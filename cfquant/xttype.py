@@ -401,6 +401,12 @@ def _normalize_account_type(value):
             "SECURITY": xtconstant.SECURITY_ACCOUNT,
             "SECURITY_ACCOUNT": xtconstant.SECURITY_ACCOUNT,
             "STOCK_ACCOUNT": xtconstant.SECURITY_ACCOUNT,
+            "HGT": xtconstant.HUGANGTONG_ACCOUNT,
+            "HUGANGTONG_ACCOUNT": xtconstant.HUGANGTONG_ACCOUNT,
+            "SHANGHAI_HK_CONNECT": xtconstant.HUGANGTONG_ACCOUNT,
+            "SGT": xtconstant.SHENGANGTONG_ACCOUNT,
+            "SHENGANGTONG_ACCOUNT": xtconstant.SHENGANGTONG_ACCOUNT,
+            "SHENZHEN_HK_CONNECT": xtconstant.SHENGANGTONG_ACCOUNT,
             "MARGIN": xtconstant.CREDIT_ACCOUNT,
             "CREDIT_ACCOUNT": xtconstant.CREDIT_ACCOUNT,
             "FUTURE_OPTION": xtconstant.FUTURE_OPTION_ACCOUNT,
@@ -433,8 +439,24 @@ def _apply_common_account_fields(data):
         "m_strAccountType",
         "broker_type",
         "m_nBrokerType",
-    ), default=xtconstant.SECURITY_ACCOUNT)
+    ), default=None)
+    if _is_empty(account_type):
+        account_type = _account_type_from_account_key(data.get("m_strAccountKey"))
+    if _is_empty(account_type):
+        account_type = xtconstant.SECURITY_ACCOUNT
     data["account_type"] = _normalize_account_type(account_type)
+
+
+def _account_type_from_account_key(value):
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            value = value.decode("gbk", errors="replace")
+    text = str(value or "").strip()
+    if "____" not in text:
+        return None
+    return _normalize_account_type(text.split("____", 1)[0])
 
 
 def _exchange_suffix(value):
@@ -483,39 +505,54 @@ def _exchange_suffix(value):
         "SZO": "SZO",
         "SZSEOPTION": "SZO",
         "SZSE_OPTION": "SZO",
+        "HK": "HK",
+        "SEHK": "HK",
+        "HGT": "HK",
+        "SGT": "HK",
     }
     return aliases.get(text, text)
 
 
 def _stock_code(data):
     code = _first_value(data, ("stock_code", "code", "ticker"), default="")
-    if not _is_empty(code):
-        return str(code)
-    instrument_id = _first_value(data, (
-        "m_strInstrumentID",
-        "instrument_id",
-        "m_strStockCode",
-        "stock_id",
-    ), default="")
-    if _is_empty(instrument_id):
+    if _is_empty(code):
+        code = _first_value(data, (
+            "m_strInstrumentID",
+            "instrument_id",
+            "m_strStockCode",
+            "stock_id",
+        ), default="")
+    if _is_empty(code):
         return ""
-    instrument_id = str(instrument_id)
-    if "." in instrument_id:
-        return instrument_id
+    instrument_id = str(code).strip().upper()
     exchange_id = _exchange_suffix(_first_value(data, (
         "m_strExchangeID",
         "exchange_id",
         "market",
         "m_strMarket",
     ), default=""))
+    account_type = _normalize_account_type(data.get("account_type"))
+    stock_connect = exchange_id == "HK" or account_type in (
+        xtconstant.HUGANGTONG_ACCOUNT,
+        xtconstant.SHENGANGTONG_ACCOUNT,
+    )
+    if "." in instrument_id:
+        left, right = instrument_id.split(".", 1)
+        if left in ("HK", "HGT", "SGT"):
+            instrument_id, exchange_id = right, "HK"
+        elif _exchange_suffix(right) == "HK":
+            instrument_id, exchange_id = left, "HK"
+        elif _exchange_suffix(right) and not exchange_id:
+            return instrument_id
+    if stock_connect or exchange_id == "HK":
+        return "%s.HK" % (instrument_id.zfill(5) if instrument_id.isdigit() else instrument_id)
     if exchange_id:
         return "%s.%s" % (instrument_id, exchange_id)
     return instrument_id
 
 
 def _apply_stock_code_field(data):
-    if _is_empty(data.get("stock_code")):
-        data["stock_code"] = _stock_code(data)
+    data["stock_code"] = _stock_code(data)
 
 
 class StockAccount(object):
@@ -525,9 +562,9 @@ class StockAccount(object):
         return super(StockAccount, cls).__new__(cls)
 
     def __init__(self, account_id, account_type="STOCK", bridge_id=None):
-        account_type = account_type.upper()
+        account_type = _normalize_account_type(account_type)
         for int_type, str_type in xtconstant.ACCOUNT_TYPE_DICT.items():
-            if account_type == str_type:
+            if account_type == int_type or account_type == str_type:
                 self.account_type = int_type
                 self.account_id = account_id
                 self.bridge_id = str(bridge_id or "").strip()
@@ -611,6 +648,13 @@ class XtOrder(DictObject):
             "m_nOrderType",
             "m_nBusinessType",
         ), default=0)
+        if data.get("order_type") in (None, "", 0, "0") and str(data.get("stock_code") or "").upper().endswith(".HK"):
+            try:
+                offset_flag = int(data.get("m_nOffsetFlag"))
+            except (TypeError, ValueError):
+                offset_flag = None
+            if offset_flag in (48, 49):
+                data["order_type"] = xtconstant.STOCK_BUY if offset_flag == 48 else xtconstant.STOCK_SELL
         _set_first(data, "order_volume", (
             "m_nVolumeTotalOriginal",
             "m_nOrderVolume",

@@ -1244,7 +1244,10 @@ ACCOUNT_TYPE_LABELS = {
     "FUTURE": "期货",
     "FUTURE_OPTION": "期货期权",
     "STOCK_OPTION": "股票期权",
+    "HUGANGTONG": "沪港通",
+    "SHENGANGTONG": "深港通",
 }
+STOCK_CONNECT_ACCOUNT_TYPES = frozenset(("HUGANGTONG", "SHENGANGTONG"))
 DOWNLOAD_CALLBACK_EVENT = "xtdata:download_progress"
 DOWNLOAD_EVENT_PREFIX = "xtdata:download"
 MARKET_ROUTE_MARKETS = ("SH", "SZ")
@@ -1303,9 +1306,17 @@ def normalize_account_type(value=None, default="STOCK"):
         "OPTION": "STOCK_OPTION",
         "股票期权": "STOCK_OPTION",
         "股票期权账户": "STOCK_OPTION",
+        "7": "HUGANGTONG",
+        "HUGANGTONG": "HUGANGTONG",
+        "HUGANGTONG_ACCOUNT": "HUGANGTONG",
+        "HGT": "HUGANGTONG",
+        "11": "SHENGANGTONG",
+        "SHENGANGTONG": "SHENGANGTONG",
+        "SHENGANGTONG_ACCOUNT": "SHENGANGTONG",
+        "SGT": "SHENGANGTONG",
     }
     account_type = aliases.get(upper) or aliases.get(text) or upper
-    if account_type not in ("STOCK", "CREDIT", "FUTURE", "FUTURE_OPTION", "STOCK_OPTION"):
+    if account_type not in ("STOCK", "CREDIT", "FUTURE", "FUTURE_OPTION", "STOCK_OPTION", *STOCK_CONNECT_ACCOUNT_TYPES):
         raise ValueError("unsupported account_type: %s" % text)
     return account_type
 
@@ -1470,10 +1481,10 @@ def order_actions_info():
     }
 
 
-def order_confirmation_text(action, stock_code, volume, price):
+def order_confirmation_text(action, stock_code, volume, price, account_type=None):
     return "%s %s %s @ %.3f" % (
         str(action or "").strip().upper(),
-        normalize_stock_code(stock_code),
+        normalize_stock_code(stock_code, account_type),
         int(volume),
         float(price),
     )
@@ -1494,8 +1505,8 @@ def order_confirmation_options(
     side = str(side or "").strip().lower()
     if account_type == "CREDIT":
         info = credit_order_action_info(credit_action, side=side)
-        primary = order_confirmation_text(info["action"], stock_code, volume, price)
-        legacy = order_confirmation_text(side, stock_code, volume, price)
+        primary = order_confirmation_text(info["action"], stock_code, volume, price, account_type)
+        legacy = order_confirmation_text(side, stock_code, volume, price, account_type)
         return [primary, legacy] if allow_legacy_side and legacy != primary else [primary]
     if account_type in DERIVATIVE_ACCOUNT_TYPES:
         if order_action not in (None, ""):
@@ -1505,8 +1516,8 @@ def order_confirmation_options(
         else:
             info = derivative_order_action_info(account_type, None, side=side)
         action = info.get("action") or "ORDER_TYPE_%s" % info.get("order_type")
-        return [order_confirmation_text(action, stock_code, volume, price)]
-    return [order_confirmation_text(side, stock_code, volume, price)]
+        return [order_confirmation_text(action, stock_code, volume, price, account_type)]
+    return [order_confirmation_text(side, stock_code, volume, price, account_type)]
 
 
 def resolve_order_action(account_type, side, credit_action=None, order_action=None, explicit_order_type=None):
@@ -2741,7 +2752,9 @@ class WebRuntimeConfig(object):
                                      % "/".join(missing_markets))
                 requested_channels = {route["bridge_id"] for route in market_routes.values() if route.get("enabled", True)}
                 for other in configs.values():
-                    if not isinstance(other, dict) or other.get("account_id") == account_id:
+                    if (not isinstance(other, dict)
+                            or (other.get("account_id") == account_id
+                                and normalize_account_type(other.get("account_type") or "STOCK") == account_type)):
                         continue
                     occupied = {other.get("bridge_id")}
                     occupied.update(route.get("bridge_id") for route in (other.get("market_bridges") or {}).values())
@@ -2804,6 +2817,7 @@ class WebRuntimeConfig(object):
                 for other_key, other in configs.items():
                     if (other_key != account_key and isinstance(other, dict)
                             and other.get("account_id") == account_id
+                            and normalize_account_type(other.get("account_type") or "STOCK") == account_type
                             and (other.get("mode") != mode or strategy_settings["enabled"])
                             and target_roots.intersection(account_qmt_roots(other))):
                         other["enabled"] = False
@@ -2868,6 +2882,15 @@ class WebRuntimeConfig(object):
                 return same_dir_bridge
             if not self._bridge_has_other_account_locked(existing_bridge_id, existing_key):
                 return existing_bridge_id
+            return self._new_account_bridge_id_locked(account_id, account_type)
+
+        has_same_account_other_type = any(
+            isinstance(item, dict)
+            and str(item.get("account_id") or "").strip() == str(account_id or "").strip()
+            and normalize_account_type(item.get("account_type") or "STOCK") != normalize_account_type(account_type)
+            for item in configs.values()
+        )
+        if has_same_account_other_type:
             return self._new_account_bridge_id_locked(account_id, account_type)
 
         if qmt_dir_key:
@@ -11686,7 +11709,16 @@ def account_payload(account_id, account_type="STOCK"):
     return {"account": {"account_id": account_id, "account_type": normalize_account_type(account_type)}}
 
 
-def normalize_stock_code(stock_code):
+def normalize_stock_code(stock_code, account_type=None):
+    """Normalize an instrument while retaining the selected account's market."""
+    normalized_account_type = (
+        normalize_account_type(account_type) if account_type not in (None, "") else ""
+    )
+    if normalized_account_type in STOCK_CONNECT_ACCOUNT_TYPES:
+        # The shared helper also enforces the selected Shanghai/Shenzhen Stock
+        # Connect channel and intentionally retains all five Hong Kong digits.
+        from cfquant.stock_connect import stock_connect_code
+        return stock_connect_code(stock_code, normalized_account_type)
     value = str(stock_code or "").strip().upper()
     if not value:
         raise ValueError("stock_code is required")
@@ -11749,6 +11781,26 @@ def request_timeout_value(value, default=12.0, minimum=0.5, maximum=180.0):
     except Exception:
         timeout = float(default)
     return max(float(minimum), min(float(maximum), timeout))
+
+
+def order_price_value(value, field="price"):
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a finite number" % field)
+    if not math.isfinite(price):
+        raise ValueError("%s must be a finite number" % field)
+    return price
+
+
+def order_volume_value(value, field="volume"):
+    try:
+        volume = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a positive integer" % field)
+    if not math.isfinite(volume) or not volume.is_integer() or volume <= 0:
+        raise ValueError("%s must be a positive integer" % field)
+    return int(volume)
 
 
 def probe_bridge_status(bridge_id=DEFAULT_BRIDGE_ID, timeout=STATUS_PROBE_TIMEOUT_SECONDS, client=None, mode=None):
@@ -13119,7 +13171,7 @@ def submit_cftrader_order(body, method):
         cancels = prepare_batch_cancels(raw_cancels, batch_id, stop_on_error)
         for cancel in cancels:
             if cancel.get("stock_code"):
-                cancel["stock_code"] = normalize_stock_code(cancel["stock_code"])
+                cancel["stock_code"] = normalize_stock_code(cancel["stock_code"], account_type)
         expected_count = len(cancels)
     else:
         fields = ("stock_code", "order_type", "order_volume", "price_type", "price", "strategy_name", "order_remark")
@@ -13127,9 +13179,11 @@ def submit_cftrader_order(body, method):
         orders = prepare_batch_orders(raw_orders, batch_id, body.get("strategy_name", ""),
                                       body.get("order_remark", ""), stop_on_error)
         for order in orders:
-            order["stock_code"] = normalize_stock_code(order["stock_code"])
+            order["stock_code"] = normalize_stock_code(order["stock_code"], account_type)
             if order["price_type"] == FIX_PRICE and order["price"] <= 0:
                 raise ValueError("fixed-price orders require price > 0")
+            if account_type in STOCK_CONNECT_ACCOUNT_TYPES and order["price_type"] != FIX_PRICE:
+                raise ValueError("Stock Connect orders support fixed price only")
         expected_count = len(orders)
     expected = "CFTRADER %s %s" % (account_id, expected_count)
     if str(body.get("confirm_text") or "").strip() != expected:
@@ -13168,7 +13222,7 @@ def submit_order(body, credit_only=False, asynchronous=False):
     account_key = str(body.get("account_key") or "").strip()
     bridge_id = resolve_bridge_id(account_id=account_id, account_type=account_type, account_key=account_key, bridge_id=body.get("bridge_id"))
     bridge_config(bridge_id)
-    stock_code = normalize_stock_code(body.get("stock_code"))
+    stock_code = normalize_stock_code(body.get("stock_code"), account_type)
     side = str(body.get("side") or "").strip().lower()
     credit_action = body.get("credit_action") or body.get("credit_business") or body.get("action")
     order_action = (
@@ -13183,11 +13237,11 @@ def submit_order(body, credit_only=False, asynchronous=False):
         or (body.get("business_type") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
         or (body.get("action") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
     )
-    price = float(body.get("price"))
-    volume = int(body.get("volume"))
+    price = order_price_value(body.get("price"))
+    volume = order_volume_value(body.get("volume"))
     price_type = int(body.get("price_type") or FIX_PRICE)
     confirm_text = str(body.get("confirm_text") or "").strip()
-    if account_type == "STOCK" and side not in ("buy", "sell"):
+    if account_type in ("STOCK", *STOCK_CONNECT_ACCOUNT_TYPES) and side not in ("buy", "sell"):
         raise ValueError("side must be buy or sell")
     if not stock_code:
         raise ValueError("stock_code is required")
@@ -13197,6 +13251,8 @@ def submit_order(body, credit_only=False, asynchronous=False):
         raise ValueError("price must be non-negative")
     if price_type == FIX_PRICE and price <= 0:
         raise ValueError("price must be positive")
+    if account_type in STOCK_CONNECT_ACCOUNT_TYPES and price_type != FIX_PRICE:
+        raise ValueError("Stock Connect orders support fixed price only")
 
     action_info = resolve_order_action(
         account_type,
@@ -13383,15 +13439,20 @@ def submit_batch_orders(body, credit_only=False):
             or body_order_action
         )
         side = str(row.get("side") or body.get("side") or ("buy" if account_type != "CREDIT" else "")).strip().lower()
-        if account_type == "STOCK" and side not in ("buy", "sell"):
+        if account_type in ("STOCK", *STOCK_CONNECT_ACCOUNT_TYPES) and side not in ("buy", "sell"):
             raise ValueError("orders[%s].side must be buy or sell" % index)
-        price = float(row.get("price"))
+        price = order_price_value(row.get("price"), "orders[%s].price" % index)
         price_type = int(row.get("price_type") or body.get("price_type") or FIX_PRICE)
-        volume = int(row.get("volume") or row.get("order_volume"))
+        volume = order_volume_value(
+            row.get("volume") if row.get("volume") not in (None, "") else row.get("order_volume"),
+            "orders[%s].volume" % index,
+        )
         if price < 0:
             raise ValueError("orders[%s].price must be non-negative" % index)
         if price_type == FIX_PRICE and price <= 0:
             raise ValueError("orders[%s].price must be positive" % index)
+        if account_type in STOCK_CONNECT_ACCOUNT_TYPES and price_type != FIX_PRICE:
+            raise ValueError("Stock Connect orders support fixed price only")
         if volume <= 0:
             raise ValueError("orders[%s].volume must be positive" % index)
         action_info = resolve_order_action(
@@ -13402,7 +13463,7 @@ def submit_batch_orders(body, credit_only=False):
             explicit_order_type=row.get("order_type", row.get("optype")),
         )
         orders.append({
-            "stock_code": normalize_stock_code(row.get("stock_code") or row.get("code")),
+            "stock_code": normalize_stock_code(row.get("stock_code") or row.get("code"), account_type),
             "side": action_info["side"] or side,
             "order_type": action_info["order_type"],
             "order_volume": volume,

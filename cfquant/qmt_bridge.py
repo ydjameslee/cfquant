@@ -20,6 +20,7 @@ from .level2 import (
     thousand_price,
 )
 from .xttype import _is_zero_time_value, filter_cancelable_orders
+from .stock_connect import CONNECT_MARKETS, TRADE_IDENTITY_FIELDS, connect_account_type, is_hk_code, stock_connect_code, validate_connect_order
 
 
 class CfquantQmtBridge(object):
@@ -818,6 +819,16 @@ class CfquantQmtBridge(object):
         account_id = account.get("account_id", "")
         account_type = self._account_type_name(account.get("account_type"))
         order_type = self._passorder_optype(params, account_type)
+        qmt_stock_code = params.get("stock_code", "")
+        if connect_account_type(account_type) in CONNECT_MARKETS:
+            qmt_stock_code = stock_connect_code(qmt_stock_code, account_type, qmt=True)
+            detail_func = getattr(self.context, "get_instrument_detail", None) or self._get_global_func("get_instrument_detail")
+            validate_connect_order(params, order_type, detail_func(qmt_stock_code) if detail_func else None)
+            if self.context is None:
+                raise ValueError("港股通下单需要已绑定账户类型的 QMT 上下文")
+            self.context.set_account(account_id, connect_account_type(account_type))
+        elif is_hk_code(qmt_stock_code):
+            raise ValueError("港股委托必须指定 HUGANGTONG 或 SHENGANGTONG 账户")
         user_order_id = self._first_param(
             params,
             ("order_remark", "remark", "strategy_name"),
@@ -827,7 +838,7 @@ class CfquantQmtBridge(object):
             order_type,
             params.get("qmt_order_type", 1101),
             account_id,
-            params.get("stock_code", ""),
+            qmt_stock_code,
             params.get("price_type"),
             params.get("price"),
             params.get("order_volume"),
@@ -1110,6 +1121,15 @@ class CfquantQmtBridge(object):
         return [self._format_trade_detail(row, datatype) for row in rows]
 
     def _format_trade_detail(self, obj, datatype):
+        data = self._format_trade_detail_payload(obj, datatype)
+        if isinstance(data, dict):
+            for name in TRADE_IDENTITY_FIELDS:
+                value = self._get_value(obj, name)
+                if value is not None:
+                    data.setdefault(name, value)
+        return data
+
+    def _format_trade_detail_payload(self, obj, datatype):
         if datatype == "ORDER":
             return {
                 "account_id": self._get_value(obj, "m_strAccountID"),
@@ -1328,12 +1348,15 @@ class CfquantQmtBridge(object):
         instrument_id = self._get_value(obj, "m_strInstrumentID")
         exchange_id = self._get_value(obj, "m_strExchangeID")
         if instrument_id and exchange_id:
+            if self._market_suffix(exchange_id) == "HK":
+                instrument_id = str(instrument_id).split(".", 1)[0].zfill(5)
             return "%s.%s" % (instrument_id, self._market_suffix(exchange_id))
         return instrument_id
 
     def _market_suffix(self, value):
         text = str(value or "").strip().upper()
         aliases = {
+            "HK": "HK", "HKEX": "HK", "HGT": "HK", "SGT": "HK",
             "0": "SH",
             "SH": "SH",
             "SSE": "SH",
@@ -1533,7 +1556,7 @@ class CfquantQmtBridge(object):
         if order_type not in (None, "", 0, "0"):
             return order_type
         market = self._market_suffix(self._get_value(obj, "m_strExchangeID"))
-        if market not in ("SH", "SZ", "BJ"):
+        if market not in ("SH", "SZ", "BJ", "HK"):
             return order_type
         try:
             offset_flag = int(self._get_value(obj, "m_nOffsetFlag"))
@@ -1693,6 +1716,8 @@ class CfquantQmtBridge(object):
         return bool(value)
 
     def _account_type_name(self, account_type):
+        if connect_account_type(account_type) in CONNECT_MARKETS:
+            return connect_account_type(account_type)
         mapping = {
             1: "FUTURE",
             2: "STOCK",

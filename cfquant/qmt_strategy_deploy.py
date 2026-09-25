@@ -27,6 +27,9 @@ MODE_ALIASES = {
 }
 LEGACY_NAMES = {Path(name).stem for name in SCRIPTS.values()} | {"CFQUANT_TRADE_LOWLAT"}
 LEGACY_NAMES |= {name + "_" + market for name in tuple(LEGACY_NAMES) for market in ("SH", "SZ")}
+ACCOUNT_TYPE_KEYS = {"STOCK": "2", "CREDIT": "3", "HGT": "7", "SGT": "11",
+                     "HUGANGTONG": "7", "SHENGANGTONG": "11"}
+ACCOUNT_TYPE_ALIASES = {"HUGANGTONG": "HGT", "SHENGANGTONG": "SGT"}
 STATES = {
     "waiting_exit": "请正常退出对应 QMT，并等待模型配置完成后再启动",
     "waiting_import": "导入包和模型已准备，请启动并登录 QMT",
@@ -68,6 +71,11 @@ def normalize_strategy_mode(value):
         return MODE_ALIASES[mode]
     except KeyError:
         raise ValueError("unknown QMT strategy mode: %s" % mode)
+
+
+def _canonical_account_type(value):
+    value = str(value or "STOCK").strip().upper()
+    return ACCOUNT_TYPE_ALIASES.get(value, value)
 
 
 def qmt_root(directory, validate=False):
@@ -188,7 +196,7 @@ def _model_items(document):
     return section, list(section.getElementsByTagName("item"))
 
 
-def _strategy_slot_name(account_id, mode="ctypes", role="normal"):
+def _strategy_slot_name(account_id, mode="ctypes", role="normal", account_type=""):
     """Return a deterministic, mode-specific name in cfquant's namespace."""
     account = re.sub(r"[^A-Z0-9]+", "_", str(account_id or "").upper()).strip("_") or "ACCOUNT"
     if len(account) > 20:
@@ -196,7 +204,9 @@ def _strategy_slot_name(account_id, mode="ctypes", role="normal"):
     mode = normalize_strategy_mode(mode).upper()
     market = str(role or "normal").upper()
     suffix = "_%s" % market if market in ("SH", "SZ") else ""
-    return ("CFQ_%s_%s%s" % (account, mode, suffix))[:64]
+    account_type = _canonical_account_type(account_type)
+    type_suffix = "_%s" % account_type if account_type in ("HGT", "SGT") else ""
+    return ("CFQ_%s%s_%s%s" % (account, type_suffix, mode, suffix))[:64]
 
 
 def _is_managed_strategy_name(name):
@@ -226,11 +236,12 @@ def _remove_formula_catalog_entries(document, names):
 
 
 def _account_binding(document, account_id, account_type, supplied=""):
+    expected_kind = ACCOUNT_TYPE_KEYS.get(str(account_type or "").strip().upper())
     candidates = set()
     for item in document.getElementsByTagName("item"):
         if item.getAttribute("account") == account_id:
             key, kind = item.getAttribute("m_strAccountKey"), item.getAttribute("accountType")
-            if key and kind:
+            if key and kind and (not expected_kind or kind == expected_kind):
                 candidates.add((kind, key))
     if supplied:
         parts = supplied.split("____")
@@ -243,8 +254,8 @@ def _account_binding(document, account_id, account_type, supplied=""):
     if (len(parts) != 6 or parts[-1] or parts[-2] != account_id
             or parts[0] != binding[0] or not all(p.isdigit() for p in parts[:-1])):
         raise ValueError("模型账号 Key 与资金账号不匹配")
-    if account_type in ("STOCK", "CREDIT") and binding[0] != {"STOCK": "2", "CREDIT": "3"}[account_type]:
-        raise ValueError("模型账号 Key 与普通/信用账户类型不匹配")
+    if expected_kind and binding[0] != expected_kind:
+        raise ValueError("模型账号 Key 与账户类型不匹配")
     return binding
 
 
@@ -253,7 +264,9 @@ def _resolve_account_binding(root, document, account_id, account_type, supplied=
     if binding or supplied:
         return binding
     # A conflicting selection must not be silently resolved using another source.
+    expected_kind = ACCOUNT_TYPE_KEYS.get(str(account_type or "").strip().upper())
     if any(item.getAttribute("account") == account_id and item.getAttribute("m_strAccountKey")
+           and (not expected_kind or item.getAttribute("accountType") == expected_kind)
            for item in document.getElementsByTagName("item")):
         return None
     candidates = set()
@@ -490,7 +503,15 @@ class QmtStrategyManager:
                         raise ValueError("QMT 内置脚本不存在: %s" % source_path)
                     for key in ("updated_at", "updated_at_text"):
                         identity.pop(key, None)
-                    group_key = _digest([os.path.normcase(str(root)), row["account_id"]])[:24]
+                    group_key = _digest([os.path.normcase(str(root)), row["account_id"],
+                                         _canonical_account_type(row["account_type"])])[:24]
+                    legacy_key = _digest([os.path.normcase(str(root)), row["account_id"]])[:24]
+                    legacy_job = self.jobs.get(legacy_key)
+                    if (legacy_job and _canonical_account_type(legacy_job.get("account_type"))
+                            == _canonical_account_type(row["account_type"])):
+                        # Existing compiled models embed this directory. Keep its
+                        # control/lease identity when adding another account type.
+                        group_key = legacy_key
                     grouped.setdefault(group_key, {"root": str(root), "roles": []})["roles"].append({
                         "role": role, "source": str(source_path), "identity": identity,
                         "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
@@ -531,7 +552,8 @@ class QmtStrategyManager:
                 for role in group["roles"]:
                     old_role = previous_roles.get(role["role"])
                     old_name = old_role.get("name") if isinstance(old_role, dict) else ""
-                    expected_name = _strategy_slot_name(row["account_id"], mode, role["role"])
+                    expected_name = _strategy_slot_name(row["account_id"], mode, role["role"],
+                                                       row["account_type"])
                     if old_name == expected_name:
                         role_names[role["role"]] = old_name
                     else:
@@ -672,11 +694,13 @@ class QmtStrategyManager:
         document, original = _read_document(config)
         section, items = _model_items(document)
         owned_names = set(job.get("retired", [])) | {role["name"] for role in job["roles"]}
+        expected_account_type = ACCOUNT_TYPE_KEYS.get(str(job.get("account_type") or "").strip().upper())
         changed = False
         disabled_names = set(job.get("retired", [])) | LEGACY_NAMES
         for item in items:
             item_name = item.getAttribute("name")
             if (item.getAttribute("account") == job["account_id"]
+                    and (not expected_account_type or item.getAttribute("accountType") == expected_account_type)
                     and (_is_managed_strategy_name(item_name) or item_name in disabled_names)
                     and (item_name not in {role["name"] for role in job["roles"]}
                          or not job["enabled"])

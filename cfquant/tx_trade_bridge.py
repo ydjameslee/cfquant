@@ -27,6 +27,7 @@ from .level2 import (
 from .version import __version__ as CORE_VERSION
 from . import account_routing
 from . import order_meta
+from .stock_connect import CONNECT_MARKETS, TRADE_IDENTITY_FIELDS, connect_account_type, is_hk_code, stock_connect_code, validate_connect_order
 from .logging_i18n import get_log_enabled, get_log_language, set_log_enabled, set_log_language, translate_log
 from .runtime_report import build_qmt_runtime_report, module_source_state, source_sha256, write_qmt_runtime_marker
 from .xttype import (
@@ -976,6 +977,17 @@ class TxTradeBridge(object):
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
         order_type = self._passorder_optype(params, account_type)
+        qmt_stock_code = params.get("stock_code", params.get("code", ""))
+        if connect_account_type(account_type) in CONNECT_MARKETS:
+            qmt_stock_code = stock_connect_code(qmt_stock_code, account_type, qmt=True)
+            detail_func = self._get_callable("get_instrument_detail")
+            detail = detail_func(qmt_stock_code) if detail_func else None
+            validate_connect_order(params, order_type, detail)
+            if self.context is None:
+                raise ValueError("港股通下单需要已绑定账户类型的 QMT 上下文")
+            self._set_context_account(account_id, connect_account_type(account_type))
+        elif is_hk_code(qmt_stock_code):
+            raise ValueError("港股委托必须指定 HUGANGTONG 或 SHENGANGTONG 账户")
         if not account_id:
             raise ValueError("account_id is required")
         price_type = params.get("price_type", 11)
@@ -1030,7 +1042,7 @@ class TxTradeBridge(object):
                 order_type,
                 params.get("qmt_order_type", 1101),
                 account_id,
-                params.get("stock_code", params.get("code", "")),
+                qmt_stock_code,
                 price_type,
                 params.get("price", 0),
                 params.get("order_volume", params.get("num", 0)),
@@ -3368,6 +3380,15 @@ class TxTradeBridge(object):
         return 0
 
     def _format_trade_detail(self, obj, detail_type):
+        data = self._format_trade_detail_payload(obj, detail_type)
+        if isinstance(data, dict):
+            for name in TRADE_IDENTITY_FIELDS:
+                value = self._get_value(obj, name)
+                if value is not None:
+                    data.setdefault(name, value)
+        return data
+
+    def _format_trade_detail_payload(self, obj, detail_type):
         detail_type = str(detail_type).lower()
         if detail_type == "order":
             return {
@@ -3616,7 +3637,7 @@ class TxTradeBridge(object):
         if order_type not in (None, "", 0, "0"):
             return order_type
         market = self._market_suffix(self._get_value(obj, "m_strExchangeID"))
-        if market not in ("SH", "SZ", "BJ"):
+        if market not in ("SH", "SZ", "BJ", "HK"):
             return order_type
         try:
             offset_flag = int(self._get_value(obj, "m_nOffsetFlag"))
@@ -3628,12 +3649,15 @@ class TxTradeBridge(object):
         instrument_id = self._get_value(obj, "m_strInstrumentID")
         exchange_id = self._get_value(obj, "m_strExchangeID")
         if instrument_id and exchange_id:
+            if self._market_suffix(exchange_id) == "HK":
+                instrument_id = str(instrument_id).split(".", 1)[0].zfill(5)
             return "%s.%s" % (instrument_id, self._market_suffix(exchange_id))
         return instrument_id
 
     def _market_suffix(self, value):
         text = str(value or "").strip().upper()
         aliases = {
+            "HK": "HK", "HKEX": "HK", "HGT": "HK", "SGT": "HK",
             "0": "SH",
             "SH": "SH",
             "SSE": "SH",
@@ -3766,6 +3790,8 @@ class TxTradeBridge(object):
         return [value]
 
     def _account_type_name(self, account_type):
+        if connect_account_type(account_type) in CONNECT_MARKETS:
+            return connect_account_type(account_type).lower()
         mapping = {
             1: "future",
             2: "stock",
@@ -3793,6 +3819,9 @@ class TxTradeBridge(object):
                 self.context.set_account(account_id)
                 self._log("context account set account=%s account_type=%s mode=account_only" % (account_id, account_type_text or "-"))
         except Exception as e:
+            if connect_account_type(account_type) in CONNECT_MARKETS:
+                # An untyped fallback could bind the same ID to another account.
+                raise
             try:
                 self.context.set_account(account_id)
                 self._log("context account set account=%s account_type=%s mode=fallback error=%s" % (account_id, account_type_text or "-", e))

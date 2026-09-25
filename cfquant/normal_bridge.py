@@ -8,7 +8,7 @@ import re
 import threading
 import time
 
-from . import order_meta
+from . import account_routing, order_meta
 from .level2 import L2_THOUSAND_SUBSCRIPTIONS, quote_callback_data, quote_plain, require_l2_callable, thousand_price
 from .protocol import loads_message, pack_event, pack_response
 from .tx_trade_bridge import TxTradeBridge, relay_sync_order_callback
@@ -309,7 +309,12 @@ class NormalQmtBridge(TxTradeBridge):
             order_meta.ensure_callback_text_fields(data)
             return None
         account_id = str(account_id or "").strip()
-        account_type = order_meta.normalize_account_type(account_type or self.account_type)
+        account_type = order_meta.normalize_account_type(account_type) if account_type else ""
+        if not account_type:
+            # A same-id callback without a raw account type cannot safely be
+            # correlated with metadata from STOCK or either Stock Connect leg.
+            order_meta.ensure_callback_text_fields(data)
+            return None
         if account_id:
             data.setdefault("account_id", account_id)
             data.setdefault("m_strAccountID", account_id)
@@ -851,8 +856,14 @@ class NormalQmtBridge(TxTradeBridge):
             return
         force_order_error = isinstance(obj, dict) and obj.pop("_cfquant_force_order_error", False)
         reconciled_order_error = None
+        # m_nBrokerType is the documented raw QMT account identity.  Read it
+        # before order-state deduplication as well as event routing.
+        broker_type = self._get_value(obj, "m_nBrokerType")
+        account_key = self._get_value(obj, "m_strAccountKey")
         if event_name == "trader:on_stock_order":
             data = self._format_trade_detail(obj, "order")
+            if broker_type is not None:
+                data.setdefault("m_nBrokerType", broker_type)
             if not self._accept_order_callback(data):
                 return
             reconciled_order_error = self._match_pending_order_error(data)
@@ -860,10 +871,16 @@ class NormalQmtBridge(TxTradeBridge):
             data = self._format_trade_detail(obj, "deal")
         else:
             data = self._callback_object_to_dict(obj)
+        if broker_type is not None:
+            data.setdefault("m_nBrokerType", broker_type)
+        if account_key is not None:
+            data.setdefault("m_strAccountKey", account_key)
         account_id = self._callback_account_id(obj, data)
         account_type = self._callback_account_type(obj, data)
-        if not account_type and self.account_type:
-            account_type = order_meta.normalize_account_type(self.account_type)
+        if not account_type:
+            account_type = self._unambiguous_callback_account_type(account_id)
+            if not account_type and account_id:
+                data["cfquant_account_type_unresolved"] = True
         if account_id:
             data.setdefault("account_id", account_id)
         if account_type:
@@ -912,7 +929,7 @@ class NormalQmtBridge(TxTradeBridge):
         sent_clients = 0
         if account_id:
             trader_event = event_name.replace("trader:", "", 1)
-            for client_id in self._client_ids_for_account(account_id, account_type=account_type or None):
+            for client_id in self._client_ids_for_account(account_id, account_type=account_type or None) if account_type else []:
                 client_duplicate = self._duplicate_asset_callback(
                     "client:%s" % client_id,
                     event_name,
@@ -947,6 +964,7 @@ class NormalQmtBridge(TxTradeBridge):
         if not isinstance(order, dict):
             return None
         account = str(order.get("account_id") or "").strip()
+        account_type = self._callback_account_type(None, order)
         code = str(order.get("stock_code") or "").upper().split(".", 1)[0]
         strategy = str(order.get("strategy_name") or "")
         remark = str(order.get("order_remark") or "")
@@ -954,8 +972,11 @@ class NormalQmtBridge(TxTradeBridge):
             for index, item in enumerate(self.pending_order_errors):
                 error = item.get("data") or {}
                 error_account = str(error.get("account_id") or "").strip()
+                error_account_type = self._callback_account_type(None, error)
                 error_code = str(error.get("stock_code") or "").upper().split(".", 1)[0]
                 if account and error_account and account != error_account:
+                    continue
+                if account_type and error_account_type and account_type != error_account_type:
                     continue
                 if code and error_code and code != error_code:
                     continue
@@ -1057,7 +1078,8 @@ class NormalQmtBridge(TxTradeBridge):
                     break
         if not order_id:
             return True
-        key = (str(data.get("account_id") or ""), order_id)
+        account_type = self._callback_account_type(None, data)
+        key = (str(data.get("account_id") or ""), account_type, order_id)
         with self.order_terminal_statuses_lock:
             if status == partial and self.order_terminal_statuses.get(key) == succeeded:
                 self._log("drop stale partial order callback account=%s order=%s" % key)
@@ -1368,10 +1390,17 @@ class NormalQmtBridge(TxTradeBridge):
         return str(self.account_id or "").strip()
 
     def _callback_account_type(self, obj, data):
+        """Return the explicit callback type; m_nBrokerType is QMT's raw field."""
         candidates = [
+            data.get("m_nBrokerType") if isinstance(data, dict) else None,
+            data.get("broker_type") if isinstance(data, dict) else None,
+            self._account_type_from_account_key(data.get("m_strAccountKey")) if isinstance(data, dict) else None,
             data.get("account_type") if isinstance(data, dict) else None,
             data.get("m_nAccountType") if isinstance(data, dict) else None,
             data.get("m_strAccountType") if isinstance(data, dict) else None,
+            self._get_value(obj, "m_nBrokerType"),
+            self._get_value(obj, "broker_type"),
+            self._account_type_from_account_key(self._get_value(obj, "m_strAccountKey")),
             self._get_value(obj, "account_type"),
             self._get_value(obj, "m_nAccountType"),
             self._get_value(obj, "m_strAccountType"),
@@ -1379,18 +1408,40 @@ class NormalQmtBridge(TxTradeBridge):
         for value in candidates:
             if value in (None, ""):
                 continue
-            text = str(value).strip().upper()
-            if text in ("2", "SECURITY", "SECURITY_ACCOUNT", "STOCK_ACCOUNT"):
-                return "STOCK"
-            if text in ("3", "CREDIT_ACCOUNT", "MARGIN"):
-                return "CREDIT"
-            if text in ("1", "FUTURE_ACCOUNT"):
-                return "FUTURE"
-            if text in ("5", "FUTURE_OPTION_ACCOUNT"):
-                return "FUTURE_OPTION"
-            if text in ("6", "STOCK_OPTION_ACCOUNT", "OPTION"):
-                return "STOCK_OPTION"
-            return text
+            return order_meta.normalize_account_type(value)
+        return ""
+
+    @staticmethod
+    def _account_type_from_account_key(value):
+        """Read the AccountAuth kind from a documented QMT account key."""
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                value = value.decode("gbk", errors="replace")
+        text = str(value or "").strip()
+        if "____" not in text:
+            return ""
+        return order_meta.normalize_account_type(text.split("____", 1)[0])
+
+    def _unambiguous_callback_account_type(self, account_id):
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            return order_meta.normalize_account_type(self.account_type) if self.account_type else ""
+        types = set(order_meta.normalize_account_type(value) for value in account_routing.account_types(self.bridge_id, account_id))
+        with self.subscriber_lock:
+            types.update(
+                order_meta.normalize_account_type(value[0])
+                for value in self.account_subscribers
+                if isinstance(value, tuple) and len(value) == 2 and value[1] == account_id
+            )
+        if len(types) == 1:
+            return types.pop()
+        if len(types) > 1:
+            return ""
+        configured_account_id = str(self.account_id or "").strip()
+        if self.account_type and (not configured_account_id or configured_account_id == account_id):
+            return order_meta.normalize_account_type(self.account_type)
         return ""
 
     def _status_extra(self):

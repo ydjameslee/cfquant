@@ -191,6 +191,8 @@ const ACCOUNT_TYPE_OPTIONS = [
   { value: 'FUTURE', label: '期货账户' },
   { value: 'FUTURE_OPTION', label: '期货期权账户' },
   { value: 'STOCK_OPTION', label: '股票期权账户' },
+  { value: 'HUGANGTONG', label: '沪港通账户' },
+  { value: 'SHENGANGTONG', label: '深港通账户' },
 ];
 const ACCOUNT_TYPE_LABELS = {
   STOCK: '普通',
@@ -198,6 +200,8 @@ const ACCOUNT_TYPE_LABELS = {
   FUTURE: '期货',
   FUTURE_OPTION: '期货期权',
   STOCK_OPTION: '股票期权',
+  HUGANGTONG: '沪港通',
+  SHENGANGTONG: '深港通',
 };
 const PRICE_TYPE_OPTIONS = [
   { value: '11', label: 'FIX_PRICE 11' },
@@ -7928,7 +7932,13 @@ function normalizeAccountType(value = 'STOCK') {
   if (['3', 'CREDIT', 'CREDIT_ACCOUNT', 'MARGIN', 'MARGIN_TRADING'].includes(text)) return 'CREDIT';
   if (['5', 'FUTURE_OPTION', 'FUTURE_OPTION_ACCOUNT', 'FUTUREOPTION'].includes(text)) return 'FUTURE_OPTION';
   if (['6', 'STOCK_OPTION', 'STOCK_OPTION_ACCOUNT', 'STOCKOPTION', 'OPTION'].includes(text)) return 'STOCK_OPTION';
+  if (['7', 'HUGANGTONG', 'HUGANGTONG_ACCOUNT', 'HGT'].includes(text)) return 'HUGANGTONG';
+  if (['11', 'SHENGANGTONG', 'SHENGANGTONG_ACCOUNT', 'SGT'].includes(text)) return 'SHENGANGTONG';
   return 'STOCK';
+}
+
+function isStockConnectAccountType(value = 'STOCK') {
+  return ['HUGANGTONG', 'SHENGANGTONG'].includes(normalizeAccountType(value));
 }
 
 function accountTypeLabel(value = 'STOCK') {
@@ -8002,6 +8012,7 @@ function syncCreditOrderControls() {
   const accountType = normalizeAccountType(state.accountType || 'STOCK');
   const credit = accountType === 'CREDIT';
   const derivative = isDerivativeAccountType(accountType);
+  const stockConnect = isStockConnectAccountType(accountType);
   const orderForm = $('orderForm');
   const orderField = $('creditOrderActionField');
   const derivativeField = $('derivativeOrderActionField');
@@ -8054,6 +8065,34 @@ function syncCreditOrderControls() {
     }
   }
   if (batchDerivativeField) batchDerivativeField.classList.toggle('hidden', !derivative);
+
+  if (orderForm) {
+    const codeInput = orderForm.stock_code;
+    const volumeInput = orderForm.volume;
+    const priceSelect = orderForm.price_type;
+    if (codeInput) codeInput.placeholder = stockConnect ? '00700.HK 或 HK.00700' : '000001.SZ';
+    if (volumeInput) {
+      volumeInput.min = stockConnect ? '1' : '100';
+      volumeInput.step = stockConnect ? '1' : '100';
+    }
+    if (priceSelect) {
+      Array.from(priceSelect.options).forEach((option) => { option.disabled = stockConnect && Number(option.value) !== FIX_PRICE; });
+      if (stockConnect) priceSelect.value = String(FIX_PRICE);
+    }
+  }
+  if ($('orderCodeLabel')) $('orderCodeLabel').textContent = stockConnect ? '港股代码' : '代码';
+  if ($('orderPriceLabel')) $('orderPriceLabel').textContent = stockConnect ? '价格（HKD）' : '价格';
+  if ($('orderVolumeLabel')) $('orderVolumeLabel').textContent = stockConnect ? '数量（股）' : '数量';
+  if ($('batchPriceTypeLabel')) $('batchPriceTypeLabel').textContent = stockConnect ? '默认报价类型（仅限价）' : '默认报价类型';
+  if (batchForm) {
+    if (batchForm.orders_text) batchForm.orders_text.placeholder = stockConnect
+      ? '00700.HK,320.500,100\nHK.00941,52.000,50'
+      : '000001.SZ,10.000,100\n600000.SH,8.500,200';
+    if (batchForm.price_type) {
+      Array.from(batchForm.price_type.options).forEach((option) => { option.disabled = stockConnect && Number(option.value) !== FIX_PRICE; });
+      if (stockConnect) batchForm.price_type.value = String(FIX_PRICE);
+    }
+  }
 
   if (orderForm) {
     const expected = buildOrderConfirmation(orderForm);
@@ -12050,9 +12089,20 @@ async function refreshAccount(sections = 'asset,positions', options = {}) {
   $('lastRefresh').textContent = data.cache && data.cache.checked_at_text ? data.cache.checked_at_text : nowText();
 }
 
-function normalizeStockCode(value) {
+function normalizeStockCode(value, accountType = selectedAccountType()) {
   const raw = String(value || '').trim().toUpperCase();
   if (!raw) return '';
+  const type = normalizeAccountType(accountType);
+  if (isStockConnectAccountType(type)) {
+    const prefixed = raw.startsWith('HK.') ? raw.slice(3) : raw;
+    const parts = prefixed.split('.');
+    const code = parts[0] || '';
+    const market = parts[1] || '';
+    if (!/^\d{5}$/.test(code) || (market && market !== 'HK' && market !== 'HGT' && market !== 'SGT')) return raw;
+    if (market === 'HGT' && type !== 'HUGANGTONG') return raw;
+    if (market === 'SGT' && type !== 'SHENGANGTONG') return raw;
+    return `${code}.HK`;
+  }
   const parts = raw.split('.');
   let code = parts[0] || '';
   let market = parts[1] || '';
@@ -12073,7 +12123,7 @@ function buildOrderConfirmation(form) {
   } else if (isDerivativeAccountType(accountType) && form.order_action) {
     action = derivativeOrderActionMeta(accountType, form.order_action.value, form.side.value).value;
   }
-  const code = normalizeStockCode(form.stock_code.value);
+  const code = normalizeStockCode(form.stock_code.value, accountType);
   const volume = Number(form.volume.value || 0);
   const priceType = Number((form.price_type && form.price_type.value) || FIX_PRICE);
   const price = Number(form.price.value || 0);
@@ -12103,7 +12153,7 @@ async function submitOrder(event) {
     account_type: accountType,
     account_key: selectedAccountKey(),
     side: form.side.value,
-    stock_code: normalizeStockCode(form.stock_code.value),
+    stock_code: normalizeStockCode(form.stock_code.value, accountType),
     price_type: Number((form.price_type && form.price_type.value) || FIX_PRICE),
     price: Number(form.price.value),
     volume: Number(form.volume.value),
@@ -12122,7 +12172,7 @@ async function submitOrder(event) {
   }
 }
 
-function parseBatchOrders(text) {
+function parseBatchOrders(text, accountType = selectedAccountType()) {
   const lines = String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   return lines.map((line, index) => {
     const parts = line.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean);
@@ -12131,7 +12181,7 @@ function parseBatchOrders(text) {
     }
     const row = {
       side: 'buy',
-      stock_code: normalizeStockCode(parts[0]),
+      stock_code: normalizeStockCode(parts[0], accountType),
       price: Number(parts[1]),
       volume: Number(parts[2]),
     };
@@ -12151,7 +12201,7 @@ function parseBatchOrders(text) {
 function updateBatchOrderHint() {
   const form = $('batchOrderForm');
   try {
-    const orders = parseBatchOrders(form.orders_text.value);
+    const orders = parseBatchOrders(form.orders_text.value, selectedAccountType());
     const expected = orders.length ? `BATCH ${orders.length}` : '';
     $('batchOrderHint').textContent = expected;
     if (!form.confirm_text.value || /^BATCH\s+\d+$/.test(form.confirm_text.value.trim())) {
@@ -12166,7 +12216,7 @@ async function submitBatchOrders(event) {
   event.preventDefault();
   const form = event.currentTarget;
   try {
-    const orders = parseBatchOrders(form.orders_text.value);
+    const orders = parseBatchOrders(form.orders_text.value, selectedAccountType());
     if (!orders.length) {
       log('批量委托为空');
       return;

@@ -16,6 +16,14 @@ def _account_type(account_type):
         "SECURITY": "STOCK",
         "SECURITY_ACCOUNT": "STOCK",
         "STOCK_ACCOUNT": "STOCK",
+        "7": "HUGANGTONG",
+        "HGT": "HUGANGTONG",
+        "HUGANGTONG_ACCOUNT": "HUGANGTONG",
+        "SHANGHAI_HK_CONNECT": "HUGANGTONG",
+        "11": "SHENGANGTONG",
+        "SGT": "SHENGANGTONG",
+        "SHENGANGTONG_ACCOUNT": "SHENGANGTONG",
+        "SHENZHEN_HK_CONNECT": "SHENGANGTONG",
         "3": "CREDIT",
         "CREDIT_ACCOUNT": "CREDIT",
         "MARGIN": "CREDIT",
@@ -93,6 +101,20 @@ def client_ids(bridge_id, account_id, account_type=None):
         return []
     with _lock:
         return sorted(_subscribers.get((bridge_id, account_type, account_id), set()))
+
+
+def account_types(bridge_id, account_id):
+    """Return explicitly subscribed account types for one bridge/account id."""
+    bridge_id = str(bridge_id or "default").strip()
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return []
+    with _lock:
+        return sorted({
+            account_type
+            for item_bridge_id, account_type, item_account_id in _subscribers
+            if item_bridge_id == bridge_id and item_account_id == account_id
+        })
 
 
 def status(bridge_id):

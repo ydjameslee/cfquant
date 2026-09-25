@@ -206,6 +206,12 @@ def _account_type_value(account_type):
             "SECURITY": xtconstant.SECURITY_ACCOUNT,
             "SECURITY_ACCOUNT": xtconstant.SECURITY_ACCOUNT,
             "STOCK_ACCOUNT": xtconstant.SECURITY_ACCOUNT,
+            "HGT": xtconstant.HUGANGTONG_ACCOUNT,
+            "HUGANGTONG_ACCOUNT": xtconstant.HUGANGTONG_ACCOUNT,
+            "SHANGHAI_HK_CONNECT": xtconstant.HUGANGTONG_ACCOUNT,
+            "SGT": xtconstant.SHENGANGTONG_ACCOUNT,
+            "SHENGANGTONG_ACCOUNT": xtconstant.SHENGANGTONG_ACCOUNT,
+            "SHENZHEN_HK_CONNECT": xtconstant.SHENGANGTONG_ACCOUNT,
             "MARGIN": xtconstant.CREDIT_ACCOUNT,
             "CREDIT_ACCOUNT": xtconstant.CREDIT_ACCOUNT,
             "FUTURE_OPTION": xtconstant.FUTURE_OPTION_ACCOUNT,
@@ -863,6 +869,10 @@ class XtQuantTrader(object):
             data_account_id = _event_account_id(data)
             if self.account_id and data_account_id and data_account_id != self.account_id:
                 return
+            event_account_type = _event_account_type(data)
+            expected_account_type = _account_type_value(getattr(self.account, "account_type", xtconstant.SECURITY_ACCOUNT))
+            if self.account is not None and event_account_type is not None and event_account_type != expected_account_type:
+                return
             cls = self._event_types.get(name)
             raw_account_type = (
                 data.get("account_type") if isinstance(data, dict)
@@ -1378,6 +1388,9 @@ def _account_type_name(account_type):
             "SECURITY": "STOCK",
             "SECURITY_ACCOUNT": "STOCK",
             "STOCK_ACCOUNT": "STOCK",
+            "HGT": "HUGANGTONG",
+            "HUGANGTONG_ACCOUNT": "HUGANGTONG",
+            "SHANGHAI_HK_CONNECT": "HUGANGTONG",
             "3": "CREDIT",
             "CREDIT_ACCOUNT": "CREDIT",
             "MARGIN": "CREDIT",
@@ -1388,6 +1401,9 @@ def _account_type_name(account_type):
             "STOCK_OPTION_ACCOUNT": "STOCK_OPTION",
             "STOCKOPTION": "STOCK_OPTION",
             "OPTION": "STOCK_OPTION",
+            "SGT": "SHENGANGTONG",
+            "SHENGANGTONG_ACCOUNT": "SHENGANGTONG",
+            "SHENZHEN_HK_CONNECT": "SHENGANGTONG",
         }
         return aliases.get(text, text or "STOCK")
     return mapping.get(account_type, "STOCK")
@@ -1416,3 +1432,43 @@ def _event_account_id(data):
         if value:
             return str(value).strip()
     return ""
+
+
+def _event_account_type(data):
+    """Read QMT's callback account identity without falling back to a client account.
+
+    ``m_nBrokerType`` is the documented raw QMT field and distinguishes
+    STOCK, HUGANGTONG, and SHENGANGTONG even when their account ids match.
+    """
+    if isinstance(data, dict):
+        values = (data.get(name) for name in (
+            "m_nBrokerType", "broker_type",
+        ))
+    else:
+        values = (getattr(data, name, None) for name in (
+            "m_nBrokerType", "broker_type",
+        ))
+    for value in values:
+        if value not in (None, ""):
+            return _account_type_value(value)
+    account_key = data.get("m_strAccountKey") if isinstance(data, dict) else getattr(data, "m_strAccountKey", None)
+    if isinstance(account_key, bytes):
+        try:
+            account_key = account_key.decode("utf-8")
+        except UnicodeDecodeError:
+            account_key = account_key.decode("gbk", errors="replace")
+    account_key = str(account_key or "").strip()
+    if "____" in account_key:
+        return _account_type_value(account_key.split("____", 1)[0])
+    if isinstance(data, dict):
+        values = (data.get(name) for name in (
+            "account_type", "m_nAccountType", "m_strAccountType",
+        ))
+    else:
+        values = (getattr(data, name, None) for name in (
+            "account_type", "m_nAccountType", "m_strAccountType",
+        ))
+    for value in values:
+        if value not in (None, ""):
+            return _account_type_value(value)
+    return None

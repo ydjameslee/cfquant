@@ -3,6 +3,7 @@
 import ast
 import copy
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -15,6 +16,7 @@ from cfquant.qmt_strategy_deploy import (
     _write_json, _resolve_account_binding, account_qmt_roots, managed_source, normalize_strategy_settings,
     normalize_strategy_mode,
     _strategy_slot_name,
+    _digest,
 )
 from cfquant.qmt_strategy_package import _cipher, build_package
 from cfquant.qmt_strategy_runtime import _CqStrategyLease
@@ -25,6 +27,19 @@ ACCOUNT = "1000000001"
 ACCOUNT_KEY = "3____101____201____49____%s____" % ACCOUNT
 
 
+def test_existing_legacy_job_keeps_control_path_after_type_isolation_upgrade(deployment):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    job = next(iter(manager.jobs.values()))
+    legacy_key = _digest([os.path.normcase(str(root)), row['account_id']])[:24]
+    job['control_path'] = str(root / 'cfquant_managed' / legacy_key / 'desired.json')
+    manager.jobs = {legacy_key: job}
+    manager.configure(row, infos)
+    assert list(manager.jobs) == [legacy_key]
+    assert manager.jobs[legacy_key]['enabled'] is True
+    assert Path(manager.jobs[legacy_key]['control_path']).parent.name == legacy_key
+
+
 @pytest.mark.parametrize("value, expected", [("extreme", "lite"), ("ultimate", "lite"), ("pipe", "ctypes"), ("socket", "lttx")])
 def test_strategy_mode_aliases_are_canonical(value, expected):
     assert normalize_strategy_mode(value) == expected
@@ -33,6 +48,14 @@ def test_strategy_mode_aliases_are_canonical(value, expected):
 def test_strategy_name_contains_mode_and_shortens_long_account():
     name = _strategy_slot_name("ACCOUNT-12345678901234567890", "lite")
     assert name == "CFQ_67890_LITE"
+
+
+def test_stock_connect_strategy_names_include_account_type_without_changing_stock_names():
+    assert _strategy_slot_name(ACCOUNT, "ctypes", account_type="STOCK") == "CFQ_1000000001_CTYPES"
+    assert _strategy_slot_name(ACCOUNT, "ctypes", account_type="HGT") == "CFQ_1000000001_HGT_CTYPES"
+    assert _strategy_slot_name(ACCOUNT, "ctypes", account_type="SGT") == "CFQ_1000000001_SGT_CTYPES"
+    assert _strategy_slot_name(ACCOUNT, "ctypes", account_type="HUGANGTONG") == "CFQ_1000000001_HGT_CTYPES"
+    assert _strategy_slot_name(ACCOUNT, "ctypes", account_type="SHENGANGTONG") == "CFQ_1000000001_SGT_CTYPES"
 
 
 @pytest.fixture
@@ -325,6 +348,74 @@ def test_no_account_binding_is_never_fabricated(deployment):
         _account_binding(document, row["account_id"], "CREDIT", ACCOUNT_KEY)
     with pytest.raises(ValueError, match="Key"):
         _account_binding(document, ACCOUNT, "STOCK", ACCOUNT_KEY)
+
+
+def test_stock_connect_account_binding_selects_only_its_exact_qmt_type(deployment):
+    _, _, _, _, root = deployment
+    document, _ = _read_document(root / "config" / "indexUserConfig.xml")
+    section = document.getElementsByTagName("strategyTrade")[0]
+    hgt_key = "7____101____201____49____%s____" % ACCOUNT
+    sgt_key = "11____101____201____49____%s____" % ACCOUNT
+    for index, (kind, key) in enumerate((("7", hgt_key), ("11", sgt_key)), start=10):
+        item = document.createElement("item")
+        item.setAttribute("id", str(index))
+        item.setAttribute("name", "USER_%s" % kind)
+        item.setAttribute("account", ACCOUNT)
+        item.setAttribute("accountType", kind)
+        item.setAttribute("m_strAccountKey", key)
+        section.appendChild(item)
+
+    assert _account_binding(document, ACCOUNT, "HGT") == ("7", hgt_key)
+    assert _account_binding(document, ACCOUNT, "SGT") == ("11", sgt_key)
+    with pytest.raises(ValueError, match="账户类型"):
+        _account_binding(document, ACCOUNT, "HGT", sgt_key)
+
+
+def test_stock_connect_binding_can_fall_back_to_auth_key_when_same_id_stock_model_exists(deployment):
+    _, _, _, _, root = deployment
+    stock_key = "2____101____201____49____%s____" % ACCOUNT
+    hgt_key = "7____101____201____49____%s____" % ACCOUNT
+    config = root / "config" / "indexUserConfig.xml"
+    config.write_text(
+        '<ICUserConfigFile><FormulaCatalog/><strategyTrade><item account="%s" accountType="2" '
+        'm_strAccountKey="%s"/></strategyTrade></ICUserConfigFile>' % (ACCOUNT, stock_key),
+        encoding="utf-8")
+    auth = root / "userdata" / "users" / "test_user" / "authAndConfig.xml"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('<TTAuthAndConfigFile><AccountAuth key="%s"/></TTAuthAndConfigFile>' % hgt_key,
+                    encoding="utf-8")
+
+    document, _ = _read_document(config)
+    assert _resolve_account_binding(root, document, ACCOUNT, "HUGANGTONG") == ("7", hgt_key)
+
+
+def test_stock_connect_deployments_with_one_account_id_keep_separate_slots(deployment):
+    manager, row, infos, _, root = deployment
+    document, _ = _read_document(root / "config" / "indexUserConfig.xml")
+    section = document.getElementsByTagName("strategyTrade")[0]
+    sgt_key = "11____101____201____49____%s____" % ACCOUNT
+    sgt = document.createElement("item")
+    sgt.setAttribute("id", "10")
+    sgt.setAttribute("name", "CFQ_1000000001_SGT_CTYPES")
+    sgt.setAttribute("account", ACCOUNT)
+    sgt.setAttribute("accountType", "11")
+    sgt.setAttribute("m_strAccountKey", sgt_key)
+    sgt.setAttribute("startupAutorun", "1")
+    section.appendChild(sgt)
+    root.joinpath("config", "indexUserConfig.xml").write_bytes(document.toxml(encoding="utf-8"))
+
+    hgt_key = "7____101____201____49____%s____" % ACCOUNT
+    hgt_row = dict(row, account_key="bridge:HGT:" + ACCOUNT, account_type="HGT",
+                   qmt_strategy=dict(row["qmt_strategy"], account_keys={"normal": hgt_key}))
+    sgt_row = dict(row, account_key="bridge:SGT:" + ACCOUNT, account_type="SGT",
+                   qmt_strategy=dict(row["qmt_strategy"], account_keys={"normal": sgt_key}))
+    manager.configure(hgt_row, infos)
+    assert models(root)["CFQ_1000000001_SGT_CTYPES"].getAttribute("startupAutorun") == "1"
+    manager.configure(sgt_row, infos)
+
+    assert len(manager.jobs) == 2
+    assert {role["name"] for job in manager.jobs.values() for role in job["roles"]} == {
+        "CFQ_1000000001_HGT_CTYPES", "CFQ_1000000001_SGT_CTYPES"}
 
 
 def test_first_start_has_a_credit_model_even_without_an_existing_model(deployment):
