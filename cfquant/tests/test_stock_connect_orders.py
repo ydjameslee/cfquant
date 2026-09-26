@@ -164,3 +164,16 @@ def test_ordinary_account_rejects_hk_security(cls):
         assert calls == []
     finally:
         bridge.close()
+
+
+@pytest.mark.parametrize("kind", ["HUGANGTONG", "SHENGANGTONG"])
+def test_batch_cancel_canonical_hk_code_does_not_infer_a_share_market(kind):
+    from cfquant.batch_orders import execute_qmt_cancel_batch
+    calls = []
+    bridge = SimpleNamespace(_cancel_order_stock=lambda params: calls.append(params) or {"cancel_result": 0})
+    params = {"account": {"account_id": "TEST", "account_type": kind}, "batch_id": "hk-cancel",
+              "cancels": [{"order_id": "SYS-1", "stock_code": "00700.HK"}]}
+    result = execute_qmt_cancel_batch(bridge, params, {}, False)
+    assert result["submitted"] == 1
+    assert calls[0]["market"] == "HK"
+    assert calls[0]["account"]["account_type"] == kind

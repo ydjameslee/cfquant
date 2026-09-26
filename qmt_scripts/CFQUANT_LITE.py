@@ -22,6 +22,175 @@ import ctypes
 from ctypes import wintypes
 
 # BEGIN GENERATED CFTRADER BATCH
+# -*- coding: utf-8 -*-
+"""Stock Connect symbols at the SDK/QMT boundary (no transport or trading)."""
+import re
+from decimal import Decimal, InvalidOperation
+
+CONNECT_MARKETS = {"HUGANGTONG": "HGT", "SHENGANGTONG": "SGT"}
+TRADE_IDENTITY_FIELDS = (
+    "account_type", "m_nBrokerType", "m_nAccountType", "m_strAccountKey",
+    "currency", "m_strCurrencyID", "m_strCurrency", "m_dReferenceRate",
+    "m_dOrderPriceRMB", "m_dPriceRMB", "m_dTradeAmountRMB",
+)
+
+
+def connect_account_type(value):
+    text = str(value or "").strip().upper()
+    return {"7": "HUGANGTONG", "11": "SHENGANGTONG",
+            "HGT": "HUGANGTONG", "SGT": "SHENGANGTONG",
+            "SHANGHAI_HK_CONNECT": "HUGANGTONG", "SHENZHEN_HK_CONNECT": "SHENGANGTONG",
+            "HUGANGTONG_ACCOUNT": "HUGANGTONG",
+            "SHENGANGTONG_ACCOUNT": "SHENGANGTONG"}.get(text, text)
+
+
+def is_hk_code(code):
+    text = str(code or "").strip().upper()
+    return text.startswith("HK.") or text.endswith((".HK", ".HGT", ".SGT"))
+
+
+def stock_connect_code(code, account_type, qmt=False):
+    """Canonical SDK code is HK; QMT order codes explicitly select HGT/SGT."""
+    kind = connect_account_type(account_type)
+    if kind not in CONNECT_MARKETS:
+        raise ValueError("Stock Connect account_type is required")
+    text = str(code or "").strip().upper()
+    if text.startswith("HK."):
+        text = text[3:] + ".HK"
+    parts = text.split(".")
+    number = parts[0]
+    market = parts[1] if len(parts) == 2 else "HK"
+    if len(parts) > 2 or not re.fullmatch(r"[0-9]{5}", number) or int(number) == 0:
+        raise ValueError("港股代码必须是五位数字，例如 00700.HK")
+    if market not in ("HK", CONNECT_MARKETS[kind]):
+        raise ValueError("港股代码市场与账户类型不匹配: %s / %s" % (text, kind))
+    return number + "." + (CONNECT_MARKETS[kind] if qmt else "HK")
+
+
+def validate_connect_order(params, optype, detail):
+    """Validate the first-release contract: limit orders in whole board lots."""
+    if optype not in (23, 24) or params.get("price_type", 11) != 11:
+        raise ValueError("港股通首版仅支持限价买入/卖出")
+    if params.get("qmt_order_type", 1101) != 1101:
+        raise ValueError("港股通仅支持按股数下单 qmt_order_type=1101")
+    try:
+        price = Decimal(str(params.get("price", 0)))
+        volume = Decimal(str(params.get("order_volume", params.get("num", 0))))
+    except InvalidOperation:
+        raise ValueError("港股通价格和数量必须是有效数字")
+    if not price.is_finite() or price <= 0:
+        raise ValueError("港股通价格必须为正有限数，单位为港币")
+    if not volume.is_finite() or volume <= 0 or volume != volume.to_integral_value():
+        raise ValueError("港股通数量必须为正整数股数")
+    try:
+        lot = Decimal(str((detail or {}).get("VolumeMultiple", 0)))
+    except (InvalidOperation, AttributeError):
+        lot = Decimal(0)
+    if not lot.is_finite() or lot <= 0 or lot != lot.to_integral_value() or (detail or {}).get("cfquant_detail_fallback"):
+        raise ValueError("无法获取港股每手股数，请先确认 QMT 合约信息")
+    if volume % lot:
+        raise ValueError("港股通数量必须是每手 %s 股的整数倍；首版不支持碎股委托" % lot)
+
+
+CONNECT_ACCOUNT_MARKETS = CONNECT_MARKETS
+
+def normalize_connect_code(value):
+    text = str(value or "").strip()
+    if "." not in text:
+        return text
+    code, market = text.rsplit(".", 1)
+    market = market.strip().upper()
+    if market not in ("HK", "HGT", "SGT"):
+        return text
+    code = code.strip()
+    if not code or len(code) > 5 or not all("0" <= c <= "9" for c in code) or int(code) == 0:
+        raise ValueError("HK/HGT/SGT stock code must contain 1 to 5 digits and be positive")
+    return "%s.%s" % (code.zfill(5), market)
+
+
+def validate_connect_market(account_type, stock_code="", market=""):
+    account_type = connect_account_type(account_type)
+    code = normalize_connect_code(stock_code)
+    suffix = code.rsplit(".", 1)[-1].upper() if "." in code else ""
+    market = str(market or "").strip().upper()
+    expected = CONNECT_ACCOUNT_MARKETS.get(account_type)
+    if expected and suffix == "HK":
+        suffix = expected
+    if expected and market == "HK":
+        market = expected
+    if market and suffix and market != suffix and (market in ("HGT", "SGT") or suffix in ("HGT", "SGT")):
+        raise ValueError("Stock Connect market does not match stock_code")
+    target = market or suffix
+    expected = CONNECT_ACCOUNT_MARKETS.get(account_type)
+    if expected and target and target != expected:
+        raise ValueError("%s requires .%s securities" % (account_type, expected))
+    if target in ("HGT", "SGT") and target != expected:
+        raise ValueError(".%s requires its matching HUGANGTONG/SHENGANGTONG account" % target)
+    return code
+
+
+def query_connect_exchange_rate(bridge, params):
+    account = params.get("account") or {}
+    account_id = str(account.get("account_id") or "").strip()
+    kind = connect_account_type(account.get("account_type"))
+    if not account_id or kind not in CONNECT_ACCOUNT_MARKETS:
+        raise ValueError("get_hkt_exchange_rate requires a HUGANGTONG/SHENGANGTONG account")
+    getter = getattr(bridge, "_get_callable", None) or bridge._get_global_func
+    func = getter("get_hkt_exchange_rate")
+    if not func:
+        raise NotImplementedError("This QMT does not expose get_hkt_exchange_rate")
+    return func(account_id, kind)
+
+
+def normalize_connect_order(params, account_type):
+    raw_code = normalize_connect_code(params.get("stock_code", params.get("code", "")))
+    kind = connect_account_type(account_type)
+    if kind in CONNECT_MARKETS:
+        raw_code = stock_connect_code(raw_code, kind, qmt=True)
+    code = validate_connect_market(account_type, raw_code)
+    expected = CONNECT_ACCOUNT_MARKETS.get(connect_account_type(account_type))
+    if expected and not code.endswith("." + expected):
+        raise ValueError("Stock Connect orders require an explicit .%s suffix" % expected)
+    if expected:
+        operation = next((params[name] for name in ("qmt_optype", "passorder_optype", "optype", "order_type")
+                          if params.get(name) is not None), None)
+        if operation is not None and str(operation).lower() not in ("23", "24", "buy", "sell", "stock_buy", "stock_sell"):
+            raise ValueError("Stock Connect order_stock supports STOCK_BUY/SELL (23/24)")
+        if any(params.get(name) for name in ("credit_action", "credit_business", "future_action",
+                                            "future_business", "option_action", "option_business",
+                                            "stock_option_action", "future_option_action", "derivative_action")):
+            raise ValueError("Stock Connect does not support credit or derivative actions")
+    if code.upper().endswith(".HK"):
+        raise ValueError("港股委托必须指定 HUGANGTONG 或 SHENGANGTONG 账户")
+    return code
+
+def _lite_normalize_account_type(value):
+    if value is None or value == "":
+        return "STOCK"
+    text = connect_account_type(value)
+    aliases = {
+        "2": "STOCK",
+        "STOCK": "STOCK",
+        "SECURITY": "STOCK",
+        "SECURITY_ACCOUNT": "STOCK",
+        "STOCK_ACCOUNT": "STOCK",
+        "7": "HUGANGTONG",
+        "HGT": "HUGANGTONG",
+        "HUGANGTONG_ACCOUNT": "HUGANGTONG",
+        "SHANGHAI_HK_CONNECT": "HUGANGTONG",
+        "11": "SHENGANGTONG",
+        "SGT": "SHENGANGTONG",
+        "SHENGANGTONG_ACCOUNT": "SHENGANGTONG",
+        "SHENZHEN_HK_CONNECT": "SHENGANGTONG",
+        "0": "FUTURE",
+        "FUTURE": "FUTURE",
+        "FUTURES": "FUTURE",
+        "CREDIT": "CREDIT",
+        "MARGIN": "CREDIT",
+    }
+    return aliases.get(text, text)
+
+
 """Batch wire contract and QMT execution, compatible with embedded Python 3.6."""
 
 import math
@@ -74,7 +243,7 @@ def prepare_batch_orders(orders, batch_id, strategy_name="", order_remark="", st
         row = dict(order)
         if not isinstance(row["stock_code"], str) or not row["stock_code"].strip():
             raise ValueError("%s.stock_code is required" % label)
-        row["stock_code"] = row["stock_code"].strip()
+        row["stock_code"] = normalize_connect_code(row["stock_code"].strip())
         for name in ("order_type", "order_volume", "price_type"):
             value = row[name]
             if isinstance(value, bool) or not isinstance(value, Integral):
@@ -109,7 +278,7 @@ def _infer_stock_market(stock_code):
     text = str(stock_code or "").strip().upper()
     if "." in text:
         suffix = text.rsplit(".", 1)[1]
-        if suffix in ("SH", "SZ", "BJ"):
+        if suffix in ("SH", "SZ", "BJ", "HK", "HGT", "SGT"):
             return suffix
     code = text.split(".", 1)[0]
     if len(code) >= 2:
@@ -147,8 +316,8 @@ def prepare_batch_cancels(cancels, batch_id, stop_on_error=False):
         row["order_id"] = str(order_id).strip()
         stock_code = str(row.get("stock_code") or "").strip().upper()
         market = str(row.get("market") or "").strip().upper()
-        if market and market not in ("SH", "SZ", "BJ"):
-            raise ValueError("%s.market must be SH, SZ or BJ" % label)
+        if market and market not in ("SH", "SZ", "BJ", "HK", "HGT", "SGT"):
+            raise ValueError("%s.market must be SH, SZ, BJ, HK, HGT or SGT" % label)
         if not market:
             market = _infer_stock_market(stock_code)
         row["stock_code"] = stock_code
@@ -365,6 +534,8 @@ def execute_qmt_cancel_batch(bridge, params, msg, asynchronous):
     cancels = prepare_batch_cancel_request(params, asynchronous)
     account = params["account"]
     results = batch_cancel_result_rows(cancels, params.get("seqs") if asynchronous else None)
+    for cancel in cancels:
+        validate_connect_market(account.get("account_type"), cancel.get("stock_code"), cancel.get("market"))
     started = time.perf_counter()
     for index, (cancel, row) in enumerate(zip(cancels, results)):
         request = dict(cancel, account=account)
@@ -420,7 +591,7 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.40"
+CORE_VERSION = "0.2.43"
 LITE_ENTRY_VERSION = "lite_20260828_01"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
@@ -1662,6 +1833,8 @@ class TxTradeBridge(object):
             )
 
     def _dispatch(self, action, params, msg):
+        if action == "xttrader.get_hkt_exchange_rate":
+            return query_connect_exchange_rate(self, params)
         if action in CFTRADER_BATCH_ORDER_ACTIONS:
             return execute_qmt_batch(self, params, msg, action.endswith("_async"))
         if action in CFTRADER_BATCH_CANCEL_ACTIONS:
@@ -2150,6 +2323,7 @@ class TxTradeBridge(object):
         return filtered
 
     def _passorder_optype(self, params, account_type):
+        normalize_connect_order(params, account_type)
         qmt_optype = self._first_param(params, ("qmt_optype", "passorder_optype"))
         if qmt_optype is not None:
             return self._coerce_optype(qmt_optype)
@@ -2411,6 +2585,8 @@ class TxTradeBridge(object):
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+        params = dict(params)
+        params["stock_code"] = normalize_connect_order(params, account_type)
         order_type = self._passorder_optype(params, account_type)
         if not account_id:
             raise ValueError("account_id is required")
@@ -3025,6 +3201,7 @@ class TxTradeBridge(object):
         if not order_id:
             raise ValueError("order_id is required")
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+        validate_connect_market(account_type, params.get("stock_code"), self._market_suffix(params.get("market")))
         result = cancel_func(order_id, account_id, account_type, self.context)
         return {"cancel_result": 0 if result else -1, "request_result": result, "order_id": order_id}
 
@@ -3674,6 +3851,57 @@ class TxTradeBridge(object):
         return result
 
     def _get_trading_dates(self, params):
+        if "market" in params:
+            import datetime
+
+            market = params["market"]
+            if not isinstance(market, str) or not market.strip() or "." in market:
+                raise ValueError("market must be an exchange code, e.g. SH or SZ")
+            market = market.strip().upper()
+            count = params.get("count", -1)
+            if isinstance(count, bool) or not isinstance(count, int) or count < -1:
+                raise ValueError("count must be -1 or a non-negative integer")
+            zone = datetime.timezone(datetime.timedelta(hours=8))
+
+            def parse_date(value):
+                if not isinstance(value, str) or len(value) not in (8, 14) or not value.isdigit():
+                    raise ValueError("trading date must be YYYYMMDD or YYYYMMDDhhmmss")
+                return datetime.datetime.strptime(
+                    value, "%Y%m%d" if len(value) == 8 else "%Y%m%d%H%M%S"
+                ).replace(tzinfo=zone)
+
+            start = params.get("start_time", "")
+            end = params.get("end_time", "")
+            lower = parse_date(start) if start else None
+            today = datetime.datetime.now(zone).strftime("%Y%m%d")
+            upper = parse_date(end or today)
+            # Trading dates are historical; future calendars belong to get_trading_calendar.
+            end_day = min(upper.strftime("%Y%m%d"), today)
+            start_day = lower.strftime("%Y%m%d") if lower else ""
+            if count == 0 or (start_day and start_day > end_day):
+                return []
+            func = self._get_callable("get_trading_calendar")
+            if not func:
+                raise NotImplementedError(
+                    "xtdata.get_trading_dates requires QMT get_trading_calendar; "
+                    "ContextInfo.get_trading_dates queries security bars, not market dates"
+                )
+            # QMT calendar takes three arguments, has no count, and returns YYYYMMDD.
+            raw = func(market, start_day, end_day)
+            if raw is None:
+                raise ValueError("QMT get_trading_calendar returned None")
+            dates = set()
+            for value in raw:
+                day = parse_date(value)
+                if day.strftime("%Y%m%d") > end_day or day > upper:
+                    continue
+                if lower is not None and day < lower:
+                    continue
+                dates.add(int(day.timestamp() * 1000))
+            dates = sorted(dates)
+            return dates[-count:] if count > 0 else dates
+
+        # Retain support for requests from older SDKs using the QMT bar signature.
         func = self._get_callable("get_trading_dates")
         if not func:
             raise NotImplementedError("get_trading_dates not found")
@@ -4102,7 +4330,7 @@ class TxTradeBridge(object):
         if order_type not in (None, "", 0, "0"):
             return order_type
         market = self._market_suffix(self._get_value(obj, "m_strExchangeID"))
-        if market not in ("SH", "SZ", "BJ"):
+        if market not in ("SH", "SZ", "BJ", "HK", "HGT", "SGT"):
             return order_type
         try:
             offset_flag = int(self._get_value(obj, "m_nOffsetFlag"))
@@ -4213,18 +4441,21 @@ class TxTradeBridge(object):
         return [value]
 
     def _account_type_name(self, account_type):
+        if connect_account_type(account_type) in CONNECT_MARKETS:
+            return connect_account_type(account_type).lower()
         mapping = {
             1: "future",
             2: "stock",
             3: "credit",
             5: "future_option",
             6: "stock_option",
-            7: "hugangtong",
+            7: "HUGANGTONG",
             10: "new3board",
-            11: "shengangtong",
+            11: "SHENGANGTONG",
         }
         if isinstance(account_type, str):
-            return account_type
+            value = connect_account_type(account_type)
+            return mapping.get(int(value), value) if value.isdigit() else value
         return mapping.get(account_type, "stock")
 
     def _set_context_account(self, account_id, account_type=None):
@@ -5144,11 +5375,32 @@ class NormalQmtBridge(TxTradeBridge):
                 return str(value).strip()
         return str(self.account_id or "").strip()
 
+    @staticmethod
+    def _account_type_from_account_key(value):
+        """Read the AccountAuth kind from a documented QMT account key."""
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                value = value.decode("gbk", errors="replace")
+        text = str(value or "").strip()
+        if "____" not in text:
+            return ""
+        return _lite_normalize_account_type(text.split("____", 1)[0])
+
+
     def _callback_account_type(self, obj, data):
+        """Return the explicit callback type; m_nBrokerType is QMT's raw field."""
         candidates = [
+            data.get("m_nBrokerType") if isinstance(data, dict) else None,
+            data.get("broker_type") if isinstance(data, dict) else None,
+            self._account_type_from_account_key(data.get("m_strAccountKey")) if isinstance(data, dict) else None,
             data.get("account_type") if isinstance(data, dict) else None,
             data.get("m_nAccountType") if isinstance(data, dict) else None,
             data.get("m_strAccountType") if isinstance(data, dict) else None,
+            self._get_value(obj, "m_nBrokerType"),
+            self._get_value(obj, "broker_type"),
+            self._account_type_from_account_key(self._get_value(obj, "m_strAccountKey")),
             self._get_value(obj, "account_type"),
             self._get_value(obj, "m_nAccountType"),
             self._get_value(obj, "m_strAccountType"),
@@ -5156,18 +5408,7 @@ class NormalQmtBridge(TxTradeBridge):
         for value in candidates:
             if value in (None, ""):
                 continue
-            text = str(value).strip().upper()
-            if text in ("2", "SECURITY", "SECURITY_ACCOUNT", "STOCK_ACCOUNT"):
-                return "STOCK"
-            if text in ("3", "CREDIT_ACCOUNT", "MARGIN"):
-                return "CREDIT"
-            if text in ("1", "FUTURE_ACCOUNT"):
-                return "FUTURE"
-            if text in ("5", "FUTURE_OPTION_ACCOUNT"):
-                return "FUTURE_OPTION"
-            if text in ("6", "STOCK_OPTION_ACCOUNT", "OPTION"):
-                return "STOCK_OPTION"
-            return text
+            return _lite_normalize_account_type(value)
         return ""
 
     def _status_extra(self):

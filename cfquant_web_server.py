@@ -14,6 +14,7 @@ import json
 import math
 import mimetypes
 import os
+from cfquant.stock_connect import connect_account_type, normalize_connect_code, stock_connect_code, validate_connect_market
 import posixpath
 import queue
 import re
@@ -1315,7 +1316,8 @@ def normalize_account_type(value=None, default="STOCK"):
         "SHENGANGTONG_ACCOUNT": "SHENGANGTONG",
         "SGT": "SHENGANGTONG",
     }
-    account_type = aliases.get(upper) or aliases.get(text) or upper
+    upper = {"沪港通": "HUGANGTONG", "深港通": "SHENGANGTONG"}.get(upper, upper)
+    account_type = connect_account_type(aliases.get(upper) or aliases.get(text) or upper)
     if account_type not in ("STOCK", "CREDIT", "FUTURE", "FUTURE_OPTION", "STOCK_OPTION", *STOCK_CONNECT_ACCOUNT_TYPES):
         raise ValueError("unsupported account_type: %s" % text)
     return account_type
@@ -2736,6 +2738,8 @@ class WebRuntimeConfig(object):
                     False,
                 )
             market_routing_enabled = parse_config_bool(market_routing_enabled, False)
+            if market_routing_enabled and account_type in ("HUGANGTONG", "SHENGANGTONG"):
+                raise ValueError("港股通请分别绑定沪港通/深港通账户，不使用 SH/SZ 独立市场路由")
             market_routes = normalize_market_bridge_config(
                 market_bridges,
                 account_id=account_id,
@@ -11720,9 +11724,6 @@ def normalize_stock_code(stock_code, account_type=None):
         normalize_account_type(account_type) if account_type not in (None, "") else ""
     )
     if normalized_account_type in STOCK_CONNECT_ACCOUNT_TYPES:
-        # The shared helper also enforces the selected Shanghai/Shenzhen Stock
-        # Connect channel and intentionally retains all five Hong Kong digits.
-        from cfquant.stock_connect import stock_connect_code
         return stock_connect_code(stock_code, normalized_account_type)
     value = str(stock_code or "").strip().upper()
     if not value:
@@ -11734,6 +11735,10 @@ def normalize_stock_code(stock_code, account_type=None):
         code = value
         market = "SH" if value.startswith("6") else "SZ"
     code = code.strip()
+    if market in ("HK", "HGT", "SGT"):
+        if normalized_account_type:
+            raise ValueError("Hong Kong market codes require a Stock Connect account")
+        return normalize_connect_code("%s.%s" % (code, market))
     if not code:
         raise ValueError("stock_code is required")
     if code.isdigit() and len(code) <= 6:
@@ -13177,6 +13182,7 @@ def submit_cftrader_order(body, method):
         for cancel in cancels:
             if cancel.get("stock_code"):
                 cancel["stock_code"] = normalize_stock_code(cancel["stock_code"], account_type)
+            validate_connect_market(account_type, cancel.get("stock_code"), cancel.get("market"))
         expected_count = len(cancels)
     else:
         fields = ("stock_code", "order_type", "order_volume", "price_type", "price", "strategy_name", "order_remark")
@@ -13185,6 +13191,7 @@ def submit_cftrader_order(body, method):
                                       body.get("order_remark", ""), stop_on_error)
         for order in orders:
             order["stock_code"] = normalize_stock_code(order["stock_code"], account_type)
+            validate_connect_market(account_type, order["stock_code"])
             if order["price_type"] == FIX_PRICE and order["price"] <= 0:
                 raise ValueError("fixed-price orders require price > 0")
             if account_type in STOCK_CONNECT_ACCOUNT_TYPES and order["price_type"] != FIX_PRICE:
@@ -13308,6 +13315,7 @@ def submit_order(body, credit_only=False, asynchronous=False):
         params["credit_action"] = action_info["credit_action"]
     if action_info["order_action"]:
         params["order_action"] = action_info["order_action"]
+    validate_connect_market(account_type, params["stock_code"])
     started = time.perf_counter()
     timeout = request_timeout_value(body.get("timeout"), default=12.0, maximum=60.0)
     route = account_request(
@@ -13483,6 +13491,8 @@ def submit_batch_orders(body, credit_only=False):
             "order_action": action_info["order_action"],
             "order_action_label": action_info["order_action_label"],
         })
+    for order in orders:
+        validate_connect_market(account_type, order["stock_code"])
     params = {
         "account": {"account_id": account_id, "account_type": account_type},
         "orders": orders,
@@ -15382,6 +15392,59 @@ def get_stock_list_in_sector(body):
     })
 
 
+def get_divid_factors(body):
+    body = body or {}
+    stock_code = str(body.get("stock_code") or "").strip()
+    if not stock_code:
+        raise ValueError("stock_code is required")
+    return data_channel_request(body, "xtdata.get_divid_factors", {
+        "args": [stock_code],
+        "stock_code": stock_code,
+        "start_time": str(body.get("start_time") or ""),
+        "end_time": str(body.get("end_time") or ""),
+    })
+
+
+def get_trading_dates(body):
+    body = body or {}
+    market = str(body.get("market") or "").strip()
+    if not market:
+        raise ValueError("market is required")
+    return data_channel_request(body, "xtdata.get_trading_dates", {
+        "market": market,
+        "start_time": str(body.get("start_time") or ""),
+        "end_time": str(body.get("end_time") or ""),
+        "count": int(body.get("count", -1)),
+    })
+
+
+def python_xtdata_request(body):
+    """Execute a whitelisted cfquant.xtdata call from the web test bench."""
+    body = body or {}
+    method = str(body.get("python_method") or "").strip()
+    allowed = {
+        name for name in dir(__import__("cfquant.xtdata", fromlist=["xtdata"]))
+        if name.startswith("get_") or name.startswith("is_") or name.startswith("subscribe_")
+        or name.startswith("download_") or name.startswith("unsubscribe_")
+    }
+    if method not in allowed or method.startswith("get_client"):
+        raise ValueError("unsupported cfquant.xtdata method")
+    from cfquant import xtdata as sdk_xtdata
+    from cfquant.channels import channels_for_bridge
+    channel = str(body.get("channel") or "normal")
+    bridge_id = body.get("bridge_id") or "default"
+    configure_kwargs = {"bridge_id": bridge_id, "request_channel": channels_for_bridge(bridge_id).get(channel, channels_for_bridge(bridge_id)["normal"])}
+    sdk_xtdata.configure(**configure_kwargs)
+    func = getattr(sdk_xtdata, method)
+    control = {"python_method", "channel", "bridge_id", "account_id", "account_type", "account_key", "timeout"}
+    args = {key: value for key, value in body.items() if key not in control}
+    if method == "get_divid_factors":
+        args = {"stock_code": str(body.get("stock_code") or ""), "start_time": str(body.get("start_time") or ""), "end_time": str(body.get("end_time") or "")}
+    elif method == "get_trading_dates":
+        args = {"market": str(body.get("market") or ""), "start_time": str(body.get("start_time") or ""), "end_time": str(body.get("end_time") or ""), "count": int(body.get("count", -1))}
+    return {"python_method": method, "result": func(**args)}
+
+
 def download_job_id(body, prefix):
     value = str((body or {}).get("job_id") or (body or {}).get("download_job_id") or "").strip()
     return value or new_id(prefix)
@@ -15804,6 +15867,12 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(get_instrument_detail(body)))
             elif parsed.path == "/api/data/sector":
                 self._write_json(ok(get_stock_list_in_sector(body)))
+            elif parsed.path == "/api/data/divid-factors":
+                self._write_json(ok(get_divid_factors(body)))
+            elif parsed.path == "/api/data/trading-dates":
+                self._write_json(ok(get_trading_dates(body)))
+            elif parsed.path == "/api/python/xtdata":
+                self._write_json(ok(python_xtdata_request(body)))
             elif parsed.path == "/api/data/history/download":
                 self._write_json(ok(download_history_data(body)))
             elif parsed.path == "/api/data/financial":
