@@ -656,6 +656,7 @@ class TxTradeBridge(object):
                 account_id,
                 account_type.lower(),
                 detail_type.lower(),
+                params.get("_qmt_strategy_name", ""),
             ) or []
         except Exception as e:
             self._log(
@@ -675,6 +676,13 @@ class TxTradeBridge(object):
                         formatted["account_type"] = (
                             account.get("account_type") or params.get("account_type") or account_type.upper()
                         )
+                    required_token = str(params.get("_qmt_strategy_name") or "")
+                    if required_token:
+                        raw_token = str(self._first_value(
+                            formatted, ("strategy_name", "m_strStrategyName", "strategyName")
+                        ) or "")
+                        if raw_token != required_token:
+                            continue
                     if detail_type.lower() in ("order", "deal"):
                         self._enrich_order_request_fields(formatted)
                         self._enrich_query_order_meta_fields(formatted, account_id, account_type)
@@ -696,12 +704,13 @@ class TxTradeBridge(object):
         )
         return result
 
-    def _call_trade_detail_data(self, func, account_id, account_type, detail_type):
+    def _call_trade_detail_data(self, func, account_id, account_type, detail_type, strategy_name=""):
         # QMT's fourth argument is strategyname, not ContextInfo.
-        variants = [
-            ((account_id, account_type, detail_type), {}),
-            ((account_id, account_type, detail_type, ""), {}),
-        ]
+        variants = ([((account_id, account_type, detail_type, strategy_name), {})]
+                    if strategy_name else [
+                        ((account_id, account_type, detail_type), {}),
+                        ((account_id, account_type, detail_type, ""), {}),
+                    ])
         last_error = None
         for args, kwargs in variants:
             try:
@@ -970,6 +979,7 @@ class TxTradeBridge(object):
         }
 
     def _order_stock(self, params, msg, resolve_order_id=True, capture_previous_id=True, trust_request_order_id=True):
+        params.pop("_cfquant_async_pending", None)
         passorder = self._get_callable("passorder")
         if not passorder:
             raise NotImplementedError("passorder not found")
@@ -999,10 +1009,14 @@ class TxTradeBridge(object):
         strategy_name = params.get("strategy_name", "")
         qmt_strategy_name = self._register_order_error_context(
             account_id,
+            account_type,
             params.get("stock_code", params.get("code", "")),
             strategy_name,
             order_remark,
         )
+        external_sync_pending = params.get("_cfquant_sync_pending")
+        if isinstance(external_sync_pending, dict):
+            external_sync_pending["request_token"] = qmt_strategy_name
         order_meta_record = None
         if self.order_meta_enabled:
             order_meta_record = self._build_order_meta_record(
@@ -1016,7 +1030,7 @@ class TxTradeBridge(object):
                 strategy_name,
             )
             self._publish_order_meta_record(order_meta_record, push=True, persist=True)
-        previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) if capture_previous_id else None
+        previous_order_id = self._get_last_order_id(account_id, account_type, qmt_strategy_name) if capture_previous_id else None
         pending_sync_order = None
         if resolve_order_id:
             pending_sync_order = self._register_pending_sync_order(
@@ -1026,9 +1040,33 @@ class TxTradeBridge(object):
                 order_remark,
                 strategy_name,
                 previous_order_id,
+                dates=order_meta.order_dates(params),
+                request_token=qmt_strategy_name,
             )
         if order_meta_record is not None:
             order_meta_record["previous_order_id"] = previous_order_id
+            order_meta_record["qmt_strategy_name"] = qmt_strategy_name
+            self._publish_order_meta_record(order_meta_record, push=True, persist=True)
+        pending_async_order = None
+        if (
+            not trust_request_order_id
+            and isinstance(params.get("seq"), int)
+            and not isinstance(params.get("seq"), bool)
+            and params.get("seq") > 0
+            and (msg.get("client_id") or msg.get("reply_channel"))
+        ):
+            pending_async_order = self._async_order_record(
+                params,
+                msg,
+                {
+                    "account_type": account_type,
+                    "order_remark": order_remark,
+                    "previous_order_id": previous_order_id,
+                    "request_token": qmt_strategy_name,
+                },
+            )
+            params["_cfquant_async_pending"] = pending_async_order
+            self._register_pending_async_order(pending_async_order)
         if not self.order_meta_enabled:
             # Register before passorder so a synchronous QMT error can still be correlated.
             self._remember_order_request(
@@ -1036,6 +1074,8 @@ class TxTradeBridge(object):
                 params.get("stock_code", params.get("code", "")),
                 order_remark,
                 strategy_name,
+                account_type=account_type,
+                trading_day=order_meta.order_dates(params).get("trading_day"),
             )
         try:
             result = passorder(
@@ -1052,7 +1092,7 @@ class TxTradeBridge(object):
                 self.context,
             )
         except Exception as e:
-            self._discard_order_error_context(account_id, params.get("stock_code", params.get("code", "")), qmt_strategy_name)
+            self._discard_pending_async_order(pending_async_order)
             if pending_sync_order is not None:
                 self._discard_pending_sync_order(pending_sync_order)
             if order_meta_record is not None:
@@ -1081,6 +1121,7 @@ class TxTradeBridge(object):
                 order_meta_record["canonical_order_id"] = order_id
                 order_meta_record["order_ref"] = str(order_id)
         if failed:
+            self._discard_pending_async_order(pending_async_order)
             if pending_sync_order is not None:
                 self._discard_pending_sync_order(pending_sync_order)
             if order_meta_record is not None:
@@ -1096,6 +1137,8 @@ class TxTradeBridge(object):
                 order_remark,
                 strategy_name,
                 order_id=order_id,
+                account_type=account_type,
+                trading_day=order_meta.order_dates(params).get("trading_day"),
             )
         if resolve_order_id and order_id is None and not failed:
             order_id = self._find_order_id(
@@ -1120,6 +1163,8 @@ class TxTradeBridge(object):
                 order_remark,
                 strategy_name,
                 order_id=order_id,
+                account_type=account_type,
+                trading_day=order_meta.order_dates(params).get("trading_day"),
             )
         if pending_sync_order is not None:
             self._discard_pending_sync_order(pending_sync_order)
@@ -1139,36 +1184,54 @@ class TxTradeBridge(object):
             text = text[2:]
         return text.split(".", 1)[0]
 
-    def _register_order_error_context(self, account_id, stock_code, strategy_name, order_remark):
+    def _register_order_error_context(self, account_id, account_type, stock_code, strategy_name, order_remark):
         original = str(strategy_name or "")
         internal = "%s&&&_cfq_%s" % (original, uuid.uuid4().hex[:12]) if original else "cfq_%s" % uuid.uuid4().hex[:12]
-        key = (str(account_id or "").strip(), self._order_error_code(stock_code), internal)
+        key = (
+            order_meta.normalize_bridge_id(self.bridge_id),
+            self._identity_account_type(account_type),
+            str(account_id or "").strip(),
+            internal,
+        )
         now = time.time()
         with self.order_error_contexts_lock:
-            cutoff = now - 300.0
-            self.order_error_contexts = {
-                item_key: item for item_key, item in self.order_error_contexts.items()
-                if item.get("created_at", now) >= cutoff
-            }
             self.order_error_contexts[key] = {
-                "account_id": key[0], "stock_code": key[1],
+                "bridge_id": key[0], "account_type": key[1], "account_id": key[2],
+                "stock_code": self._order_error_code(stock_code),
                 "internal_strategy_name": internal, "strategy_name": original,
                 "order_remark": str(order_remark or ""), "created_at": now,
                 "lifecycle": "pending",
             }
-            while len(self.order_error_contexts) > 4096:
+            while len(self.order_error_contexts) > 65536:
                 self.order_error_contexts.pop(next(iter(self.order_error_contexts)))
         return internal
 
-    def _discard_order_error_context(self, account_id, stock_code, internal_strategy):
-        key = (str(account_id or "").strip(), self._order_error_code(stock_code), str(internal_strategy or ""))
+    def _discard_order_error_context(self, account_id, account_type, internal_strategy):
+        key = (
+            order_meta.normalize_bridge_id(self.bridge_id),
+            self._identity_account_type(account_type),
+            str(account_id or "").strip(),
+            str(internal_strategy or ""),
+        )
         with self.order_error_contexts_lock:
             self.order_error_contexts.pop(key, None)
 
-    def _consume_order_error_context(self, account_id, stock_code, internal_strategy):
-        key = (str(account_id or "").strip(), self._order_error_code(stock_code), str(internal_strategy or ""))
+    def _consume_order_error_context(self, account_id, account_type, internal_strategy):
+        key = (
+            order_meta.normalize_bridge_id(self.bridge_id),
+            self._identity_account_type(account_type),
+            str(account_id or "").strip(),
+            str(internal_strategy or ""),
+        )
         with self.order_error_contexts_lock:
-            return self.order_error_contexts.pop(key, None)
+            context = self.order_error_contexts.get(key)
+            if context is not None or key[1] or not key[2] or not key[3]:
+                return context
+            candidates = [
+                item for item_key, item in self.order_error_contexts.items()
+                if item_key[0] == key[0] and item_key[2] == key[2] and item_key[3] == key[3]
+            ]
+            return candidates[0] if len(candidates) == 1 else None
 
     def _register_pending_sync_order(
         self,
@@ -1178,14 +1241,21 @@ class TxTradeBridge(object):
         order_remark,
         strategy_name,
         previous_order_id,
+        dates=None,
+        request_token="",
     ):
+        dates = dates or {}
         record = {
+            "bridge_id": order_meta.normalize_bridge_id(self.bridge_id),
             "account_id": str(account_id or "").strip(),
-            "account_type": str(account_type or "").upper(),
+            "account_type": self._identity_account_type(account_type),
             "stock_code": str(stock_code or "").strip().upper(),
             "order_remark": str(order_remark or ""),
             "strategy_name": str(strategy_name or ""),
             "previous_order_id": previous_order_id,
+            "request_token": str(request_token or ""),
+            "trading_day": dates.get("trading_day") or "",
+            "order_date": dates.get("order_date") or "",
             "created_at": time.time(),
             "event": threading.Event(),
         }
@@ -1212,6 +1282,10 @@ class TxTradeBridge(object):
         if not isinstance(order, dict):
             return False
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
+        account_type = self._identity_account_type(self._first_value(
+            order, ("account_type", "m_nBrokerType", "m_nAccountType")
+        ))
+        dates = self._order_dates(order)
         order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
         strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
@@ -1220,6 +1294,8 @@ class TxTradeBridge(object):
         with self.pending_sync_orders_lock:
             for record in list(self.pending_sync_orders):
                 if account_id and record.get("account_id") and account_id != record.get("account_id"):
+                    continue
+                if not self._identity_scope_matches(record, account_type, dates):
                     continue
                 expected_code = str(record.get("stock_code") or "").upper()
                 if (
@@ -1233,7 +1309,10 @@ class TxTradeBridge(object):
                 if not order_remark or order_remark != expected_remark:
                     continue
                 expected_strategy = str(record.get("strategy_name") or "")
-                if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
+                expected_token = str(record.get("request_token") or "")
+                if expected_token and strategy_name != expected_token:
+                    continue
+                if not expected_token and not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
                     continue
                 if self._is_previous_order_detail(order, record.get("previous_order_id")):
                     continue
@@ -1301,6 +1380,10 @@ class TxTradeBridge(object):
             try:
                 orders = self._query_trade_detail({
                     "account": {"account_id": account_id, "account_type": account_type},
+                    "_qmt_strategy_name": (
+                        pending_sync_order.get("request_token", "")
+                        if pending_sync_order is not None else ""
+                    ),
                 }, "order")
                 candidates = []
                 callback_candidates = []
@@ -1309,6 +1392,14 @@ class TxTradeBridge(object):
                     if pending_sync_order is not None else None
                 )
                 for order in orders or []:
+                    if pending_sync_order is not None and not self._identity_scope_matches(
+                        pending_sync_order,
+                        self._identity_account_type(self._first_value(
+                            order, ("account_type", "m_nBrokerType", "m_nAccountType")
+                        )),
+                        self._order_dates(order),
+                    ):
+                        continue
                     if str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "") != str(order_remark or ""):
                         continue
                     stock_code = str(params.get("stock_code", params.get("code", "")) or "").upper()
@@ -1446,6 +1537,7 @@ class TxTradeBridge(object):
         order_remark,
         strategy_name,
     ):
+        dates = order_meta.order_dates(params)
         return order_meta.normalize_record(
             {
                 "bridge_id": self.bridge_id,
@@ -1463,6 +1555,8 @@ class TxTradeBridge(object):
                 "quick_trade": params.get("quick_trade", 2),
                 "request_id": (msg or {}).get("id", ""),
                 "request_channel": self.request_channel,
+                "trading_day": dates["trading_day"],
+                "order_date": dates["order_date"],
                 "status": "pending",
                 "created_at": time.time(),
             },
@@ -1626,35 +1720,65 @@ class TxTradeBridge(object):
         return {"seq": seq, "accepted": True, "request_result": request_result}
 
     def _async_order_record(self, params, msg, result):
+        existing = params.get("_cfquant_async_pending")
+        if isinstance(existing, dict):
+            return existing
         account = params.get("account") or {}
+        dates = order_meta.order_dates(params)
         return {
+            "bridge_id": order_meta.normalize_bridge_id(self.bridge_id),
             "seq": params.get("seq"),
             "client_id": msg.get("client_id") or msg.get("reply_channel"),
             "account_id": account.get("account_id") or params.get("account_id") or self.account_id,
-            "account_type": result.get("account_type") or self._account_type_name(
+            "account_type": self._identity_account_type(result.get("account_type") or self._account_type_name(
                 account.get("account_type") or params.get("account_type")
-            ).upper(),
+            )),
             "stock_code": str(params.get("stock_code", params.get("code", "")) or "").upper(),
             "strategy_name": params.get("strategy_name", ""),
             "order_remark": result.get("order_remark", params.get("order_remark", "")),
             "previous_order_id": result.get("previous_order_id"),
+            "request_token": result.get("request_token", ""),
+            "trading_day": dates["trading_day"],
+            "order_date": dates["order_date"],
             "created_at": time.time(),
         }
 
     def _register_pending_async_order(self, record):
+        if not isinstance(record, dict):
+            return record
         with self.pending_async_orders_lock:
+            if record.get("_completed"):
+                return record
             self._prune_pending_async_orders_locked()
-            self.pending_async_orders.append(record)
+            if not any(item is record for item in self.pending_async_orders):
+                self.pending_async_orders.append(record)
+        return record
 
-    def _remember_order_request(self, account_id, stock_code, order_remark, strategy_name, order_id=None):
+    def _discard_pending_async_order(self, record):
+        if not isinstance(record, dict):
+            return
+        with self.pending_async_orders_lock:
+            self.pending_async_orders[:] = [item for item in self.pending_async_orders if item is not record]
+
+    def _remember_order_request(
+        self, account_id, stock_code, order_remark, strategy_name, order_id=None,
+        account_type="", trading_day="",
+    ):
         key = (
+            order_meta.normalize_bridge_id(self.bridge_id),
+            self._identity_account_type(account_type),
             str(account_id or "").strip(),
+            order_meta.order_dates({"trading_day": trading_day})["trading_day"],
             str(stock_code or "").strip().upper().split(".", 1)[0],
             str(order_remark or ""),
         )
-        if not key[0] or not key[2]:
+        if not key[2] or not key[5]:
             return
         metadata = {
+            "bridge_id": key[0],
+            "account_type": key[1],
+            "account_id": key[2],
+            "trading_day": key[3],
             "strategy_name": str(strategy_name or ""),
             "order_remark": str(order_remark or ""),
             "order_id": self._normalize_order_id(order_id),
@@ -1667,52 +1791,60 @@ class TxTradeBridge(object):
     def _enrich_order_request_fields(self, order):
         if not isinstance(order, dict):
             return order
+        explicit_bridge = order.get("bridge_id")
+        bridge_matches = (
+            explicit_bridge in (None, "")
+            or order_meta.normalize_bridge_id(explicit_bridge) == order_meta.normalize_bridge_id(self.bridge_id)
+        )
+        account_id, account_type = self._strict_order_callback_scope(order)
+        raw_strategy = str(self._first_value(order, ("strategy_name", "m_strStrategyName", "strategyName")) or "")
+        alias = self._consume_order_error_context(account_id, account_type, raw_strategy) if bridge_matches else None
+        if alias is not None:
+            original = str(alias.get("strategy_name") or "")
+            order["strategy_name"] = original
+            order["m_strStrategyName"] = original
+            if "strategyName" in order:
+                order["strategyName"] = original
+        dates = self._order_dates(order)
         key = (
+            order_meta.normalize_bridge_id(self.bridge_id),
+            self._identity_account_type(self._first_value(
+                order, ("account_type", "m_nBrokerType", "m_nAccountType")
+            )),
             str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip(),
+            dates["trading_day"],
             str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
             str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or ""),
         )
         with self.order_request_metadata_lock:
             metadata = self.order_request_metadata.get(key)
             matched_key = key if metadata is not None else None
-            if metadata is None and key[0]:
-                callback_order_ids = set()
-                for name in (
-                    "order_id",
-                    "m_nRef",
-                    "m_nOrderID",
-                    "m_strOrderRef",
-                    "m_strOrderID",
-                ):
-                    order_id = self._normalize_order_id(self._first_value(order, (name,)))
-                    if order_id is not None:
-                        callback_order_ids.add(str(order_id))
-                if callback_order_ids:
-                    matches = []
-                    for candidate_key, candidate in self.order_request_metadata.items():
-                        if candidate_key[0] != key[0]:
-                            continue
-                        if key[1] and candidate_key[1] and key[1] != candidate_key[1]:
-                            continue
-                        if isinstance(candidate, dict):
-                            candidate_id = self._normalize_order_id(candidate.get("order_id"))
-                        else:
-                            candidate_id = None
-                        if candidate_id is not None and str(candidate_id) in callback_order_ids:
-                            matches.append((candidate_key, candidate))
-                    if len(matches) == 1:
-                        matched_key, metadata = matches[0]
+        # A user remark is not an order identity.  This legacy cache may have
+        # been overwritten by another request with the same labels; use it
+        # only when QMT itself supplied the matching dated internal reference.
+        raw_ref = self._normalize_order_id(order.get("m_nRef"))
+        if (
+            not bridge_matches
+            or not account_id
+            or not account_type
+            or (account_id, account_type) != (key[2], key[1])
+            or not isinstance(metadata, dict)
+            or not dates["trading_day"]
+            or raw_ref is None
+            or raw_ref != self._normalize_order_id(metadata.get("order_id"))
+        ):
+            return order
         if isinstance(metadata, dict):
             strategy_name = str(metadata.get("strategy_name") or "")
             order_remark = str(
                 metadata.get("order_remark")
-                or (matched_key[2] if matched_key is not None else "")
+                or (matched_key[5] if matched_key is not None else "")
             )
             order_id = self._normalize_order_id(metadata.get("order_id"))
         else:
             # Keep compatibility with bridges created before metadata became structured.
             strategy_name = metadata
-            order_remark = str(matched_key[2] if matched_key is not None else "")
+            order_remark = str(matched_key[5] if matched_key is not None else "")
             order_id = None
         if strategy_name is not None and not order.get("strategy_name"):
             order["strategy_name"] = strategy_name
@@ -1724,14 +1856,8 @@ class TxTradeBridge(object):
             for name in ("m_strRemark", "m_strOrderRemark"):
                 if not order.get(name):
                     order[name] = order_remark
-        if order_id is not None:
-            order_meta.reconcile_order_id(order, order_id)
-            for name in ("m_nRef", "m_nOrderID"):
-                if self._normalize_order_id(order.get(name)) is None:
-                    order[name] = order_id
-            for name in ("m_strOrderRef", "m_strOrderID"):
-                if order.get(name) is None or str(order.get(name)).strip() in ("", "0", "-1"):
-                    order[name] = str(order_id)
+        if order_id is not None and self._normalize_order_id(order.get("order_id")) is None:
+            order["order_id"] = order_id
         return order
 
     def _enrich_query_order_meta_fields(self, data, account_id="", account_type=""):
@@ -1776,35 +1902,13 @@ class TxTradeBridge(object):
             account_type=account_type or data.get("account_type"),
             account_id=account_id or data.get("account_id"),
         )
-        order_refs = order_meta.order_ref_candidates_from_data(callback_record)
-        user_order_id = order_meta.normalize_text(callback_record.get("user_order_id"))
-        with self.order_meta_cache.lock:
-            self.order_meta_cache.prune()
-            ctx = self.order_meta_cache._ctx(callback_record)
-            for order_ref in order_refs:
-                record = self.order_meta_cache.by_ref.get(ctx + (order_ref,))
-                if record:
-                    return record, {"match_confidence": "order_ref"}
-            if user_order_id:
-                record = self.order_meta_cache.by_user.get(ctx + (user_order_id,))
-                if record:
-                    bound_order_ref = ""
-                    if order_refs:
-                        existing_refs = order_meta.order_ref_candidates_from_data(record)
-                        existing_set = set(existing_refs)
-                        bound_refs = [ref for ref in order_refs if ref not in existing_set]
-                        order_meta.merge_order_ref_candidates(record, order_refs)
-                        if not order_meta.normalize_order_ref(record.get("order_ref")):
-                            record["order_ref"] = order_refs[0]
-                            record["m_strOrderRef"] = order_refs[0]
-                        record["updated_at"] = time.time()
-                        self.order_meta_cache._upsert_locked(record)
-                        bound_order_ref = order_refs[0] if bound_refs else ""
-                    return record, {
-                        "match_confidence": "user_order_id",
-                        "bound_order_ref": bound_order_ref,
-                    }
-        return None, {}
+        return self.order_meta_cache.resolve_callback(
+            callback_record,
+            bridge_id=self.bridge_id,
+            account_type=account_type,
+            account_id=account_id,
+            allow_pending=False,
+        )
 
     def _prune_pending_async_orders_locked(self):
         wait_seconds = os.environ.get("CFQUANT_ASYNC_ORDER_RESPONSE_WAIT_SECONDS", 60.0)
@@ -1818,37 +1922,106 @@ class TxTradeBridge(object):
             if item.get("created_at", 0) >= cutoff
         ]
 
+    def _identity_account_type(self, value):
+        """Canonicalize a QMT account type without guessing a default."""
+        if value in (None, ""):
+            return ""
+        parsed = value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            try:
+                parsed = int(text)
+            except (TypeError, ValueError):
+                parsed = text
+        return str(self._account_type_name(parsed) or "").strip().upper()
+
+    def _strict_order_callback_scope(self, order):
+        """Return explicit QMT account scope, rejecting contradictory aliases."""
+        account_ids = {
+            str(order.get(name)).strip()
+            for name in ("account_id", "m_strAccountID", "accountID")
+            if isinstance(order, dict) and order.get(name) not in (None, "")
+        }
+        account_types = {
+            self._identity_account_type(order.get(name))
+            for name in ("account_type", "m_nBrokerType", "m_nAccountType", "m_strAccountType")
+            if isinstance(order, dict) and order.get(name) not in (None, "")
+        }
+        account_types.discard("")
+        if len(account_ids) != 1 or len(account_types) > 1:
+            return "", ""
+        return next(iter(account_ids)), next(iter(account_types)) if account_types else ""
+
+    def _order_dates(self, data):
+        if isinstance(data, dict):
+            return order_meta.order_dates(data)
+        return order_meta.order_dates({
+            name: self._get_value(data, name)
+            for name in (
+                "trading_day", "trade_date", "order_date", "m_strTradingDay",
+                "m_strTradeDate", "m_nTradingDay", "m_nTradeDate",
+                "m_strOrderDate", "m_nOrderDate",
+            )
+        })
+
+    @staticmethod
+    def _identity_scope_matches(record, account_type, dates):
+        expected_type = str(record.get("account_type") or "").strip().upper()
+        if account_type and expected_type and account_type != expected_type:
+            return False
+        expected_day = str(record.get("trading_day") or "")
+        actual_day = str((dates or {}).get("trading_day") or "")
+        # A record with a known QMT day cannot be attributed to an undated or
+        # different callback/query row.  No PC clock fallback is permitted.
+        if expected_day and expected_day != actual_day:
+            return False
+        return True
+
     def _consume_pending_async_order(self, order):
-        order_id = self._order_id_from_detail(order)
-        if order_id is None:
+        raw_ref = self._get_value(order, "m_nRef")
+        raw_ref_key = order_meta.normalize_order_ref(raw_ref)
+        order_id = self._normalize_order_id(raw_ref)
+        if not raw_ref_key or order_id is None:
             return None
-        account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
-        strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
-        stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
-        stock_code_base = stock_code.split(".", 1)[0]
+        account_id, account_type = self._strict_order_callback_scope(order)
+        dates = self._order_dates(order)
+        request_token = str(self._first_value(order, ("strategy_name", "m_strStrategyName", "strategyName")) or "")
+        callback_bridge = order_meta.normalize_bridge_id(order.get("bridge_id") or self.bridge_id)
+        if (
+            not account_id
+            or not account_type
+            or not dates["trading_day"]
+            or not request_token
+            or callback_bridge != order_meta.normalize_bridge_id(self.bridge_id)
+        ):
+            return None
         with self.pending_async_orders_lock:
             self._prune_pending_async_orders_locked()
+            candidates = []
             for index, item in enumerate(self.pending_async_orders):
-                if account_id and str(item.get("account_id") or "").strip() != account_id:
+                if str(item.get("bridge_id") or "") != callback_bridge:
                     continue
-                if item.get("previous_order_id") is not None and order_id == item.get("previous_order_id"):
+                if str(item.get("account_id") or "").strip() != account_id:
                     continue
-                expected_remark = str(item.get("order_remark") or "")
-                expected_strategy = str(item.get("strategy_name") or "")
-                if order_remark and expected_remark and order_remark != expected_remark:
+                if str(item.get("account_type") or "").strip().upper() != account_type:
                     continue
-                if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
+                if str(item.get("request_token") or "") != request_token:
                     continue
-                expected_code = str(item.get("stock_code") or "").upper()
-                if (
-                    expected_code
-                    and stock_code
-                    and expected_code != stock_code
-                    and expected_code.split(".", 1)[0] != stock_code_base
-                ):
+                expected_day = str(item.get("trading_day") or "")
+                if expected_day and expected_day != dates["trading_day"]:
                     continue
-                return self.pending_async_orders.pop(index), order_id
+                previous = self._order_reference_key(item.get("previous_order_id"))
+                if previous and previous == raw_ref_key:
+                    continue
+                candidates.append(index)
+            if len(candidates) == 1:
+                record = self.pending_async_orders.pop(candidates[0])
+                record["trading_day"] = dates["trading_day"]
+                record["m_nRef"] = raw_ref
+                record["_completed"] = True
+                return record, order_id
         return None
 
     def _handle_async_order_callback(self, order):
@@ -1861,14 +2034,17 @@ class TxTradeBridge(object):
             order["strategy_name"] = record.get("strategy_name", "")
             if not order.get("m_strRemark"):
                 order["m_strRemark"] = record.get("order_remark", "")
-            if not order.get("m_strStrategyName"):
-                order["m_strStrategyName"] = record.get("strategy_name", "")
+            order["m_strStrategyName"] = record.get("strategy_name", "")
+            if "strategyName" in order:
+                order["strategyName"] = record.get("strategy_name", "")
         self._remember_order_request(
             record.get("account_id"),
             record.get("stock_code"),
             record.get("order_remark"),
             record.get("strategy_name"),
             order_id=order_id,
+            account_type=record.get("account_type"),
+            trading_day=record.get("trading_day"),
         )
         self._send_async_order_response(record, order_id)
         return True
@@ -1929,14 +2105,147 @@ class TxTradeBridge(object):
             raise NotImplementedError("cancel not found")
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
-        order_id = str(params.get("order_id", ""))
         if not account_id:
             raise ValueError("account_id is required")
-        if not order_id:
-            raise ValueError("order_id is required")
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+        internal_ref = params.get("internal_ref", params.get("m_nRef"))
+        order_id_kind = str(params.get("order_id_kind") or "auto").strip().lower()
+        if order_id_kind not in ("auto", "internal", "native", "sysid"):
+            raise ValueError("unsupported order_id_kind")
+        if internal_ref in (None, "") and order_id_kind == "internal":
+            internal_ref = params.get("order_id")
+        if internal_ref not in (None, ""):
+            order_id = self._resolve_internal_cancel_order_id(
+                account_id, account_type, internal_ref, params
+            )
+        else:
+            # Keep the established direct QMT cancellation route for callers
+            # that supplied a native order id.  It takes no date argument.
+            order_id = str(params.get("order_id", ""))
+            if not order_id:
+                raise ValueError("order_id is required")
+            trading_day = self._requested_trading_day(params)
+            query_func = self._get_callable("get_trade_detail_data")
+            if (trading_day or order_id_kind not in ("native", "sysid")) and not query_func:
+                raise ValueError("order identity verification requires QMT order query support")
+            if query_func:
+                order_id = self._resolve_verified_cancel_order_id(
+                    account_id, account_type, order_id, trading_day, order_id_kind
+                )
         result = cancel_func(order_id, account_id, account_type, self.context)
-        return {"cancel_result": 0 if result else -1, "request_result": result, "order_id": order_id}
+        data = {
+            "cancel_result": 0 if result else -1,
+            "request_result": result,
+            "order_id": order_id,
+            "native_order_id": order_id,
+        }
+        if internal_ref not in (None, ""):
+            data["internal_ref"] = self._normalize_order_id(internal_ref) or str(internal_ref)
+        return data
+
+    def _resolve_internal_cancel_order_id(self, account_id, account_type, internal_ref, params):
+        internal_key = self._order_reference_key(internal_ref)
+        if not internal_key:
+            raise ValueError("internal_ref is required")
+        trading_day = self._requested_trading_day(params)
+        if not trading_day:
+            raise ValueError("internal_ref cancellation requires authoritative trading_day")
+        rows = self._query_trade_detail({
+            "account": {"account_id": account_id, "account_type": account_type},
+        }, "order")
+        candidates = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("account_id") or "").strip() not in ("", str(account_id).strip()):
+                continue
+            row_type = self._identity_account_type(self._first_value(
+                row, ("account_type", "m_nBrokerType", "m_nAccountType")
+            ))
+            expected_type = self._identity_account_type(account_type)
+            if row_type and expected_type and row_type != expected_type:
+                continue
+            if trading_day and self._order_dates(row).get("trading_day") != trading_day:
+                continue
+            if self._order_reference_key(row.get("m_nRef")) != internal_key:
+                continue
+            native_id = self._first_value(row, ("m_strOrderSysID", "order_sysid", "native_order_id"))
+            if native_id in (None, ""):
+                continue
+            identity = (
+                str(native_id),
+                self._order_reference_key(row.get("m_strOrderID")),
+                self._order_reference_key(row.get("m_nOrderID")),
+            )
+            if identity not in candidates:
+                candidates.append(identity)
+        if len(candidates) != 1:
+            raise ValueError(
+                "internal_ref cancellation requires exactly one QMT order for account/type/trading_day/ref"
+            )
+        return candidates[0][0]
+
+    def _resolve_verified_cancel_order_id(self, account_id, account_type, order_id, trading_day, order_id_kind="auto"):
+        """Resolve a verified QMT reference to its cancellable counter id."""
+        target = self._order_reference_key(order_id)
+        if not target:
+            raise ValueError("order_id is required")
+        native_matches = []
+        local_matches = []
+        for row in self._query_trade_detail({
+            "account": {"account_id": account_id, "account_type": account_type},
+        }, "order") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("account_id") or "").strip() not in ("", str(account_id).strip()):
+                continue
+            row_type = self._identity_account_type(self._first_value(
+                row, ("account_type", "m_nBrokerType", "m_nAccountType")
+            ))
+            expected_type = self._identity_account_type(account_type)
+            if row_type and expected_type and row_type != expected_type:
+                continue
+            if trading_day and self._order_dates(row).get("trading_day") != trading_day:
+                continue
+            native_id = self._order_reference_key(self._first_value(
+                row, ("native_order_id", "order_sysid", "m_strOrderSysID")
+            ))
+            if native_id == target:
+                native_matches.append((row, native_id))
+                continue
+            for name in (() if order_id_kind in ("native", "sysid") else ("m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID", "order_id")):
+                if self._order_reference_key(row.get(name)) == target:
+                    if native_id:
+                        local_matches.append((row, native_id))
+                    break
+        if local_matches and not trading_day:
+            raise ValueError("internal/local order_id cancellation requires authoritative trading_day")
+        matches = native_matches + local_matches
+        if trading_day and len(matches) != 1:
+            raise ValueError(
+                "order_id cancellation requires exactly one QMT order for account/type/trading_day"
+            )
+        if not trading_day and len(matches) > 1:
+            raise ValueError("order_id cancellation is ambiguous across QMT orders")
+        if matches:
+            return matches[0][1]
+        raise ValueError("order_id is not a verified QMT cancellable counter id")
+
+    @staticmethod
+    def _requested_trading_day(params):
+        raw_values = []
+        normalized_values = []
+        for name in order_meta.TRADING_DAY_FIELDS:
+            value = (params or {}).get(name)
+            if order_meta.normalize_text(value):
+                raw_values.append(value)
+                normalized = order_meta.normalize_date(value)
+                if not normalized:
+                    raise ValueError("trading_day must be an authoritative YYYYMMDD date")
+                normalized_values.append(normalized)
+        if len(set(normalized_values)) > 1:
+            raise ValueError("conflicting authoritative trading_day values")
+        return normalized_values[0] if raw_values else ""
 
     def _cancel_order_stock_async(self, params, msg):
         result = self._cancel_order_stock(params)
@@ -1944,16 +2253,19 @@ class TxTradeBridge(object):
             "seq": params.get("seq"),
             "account_id": (params.get("account") or {}).get("account_id", params.get("account_id", "")),
             "account_type": self._account_type_name((params.get("account") or {}).get("account_type") or params.get("account_type")).upper(),
-            "order_id": params.get("order_id"),
+            "order_id": result.get("order_id", params.get("order_id")) if isinstance(result, dict) else params.get("order_id"),
             "order_sysid": result.get("order_sysid", "") if isinstance(result, dict) else "",
             "cancel_result": result.get("cancel_result", -1) if isinstance(result, dict) else result,
             "error_msg": result.get("error_msg", "") if isinstance(result, dict) else "",
         }
+        if isinstance(result, dict) and result.get("internal_ref") not in (None, ""):
+            data["internal_ref"] = result["internal_ref"]
         self._send_trader_event(msg.get("client_id"), "on_cancel_order_stock_async_response", data)
         return result
 
     def _cancel_order_stock_sysid(self, params):
         row = dict(params)
+        row["order_id_kind"] = "sysid"
         row["order_id"] = params.get("sysid", params.get("order_id", ""))
         result = self._cancel_order_stock(row)
         result["market"] = params.get("market")
@@ -3382,6 +3694,16 @@ class TxTradeBridge(object):
     def _format_trade_detail(self, obj, detail_type):
         data = self._format_trade_detail_payload(obj, detail_type)
         if isinstance(data, dict):
+            dates = self._order_dates(obj)
+            normalized_type = str(detail_type or "").lower()
+            if normalized_type in ("order", "deal"):
+                data["trading_day"] = dates["trading_day"]
+            if normalized_type == "order":
+                # QMT's trading day may differ from the calendar order date.
+                if dates["order_date"]:
+                    data["order_date"] = dates["order_date"]
+            elif normalized_type == "deal":
+                data["trade_date"] = dates["trading_day"]
             for name in TRADE_IDENTITY_FIELDS:
                 value = self._get_value(obj, name)
                 if value is not None:
@@ -3419,7 +3741,6 @@ class TxTradeBridge(object):
                     "m_strOrderDate",
                     "m_strEntrustDate",
                     "m_strInsertDate",
-                    "m_strTradingDay",
                     "m_nOrderDate",
                     "m_nEntrustDate",
                     "m_nInsertDate",
@@ -3463,8 +3784,8 @@ class TxTradeBridge(object):
                 "m_strOrderSysID": self._get_value(obj, "m_strOrderSysID"),
                 "m_nRef": self._get_value(obj, "m_nRef"),
                 "m_strOrderRef": self._get_value(obj, "m_strOrderRef"),
-                "m_nOrderID": self._first_value(obj, ("m_nOrderID", "m_nRef")),
-                "m_strOrderID": self._first_value(obj, ("m_strOrderID", "m_strOrderRef")),
+                "m_nOrderID": self._get_value(obj, "m_nOrderID"),
+                "m_strOrderID": self._get_value(obj, "m_strOrderID"),
                 "m_nOrderStatus": self._get_value(obj, "m_nOrderStatus"),
                 "m_nOrderSubmitStatus": self._get_value(obj, "m_nOrderSubmitStatus"),
                 "m_nVolumeTotal": self._get_value(obj, "m_nVolumeTotal"),
@@ -3485,6 +3806,8 @@ class TxTradeBridge(object):
                 "m_strOrderDate": self._get_value(obj, "m_strOrderDate"),
                 "m_strEntrustDate": self._get_value(obj, "m_strEntrustDate"),
                 "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
+                "m_nOrderDate": self._get_value(obj, "m_nOrderDate"),
+                "m_nTradingDay": self._get_value(obj, "m_nTradingDay"),
             }
         if detail_type == "deal":
             return {
@@ -3542,8 +3865,8 @@ class TxTradeBridge(object):
                 "m_strAccountID": self._get_value(obj, "m_strAccountID"),
                 "m_nRef": self._get_value(obj, "m_nRef"),
                 "m_strOrderRef": self._get_value(obj, "m_strOrderRef"),
-                "m_nOrderID": self._first_value(obj, ("m_nOrderID", "m_nRef")),
-                "m_strOrderID": self._first_value(obj, ("m_strOrderID", "m_strOrderRef")),
+                "m_nOrderID": self._get_value(obj, "m_nOrderID"),
+                "m_strOrderID": self._get_value(obj, "m_strOrderID"),
                 "m_strOrderSysID": self._get_value(obj, "m_strOrderSysID"),
                 "m_strTradeID": self._get_value(obj, "m_strTradeID"),
                 "m_strDealID": self._get_value(obj, "m_strDealID"),
@@ -3558,6 +3881,8 @@ class TxTradeBridge(object):
                 "m_strTradeDate": self._get_value(obj, "m_strTradeDate"),
                 "m_strDealDate": self._get_value(obj, "m_strDealDate"),
                 "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
+                "m_nTradeDate": self._get_value(obj, "m_nTradeDate"),
+                "m_nTradingDay": self._get_value(obj, "m_nTradingDay"),
             }
         if detail_type == "position":
             return {

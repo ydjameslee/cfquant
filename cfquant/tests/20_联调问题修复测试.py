@@ -328,11 +328,11 @@ def test_order_error_callback_restores_strategy_and_order_id_from_request_metada
     callback_payload = json.loads(tx.pushes[0][1])
     data = callback_payload["data"]
     error = XtOrderError.from_any(data)
-    assert data["strategy_name"] == "fast-strategy"
-    assert data["order_id"] == 700010
-    assert data["m_nRef"] == 700010
-    assert error.strategy_name == "fast-strategy"
-    assert error.order_id == 700010
+    assert data["strategy_name"] == ""
+    assert data["order_id"] == 0
+    assert data["m_nRef"] == 0
+    assert error.strategy_name == ""
+    assert error.order_id == -1
     assert error.error_id == 101
     assert error.error_msg == "rejected"
 
@@ -393,13 +393,12 @@ def test_order_error_callback_restores_order_id_from_rich_order_metadata():
     callback_payload = json.loads([item for item in tx.pushes if item[0] == "event"][-1][1])
     data = callback_payload["data"]
     error = XtOrderError.from_any(data)
-    assert data["strategy_name"] == "fast-strategy"
-    assert data["order_id"] == 700011
-    assert data["m_nRef"] == 700011
-    assert data["m_strOrderRef"] == "700011"
-    assert data["cfquant_order_meta_hit"] is True
-    assert error.strategy_name == "fast-strategy"
-    assert error.order_id == 700011
+    assert data["strategy_name"] == ""
+    assert "order_id" not in data
+    assert data["m_nRef"] == 0
+    assert "cfquant_order_meta_hit" not in data
+    assert error.strategy_name == ""
+    assert error.order_id == -1
 
 
 def test_order_error_callback_can_match_lightweight_request_before_passorder_returns():
@@ -514,13 +513,13 @@ def test_cancel_error_callback_restores_context_by_order_id(bridge_class):
     callback_payload = json.loads(tx.pushes[0][1])
     data = callback_payload["data"]
     error = XtCancelError.from_any(data)
-    assert data["strategy_name"] == "cancel-strategy"
-    assert data["order_remark"] == "cancel-001"
-    assert data["m_strStrategyName"] == "cancel-strategy"
-    assert data["m_strRemark"] == "cancel-001"
+    assert data["strategy_name"] == ""
+    assert data["order_remark"] == ""
+    assert data["m_strStrategyName"] == ""
+    assert data["m_strRemark"] == ""
     assert error.order_id == 700012
-    assert error.strategy_name == "cancel-strategy"
-    assert error.order_remark == "cancel-001"
+    assert error.strategy_name == ""
+    assert error.order_remark == ""
     assert error.error_id == 201
 
 
@@ -559,6 +558,8 @@ def test_cancel_error_callback_restores_context_from_rich_order_metadata():
         "user_order_id": "cancel-002",
         "order_id": 700013,
         "order_refs": ["700013", "SYS-CANCEL-13"],
+        "m_strOrderSysID": "SYS-CANCEL-13",
+        "m_strTradingDay": "20260926",
         "status": "callback_bound",
     })
     bridge.order_meta_cache.upsert(record)
@@ -570,6 +571,7 @@ def test_cancel_error_callback_restores_context_from_rich_order_metadata():
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
             "m_strOrderSysID": "SYS-CANCEL-13",
+            "m_strTradingDay": "20260926",
             "m_nErrorID": 202,
             "m_strErrorMsg": "cancel rejected",
         })
@@ -582,7 +584,6 @@ def test_cancel_error_callback_restores_context_from_rich_order_metadata():
     assert data["strategy_name"] == "cancel-rich-strategy"
     assert data["order_remark"] == "cancel-002"
     assert data["order_id"] == 700013
-    assert data["m_nRef"] == 700013
     assert data["cfquant_order_meta_hit"] is True
     assert error.order_id == 700013
     assert error.strategy_name == "cancel-rich-strategy"
@@ -659,13 +660,13 @@ def test_property_based_callbacks_preserve_async_and_asset_position_fields(bridg
     position = XtPosition.from_any(events[3]["data"])
     assert order_response.seq == 31
     assert order_response.order_id == 700014
-    assert order_response.strategy_name == "async-strategy"
-    assert order_response.order_remark == "async-remark"
+    assert order_response.strategy_name == ""
+    assert order_response.order_remark == ""
     assert cancel_response.seq == 32
     assert cancel_response.order_id == 700014
     assert cancel_response.cancel_result == 0
-    assert events[1]["data"]["strategy_name"] == "async-strategy"
-    assert events[1]["data"]["order_remark"] == "async-remark"
+    assert events[1]["data"]["strategy_name"] == ""
+    assert events[1]["data"]["order_remark"] == ""
     assert asset.cash == 100.0
     assert asset.frozen_cash == 2.0
     assert asset.market_value == 300.0

@@ -61,8 +61,8 @@ def test_filter_cancelable_orders_keeps_only_active_statuses():
 def test_query_stock_orders_applies_cancelable_only_filter(monkeypatch):
     account = StockAccount("A123")
     returned_orders = [
-        _order(xtconstant.ORDER_REPORTED, "can-cancel"),
-        _order(xtconstant.ORDER_SUCCEEDED, "done"),
+        _order(xtconstant.ORDER_REPORTED, "719000001"),
+        _order(xtconstant.ORDER_SUCCEEDED, "719000002"),
     ]
     calls = []
 
@@ -76,8 +76,9 @@ def test_query_stock_orders_applies_cancelable_only_filter(monkeypatch):
     all_orders = trader.query_stock_orders(account, cancelable_only=False)
     cancelable_orders = trader.query_stock_orders(account, cancelable_only=True)
 
-    assert [order.order_id for order in all_orders] == ["can-cancel", "done"]
-    assert [order.order_id for order in cancelable_orders] == ["can-cancel"]
+    assert [order.order_id for order in all_orders] == [719000001, 719000002]
+    assert [order.order_id for order in cancelable_orders] == [719000001]
+    assert [order.order_status for order in cancelable_orders] == [xtconstant.ORDER_REPORTED]
     assert calls[0][1]["cancelable_only"] is False
     assert calls[1][1]["cancelable_only"] is True
 
@@ -85,8 +86,8 @@ def test_query_stock_orders_applies_cancelable_only_filter(monkeypatch):
 def test_query_stock_orders_treats_string_false_as_not_cancelable_only(monkeypatch):
     account = StockAccount("A123")
     returned_orders = [
-        _order(xtconstant.ORDER_REPORTED, "can-cancel"),
-        _order(xtconstant.ORDER_SUCCEEDED, "done"),
+        _order(xtconstant.ORDER_REPORTED, "719000001"),
+        _order(xtconstant.ORDER_SUCCEEDED, "719000002"),
     ]
     calls = []
 
@@ -99,7 +100,7 @@ def test_query_stock_orders_treats_string_false_as_not_cancelable_only(monkeypat
 
     orders = trader.query_stock_orders(account, cancelable_only="false")
 
-    assert [order.order_id for order in orders] == ["can-cancel", "done"]
+    assert [order.order_id for order in orders] == [719000001, 719000002]
     assert calls[0][1]["cancelable_only"] is False
 
 
@@ -151,7 +152,7 @@ def test_order_stock_async_returns_request_seq_or_minus_one(monkeypatch):
     assert failed == -1
 
 
-def test_order_stock_async_is_completed_from_cross_process_order_callback(monkeypatch):
+def test_order_stock_async_waits_for_explicit_seq_when_order_identity_is_incomplete(monkeypatch):
     class Callback(object):
         def __init__(self):
             self.orders = []
@@ -184,6 +185,11 @@ def test_order_stock_async_is_completed_from_cross_process_order_callback(monkey
         "order_remark": "",
         "strategy_name": "",
     })
+    # An unscoped order must not acquire the pending request's metadata or seq.
+    assert callback.orders[0].order_remark == ""
+    assert callback.orders[0].strategy_name == ""
+    assert callback.responses == []
+    assert [item["seq"] for item in trader._pending_async_orders] == [seq]
     trader._make_trader_handler("on_order_stock_async_response")({
         "account_id": "A123",
         "order_id": 719000010,
@@ -192,8 +198,7 @@ def test_order_stock_async_is_completed_from_cross_process_order_callback(monkey
         "seq": seq,
     })
 
-    assert callback.orders[0].order_remark == "remark"
-    assert callback.orders[0].strategy_name == "hxy"
+    assert trader._pending_async_orders == []
     assert len(callback.responses) == 1
     assert vars(callback.responses[0]) == {
         "account_type": xtconstant.SECURITY_ACCOUNT,
@@ -201,6 +206,7 @@ def test_order_stock_async_is_completed_from_cross_process_order_callback(monkey
         "order_id": 719000010,
         "strategy_name": "hxy",
         "order_remark": "remark",
+        "error_msg": "",
         "seq": seq,
     }
 
@@ -221,8 +227,19 @@ def test_xtorderresponse_canonical_payload_has_miniqmt_fields_only():
         "order_id",
         "strategy_name",
         "order_remark",
+        "error_msg",
         "seq",
     }
+
+
+def test_xtorderresponse_preserves_broker_rejection_message():
+    response = XtOrderResponse.from_any({
+        "account_id": "A123", "order_id": -1, "seq": 10,
+        "m_strErrorMsg": "当前交易时间禁止委托该买卖类别",
+    })
+    assert response.order_id == -1
+    assert response.seq == 10
+    assert response.error_msg == "当前交易时间禁止委托该买卖类别"
 
 
 def test_xtquanttrader_auto_assigns_session_id_when_omitted_or_zero():

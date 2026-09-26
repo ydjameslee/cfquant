@@ -21,6 +21,7 @@ from .level2 import (
 )
 from .xttype import _is_zero_time_value, filter_cancelable_orders
 from .stock_connect import CONNECT_MARKETS, TRADE_IDENTITY_FIELDS, connect_account_type, is_hk_code, stock_connect_code, validate_connect_order
+from . import order_meta
 
 
 class CfquantQmtBridge(object):
@@ -1026,9 +1027,145 @@ class CfquantQmtBridge(object):
         if cancel_func is None:
             raise NotImplementedError("当前QMT环境未找到cancel函数，暂不能撤单")
         account = params.get("account") or {}
+        account_id = account.get("account_id") or params.get("account_id") or ""
+        if not account_id:
+            raise ValueError("account_id is required")
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        result = cancel_func(str(params.get("order_id")), account.get("account_id", ""), account_type, self.context)
-        return {"cancel_result": 0 if result else -1, "request_result": result, "account_type": str(account_type or "").upper()}
+        internal_ref = params.get("internal_ref", params.get("m_nRef"))
+        order_id_kind = str(params.get("order_id_kind") or "auto").strip().lower()
+        if order_id_kind not in ("auto", "internal", "native", "sysid"):
+            raise ValueError("unsupported order_id_kind")
+        if internal_ref in (None, "") and order_id_kind == "internal":
+            internal_ref = params.get("order_id")
+        if internal_ref not in (None, ""):
+            order_id = self._resolve_internal_cancel_order_id(
+                account_id, account_type, internal_ref, params
+            )
+        else:
+            order_id = str(params.get("order_id") or "")
+            if not order_id:
+                raise ValueError("order_id is required")
+            trading_day = self._requested_trading_day(params)
+            query_func = self._get_global_func("get_trade_detail_data") or getattr(self.context, "get_trade_detail_data", None)
+            if (trading_day or order_id_kind not in ("native", "sysid")) and not callable(query_func):
+                raise ValueError("order identity verification requires QMT order query support")
+            if callable(query_func):
+                order_id = self._resolve_verified_cancel_order_id(
+                    account_id, account_type, order_id, trading_day, order_id_kind
+                )
+        result = cancel_func(order_id, account_id, account_type, self.context)
+        data = {
+            "cancel_result": 0 if result else -1,
+            "request_result": result,
+            "account_type": str(account_type or "").upper(),
+            "order_id": order_id,
+            "native_order_id": order_id,
+        }
+        if internal_ref not in (None, ""):
+            data["internal_ref"] = self._normalize_order_id(internal_ref) or str(internal_ref)
+        return data
+
+    def _resolve_internal_cancel_order_id(self, account_id, account_type, internal_ref, params):
+        internal_key = self._order_reference_key(internal_ref)
+        if not internal_key:
+            raise ValueError("internal_ref is required")
+        trading_day = self._requested_trading_day(params)
+        if not trading_day:
+            raise ValueError("internal_ref cancellation requires authoritative trading_day")
+        candidates = []
+        for row in self._query_trade_detail({
+            "account": {"account_id": account_id, "account_type": account_type},
+        }, "ORDER") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("account_id") or "").strip() not in ("", str(account_id).strip()):
+                continue
+            row_type = self._identity_account_type(self._first_value(
+                row, ("account_type", "m_nBrokerType", "m_nAccountType")
+            ))
+            expected_type = self._identity_account_type(account_type)
+            if row_type and expected_type and row_type != expected_type:
+                continue
+            if self._order_dates(row).get("trading_day") != trading_day:
+                continue
+            if self._order_reference_key(row.get("m_nRef")) != internal_key:
+                continue
+            native_id = self._first_value(row, ("m_strOrderSysID", "order_sysid", "native_order_id"))
+            if native_id in (None, ""):
+                continue
+            identity = (
+                str(native_id),
+                self._order_reference_key(row.get("m_strOrderID")),
+                self._order_reference_key(row.get("m_nOrderID")),
+            )
+            if identity not in candidates:
+                candidates.append(identity)
+        if len(candidates) != 1:
+            raise ValueError(
+                "internal_ref cancellation requires exactly one QMT order for account/type/trading_day/ref"
+            )
+        return candidates[0][0]
+
+    def _resolve_verified_cancel_order_id(self, account_id, account_type, order_id, trading_day, order_id_kind="auto"):
+        target = self._order_reference_key(order_id)
+        if not target:
+            raise ValueError("order_id is required")
+        native_matches = []
+        local_matches = []
+        for row in self._query_trade_detail({
+            "account": {"account_id": account_id, "account_type": account_type},
+        }, "ORDER") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("account_id") or "").strip() not in ("", str(account_id).strip()):
+                continue
+            row_type = self._identity_account_type(self._first_value(
+                row, ("account_type", "m_nBrokerType", "m_nAccountType")
+            ))
+            expected_type = self._identity_account_type(account_type)
+            if row_type and expected_type and row_type != expected_type:
+                continue
+            if trading_day and self._order_dates(row).get("trading_day") != trading_day:
+                continue
+            native_id = self._order_reference_key(self._first_value(
+                row, ("native_order_id", "order_sysid", "m_strOrderSysID")
+            ))
+            if native_id == target:
+                native_matches.append((row, native_id))
+                continue
+            for name in (() if order_id_kind in ("native", "sysid") else ("m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID", "order_id")):
+                if self._order_reference_key(row.get(name)) == target:
+                    if native_id:
+                        local_matches.append((row, native_id))
+                    break
+        if local_matches and not trading_day:
+            raise ValueError("internal/local order_id cancellation requires authoritative trading_day")
+        matches = native_matches + local_matches
+        if trading_day and len(matches) != 1:
+            raise ValueError(
+                "order_id cancellation requires exactly one QMT order for account/type/trading_day"
+            )
+        if not trading_day and len(matches) > 1:
+            raise ValueError("order_id cancellation is ambiguous across QMT orders")
+        if matches:
+            return matches[0][1]
+        raise ValueError("order_id is not a verified QMT cancellable counter id")
+
+    @staticmethod
+    def _requested_trading_day(params):
+        raw_values = []
+        normalized_values = []
+        for name in order_meta.TRADING_DAY_FIELDS:
+            value = (params or {}).get(name)
+            if order_meta.normalize_text(value):
+                raw_values.append(value)
+                normalized = order_meta.normalize_date(value)
+                if not normalized:
+                    raise ValueError("trading_day must be an authoritative YYYYMMDD date")
+                normalized_values.append(normalized)
+        if len(set(normalized_values)) > 1:
+            raise ValueError("conflicting authoritative trading_day values")
+        return normalized_values[0] if raw_values else ""
 
     def _cancel_order_stock_async(self, params, msg):
         seq = params.get("seq")
@@ -1038,15 +1175,18 @@ class CfquantQmtBridge(object):
         data.update({
             "seq": seq,
             "account_id": (params.get("account") or {}).get("account_id", ""),
-            "order_id": params.get("order_id"),
+            "order_id": result.get("order_id", params.get("order_id")) if isinstance(result, dict) else params.get("order_id"),
             "order_sysid": result.get("order_sysid", "") if isinstance(result, dict) else "",
             "error_msg": result.get("error_msg", "") if isinstance(result, dict) else "",
         })
+        if isinstance(result, dict) and result.get("internal_ref") not in (None, ""):
+            data["internal_ref"] = result["internal_ref"]
         self._send_trader_event(client_id, "on_cancel_order_stock_async_response", data)
         return {"seq": seq, "request_result": result}
 
     def _cancel_order_stock_sysid(self, params):
         row = dict(params)
+        row["order_id_kind"] = "sysid"
         row["order_id"] = params.get("sysid", params.get("order_id", ""))
         result = self._cancel_order_stock(row)
         if isinstance(result, dict):
@@ -1123,6 +1263,14 @@ class CfquantQmtBridge(object):
     def _format_trade_detail(self, obj, datatype):
         data = self._format_trade_detail_payload(obj, datatype)
         if isinstance(data, dict):
+            dates = self._order_dates(obj)
+            normalized_type = str(datatype or "").upper()
+            if normalized_type in ("ORDER", "DEAL"):
+                data["trading_day"] = dates["trading_day"]
+            if normalized_type == "ORDER" and dates["order_date"]:
+                data["order_date"] = dates["order_date"]
+            elif normalized_type == "DEAL":
+                data["trade_date"] = dates["trading_day"]
             for name in TRADE_IDENTITY_FIELDS:
                 value = self._get_value(obj, name)
                 if value is not None:
@@ -1159,7 +1307,6 @@ class CfquantQmtBridge(object):
                     "m_strOrderDate",
                     "m_strEntrustDate",
                     "m_strInsertDate",
-                    "m_strTradingDay",
                     "m_nOrderDate",
                     "m_nEntrustDate",
                     "m_nInsertDate",
@@ -1200,8 +1347,8 @@ class CfquantQmtBridge(object):
                 "m_strOrderSysID": self._get_value(obj, "m_strOrderSysID"),
                 "m_nRef": self._get_value(obj, "m_nRef"),
                 "m_strOrderRef": self._get_value(obj, "m_strOrderRef"),
-                "m_nOrderID": self._first_value(obj, ("m_nOrderID", "m_nRef")),
-                "m_strOrderID": self._first_value(obj, ("m_strOrderID", "m_strOrderRef")),
+                "m_nOrderID": self._get_value(obj, "m_nOrderID"),
+                "m_strOrderID": self._get_value(obj, "m_strOrderID"),
                 "m_nOrderStatus": self._get_value(obj, "m_nOrderStatus"),
                 "m_nOrderSubmitStatus": self._get_value(obj, "m_nOrderSubmitStatus"),
                 "m_nVolumeTotal": self._get_value(obj, "m_nVolumeTotal"),
@@ -1222,6 +1369,8 @@ class CfquantQmtBridge(object):
                 "m_strOrderDate": self._get_value(obj, "m_strOrderDate"),
                 "m_strEntrustDate": self._get_value(obj, "m_strEntrustDate"),
                 "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
+                "m_nOrderDate": self._get_value(obj, "m_nOrderDate"),
+                "m_nTradingDay": self._get_value(obj, "m_nTradingDay"),
             }
         if datatype == "DEAL":
             return {
@@ -1277,8 +1426,8 @@ class CfquantQmtBridge(object):
                 "m_dComssion": self._get_value(obj, "m_dComssion"),
                 "m_nRef": self._get_value(obj, "m_nRef"),
                 "m_strOrderRef": self._get_value(obj, "m_strOrderRef"),
-                "m_nOrderID": self._first_value(obj, ("m_nOrderID", "m_nRef")),
-                "m_strOrderID": self._first_value(obj, ("m_strOrderID", "m_strOrderRef")),
+                "m_nOrderID": self._get_value(obj, "m_nOrderID"),
+                "m_strOrderID": self._get_value(obj, "m_strOrderID"),
                 "m_strOrderSysID": self._get_value(obj, "m_strOrderSysID"),
                 "m_strTradeID": self._get_value(obj, "m_strTradeID"),
                 "m_strDealID": self._get_value(obj, "m_strDealID"),
@@ -1293,6 +1442,8 @@ class CfquantQmtBridge(object):
                 "m_strTradeDate": self._get_value(obj, "m_strTradeDate"),
                 "m_strDealDate": self._get_value(obj, "m_strDealDate"),
                 "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
+                "m_nTradeDate": self._get_value(obj, "m_nTradeDate"),
+                "m_nTradingDay": self._get_value(obj, "m_nTradingDay"),
             }
         if datatype == "POSITION":
             return {
@@ -1521,6 +1672,32 @@ class CfquantQmtBridge(object):
             return str(number) if number > 0 else ""
         except Exception:
             return text
+
+    def _identity_account_type(self, value):
+        if value in (None, ""):
+            return ""
+        parsed = value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            try:
+                parsed = int(text)
+            except (TypeError, ValueError):
+                parsed = text
+        return str(self._account_type_name(parsed) or "").strip().upper()
+
+    def _order_dates(self, data):
+        if isinstance(data, dict):
+            return order_meta.order_dates(data)
+        return order_meta.order_dates({
+            name: self._get_value(data, name)
+            for name in (
+                "trading_day", "trade_date", "order_date", "m_strTradingDay",
+                "m_strTradeDate", "m_nTradingDay", "m_nTradeDate",
+                "m_strOrderDate", "m_nOrderDate",
+            )
+        })
 
     def _order_reference_values(self, order):
         primary_values = []

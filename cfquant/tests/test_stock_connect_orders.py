@@ -130,15 +130,19 @@ def test_connect_raw_identity_currency_and_symbol_survive_formatting(cls):
 @pytest.mark.parametrize('kind,expected', [(7, 'hugangtong'), ('7', 'hugangtong'), ('HGT', 'hugangtong'), (11, 'shengangtong'), ('11', 'shengangtong'), ('SGT', 'shengangtong')])
 def test_query_and_cancel_keep_account_type(kind, expected):
     queries, cancels = [], []
+    detail_rows = [[], [{
+        'm_strAccountID': 'TEST', 'm_strOrderSysID': '1001',
+        'm_strTradingDay': '20260925',
+    }]]
     bridge = TxTradeBridge(None, show=False, globals_dict={
-        'get_trade_detail_data': lambda *a: queries.append(a) or [],
+        'get_trade_detail_data': lambda *a: queries.append(a) or detail_rows.pop(0),
         'cancel': lambda *a: cancels.append(a) or True,
     })
     params = {'account': {'account_id': 'TEST', 'account_type': kind}, 'order_id': '1001'}
     try:
         assert bridge._query_trade_detail(params, 'order') == []
         bridge._cancel_order_stock(params)
-        assert queries == [('TEST', expected, 'order')]
+        assert queries == [('TEST', expected, 'order'), ('TEST', expected, 'order')]
         assert cancels[0][1:3] == ('TEST', expected)
     finally:
         bridge.close()

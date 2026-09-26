@@ -6741,6 +6741,7 @@ WS_QUOTES.on_empty = _release_quote_subscription_on_empty
 
 class CallbackEventStore(object):
     def __init__(self, channels=None, max_events=500):
+        self._follow_config_channels = channels is None
         self.channels = channels or callback_channels()
         self.max_events = int(max_events)
         self._lock = threading.RLock()
@@ -6755,6 +6756,9 @@ class CallbackEventStore(object):
     def start(self):
         if self._running:
             return
+        # The global store is constructed before persisted account config loads.
+        if self._follow_config_channels:
+            self.channels = callback_channels()
         self._mode = "mixed"
         self._running = True
         try:
@@ -6898,7 +6902,8 @@ class CallbackEventStore(object):
             raw = raw.decode("utf-8", errors="replace")
         if not isinstance(raw, str):
             return None
-        key, value = raw.split("|", 1) if "|" in raw else ("", raw)
+        direct = raw.startswith("cfquant:") or raw.lstrip().startswith(("{", "["))
+        key, value = raw.split("|", 1) if not direct and "|" in raw else ("", raw)
         msg = loads_message(raw)
         if isinstance(msg, dict) and msg.get("type") == "event":
             event = dict(msg)
@@ -13559,6 +13564,9 @@ def cancel_order(body):
         "account": {"account_id": account_id, "account_type": account_type},
         "order_id": order_id,
     }
+    for field in ("trading_day", "order_id_kind"):
+        if body.get(field) not in (None, ""):
+            params[field] = body[field]
     started = time.perf_counter()
     timeout = request_timeout_value(body.get("timeout"), default=12.0, maximum=60.0)
     route = account_request(

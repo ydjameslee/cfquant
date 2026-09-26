@@ -37,6 +37,13 @@ def wire(request):
     return SimpleNamespace(**ns)
 
 
+@pytest.mark.parametrize("prefix", ["", "request|"])
+def test_all_wire_variants_preserve_pipes_in_payload(wire, prefix):
+    params = {"remark": "-150906080|1|-150906082", "order_id": BIG_ID}
+    raw = wire.pack_request("offline", params)
+    assert wire.loads_message(prefix + raw)["params"] == params
+
+
 @pytest.mark.parametrize("value,expected", [
     (np.int8(12), 12), (np.int32(100), 100), (np.int64(BIG_ID), BIG_ID),
     (np.uint64(2 ** 64 - 1), 2 ** 64 - 1), (np.float16(1.5), 1.5),

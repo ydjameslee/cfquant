@@ -10928,6 +10928,16 @@ function orderKey(row) {
   );
 }
 
+function orderIdentityKey(row) {
+  if (!row || typeof row !== 'object') return '';
+  // Only the backend-validated QMT trading day is an identity date.
+  const day = String(row.trading_day || '');
+  const ref = row.m_nRef == null ? '' : String(row.m_nRef);
+  if (!/^\d{8}$/.test(day) || !ref || ref === '0' || ref === '-1'
+      || !row.bridge_id || !row.account_id || !row.account_type) return '';
+  return JSON.stringify([row.bridge_id, String(row.account_type), row.account_id, day, ref]);
+}
+
 function orderCode(row) {
   return row.stock_code || `${row.m_strInstrumentID || ''}.${row.m_strExchangeID || ''}`;
 }
@@ -11709,9 +11719,11 @@ function orderRowFromCallbackEvent(event) {
 }
 
 function rememberOrderCallbackMeta(row) {
-  if (!row || !row.order_id) return;
-  if (state.orderCallbackMeta.has(row.order_id)) state.orderCallbackMeta.delete(row.order_id);
-  state.orderCallbackMeta.set(row.order_id, {
+  const id = row && orderIdentityKey({ ...row.payload, bridge_id: row.bridge_id,
+    account_id: row.account_id, account_type: row.account_type });
+  if (!id) return;
+  if (state.orderCallbackMeta.has(id)) state.orderCallbackMeta.delete(id);
+  state.orderCallbackMeta.set(id, {
     label: row.label,
     type: row.type,
     className: row.className,
@@ -11727,20 +11739,28 @@ function rememberOrderCallbackMeta(row) {
 }
 
 function orderCallbackMetaForRow(row) {
-  const id = orderKey(row);
+  const id = orderIdentityKey({bridge_id: selectedBridge(), account_id: selectedAccount(),
+    account_type: selectedAccountType(), ...row});
   return id ? state.orderCallbackMeta.get(id) : null;
 }
 
 function mergeOrderCallbackRow(row) {
   if (!row) return false;
-  const id = orderKey(row);
+  const scopedRow = {bridge_id: selectedBridge(), account_id: selectedAccount(),
+    account_type: selectedAccountType(), ...row};
+  const id = orderIdentityKey(scopedRow);
   if (!id) return false;
   if (isCfquantOrder(row)) rememberCfquantOrder(row);
   const rows = (state.latestOrders || []).slice();
-  const index = rows.findIndex((item) => orderKey(item) === id);
+  const matches = rows.map((item, index) => ({item, index})).filter(({item}) =>
+    orderIdentityKey({bridge_id: selectedBridge(), account_id: selectedAccount(),
+      account_type: selectedAccountType(), ...item}) === id);
+  if (matches.length > 1) return false;
+  const index = matches.length ? matches[0].index : -1;
+  if (index >= 0 && orderKey(rows[index]) !== orderKey(row)) return false;
   if (index >= 0) rows[index] = { ...rows[index], ...row };
   else rows.push(row);
-  markOrderHighlight(id, index >= 0 ? 'updated' : 'new');
+  markOrderHighlight(orderKey(row), index >= 0 ? 'updated' : 'new');
   renderOrders({ data: rows });
   return true;
 }
@@ -11998,7 +12018,7 @@ function renderOrders(section) {
 
 function orderCallbackCellHtml(row) {
   const meta = orderCallbackMetaForRow(row);
-  if (!meta) return '<span class="order-callback-empty">未收到</span>';
+  if (!meta) return '<span class="order-callback-empty">未关联回报</span>';
   return `<span class="order-callback-tag ${esc(meta.className || '')}">${esc(meta.label)}</span><small>${esc(meta.time)}${meta.seq ? ` / seq ${esc(meta.seq)}` : ''}</small>`;
 }
 
@@ -12015,8 +12035,8 @@ function orderRowsHtml(rows, options = {}) {
     const reasonText = junk
       ? (statusReason || 'QMT未返回废单原因')
       : '';
-    return `<tr class="clickable${highlightClass}" data-order-id="${esc(orderId)}" data-code="${esc(code)}" data-cancelable="${cancelable ? '1' : '0'}">
-      <td><input class="order-select" type="checkbox" data-order-id="${esc(orderId)}"${cancelable ? '' : ' disabled'}></td>
+    return `<tr class="clickable${highlightClass}" data-order-id="${esc(orderId)}" data-trading-day="${esc(row.trading_day || '')}" data-code="${esc(code)}" data-cancelable="${cancelable ? '1' : '0'}">
+      <td><input class="order-select" type="checkbox" data-order-id="${esc(orderId)}" data-trading-day="${esc(row.trading_day || '')}"${cancelable ? '' : ' disabled'}></td>
       <td class="num">${index + 1}</td>
       ${includeTime ? `<td>${esc(orderTime(row))}</td>` : ''}
       <td><span class="source-pill ${orderSourceClass(row)}">${esc(orderSource(row))}</span></td>
@@ -12250,7 +12270,7 @@ async function submitBatchOrders(event) {
   }
 }
 
-async function sendCancel(orderId, channel) {
+async function sendCancel(orderId, channel, tradingDay = '') {
   const body = {
     bridge_id: selectedBridge(),
     channel: channel || selectedTradeChannel(),
@@ -12260,6 +12280,7 @@ async function sendCancel(orderId, channel) {
     order_id: String(orderId || '').trim(),
     confirm_text: `CANCEL ${String(orderId || '').trim()}`,
   };
+  if (tradingDay) body.trading_day = tradingDay;
   const data = await api('/api/cancel', { method: 'POST', body: JSON.stringify(body) });
   log('撤单已提交', data);
   await refreshAccount('orders', { force: true, subscribe: false });
@@ -12283,7 +12304,7 @@ async function cancelOrderFromRow(row) {
   const confirmed = window.confirm(`确认撤单 ${orderId}？`);
   if (!confirmed) return;
   try {
-    await sendCancel(orderId, channel);
+    await sendCancel(orderId, channel, row.dataset.tradingDay || '');
   } catch (error) {
     log('双击撤单失败', { order_id: orderId, error: error.message });
   }
@@ -12291,7 +12312,10 @@ async function cancelOrderFromRow(row) {
 
 async function cancelSelectedOrders() {
   const checked = Array.from(document.querySelectorAll('.order-select:not(:disabled):checked'));
-  const ids = [...new Set(checked.map((item) => item.dataset.orderId).filter(Boolean))];
+  const ids = [...new Map(checked.filter((item) => item.dataset.orderId).map((item) => {
+    const order = {id: item.dataset.orderId, day: item.dataset.tradingDay || ''};
+    return [JSON.stringify([order.id, order.day]), order];
+  })).values()];
   if (!ids.length) {
     log('未选择可撤委托');
     return;
@@ -12299,9 +12323,9 @@ async function cancelSelectedOrders() {
   const confirmed = window.confirm(`确认撤销 ${ids.length} 笔委托？`);
   if (!confirmed) return;
   const channel = selectedTradeChannel();
-  for (const orderId of ids) {
+  for (const {id: orderId, day} of ids) {
     try {
-      await sendCancel(orderId, channel);
+      await sendCancel(orderId, channel, day);
     } catch (error) {
       log('批量撤单失败', { order_id: orderId, error: error.message });
     }

@@ -12,6 +12,7 @@ import json
 import re
 import threading
 import time
+from datetime import date
 
 
 ORDER_META_PUSH_KEY = "cfquant.order_meta.upsert"
@@ -33,6 +34,30 @@ ORDER_REF_FIELDS = (
     "order_id",
     "m_strOrderSysID",
     "order_sysid",
+)
+
+TRADING_DAY_FIELDS = (
+    "trading_day",
+    "trade_date",
+    "m_strTradingDay",
+    "m_strTradeDate",
+    "m_nTradingDay",
+    "m_nTradeDate",
+)
+ORDER_DATE_FIELDS = (
+    "order_date",
+    "m_strOrderDate",
+    "m_nOrderDate",
+)
+INTERNAL_REF_FIELDS = ("m_nRef", "internal_ref")
+FULL_REF_FIELDS = (
+    "m_strOrderID",
+    "m_strOrderSysID",
+    "order_sysid",
+    "order_id",
+    "order_ref",
+    "m_strOrderRef",
+    "m_nOrderID",
 )
 
 
@@ -96,14 +121,18 @@ def account_store_key(bridge_id, account_type, account_id):
     )
 
 
-def store_user_key(user_order_id):
+def store_user_key(user_order_id, trading_day=None):
     user_order_id = normalize_text(user_order_id)
-    return STORE_USER_PREFIX + user_order_id if user_order_id else ""
+    if not user_order_id:
+        return ""
+    return STORE_USER_PREFIX + (normalize_date(trading_day) or "unknown") + ":" + user_order_id
 
 
-def store_order_ref_key(order_ref):
+def store_order_ref_key(order_ref, trading_day=None, ref_kind="generic"):
     order_ref = normalize_order_ref(order_ref)
-    return STORE_REF_PREFIX + order_ref if order_ref else ""
+    if not order_ref:
+        return ""
+    return STORE_REF_PREFIX + (normalize_date(trading_day) or "unknown") + ":" + safe_key_part(ref_kind) + ":" + order_ref
 
 
 def normalize_text(value):
@@ -113,6 +142,49 @@ def normalize_text(value):
     if text.lower() in ("none", "null", "nan"):
         return ""
     return text
+
+
+def normalize_date(value):
+    """Return a validated YYYYMMDD date supplied by QMT, without guessing."""
+    text = normalize_text(value)
+    if not text:
+        return ""
+    if re.match(r"^\d{8}$", text):
+        compact = text
+    else:
+        matched = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$", text)
+        if not matched:
+            return ""
+        compact = "%s%02d%02d" % (matched.group(1), int(matched.group(2)), int(matched.group(3)))
+    try:
+        date(int(compact[:4]), int(compact[4:6]), int(compact[6:8]))
+    except (TypeError, ValueError):
+        return ""
+    return compact
+
+
+def _authoritative_date(data, names):
+    if not isinstance(data, dict):
+        return ""
+    values = [data.get(name) for name in names if not is_empty(data.get(name))]
+    if not values:
+        return ""
+    normalized = [normalize_date(value) for value in values]
+    if not all(normalized) or len(set(normalized)) != 1:
+        return ""
+    return normalized[0]
+
+
+def order_dates(data):
+    """Extract QMT's trading and calendar dates as distinct, optional values.
+
+    ``trade_day`` is deliberately excluded: older metadata synthesized it from
+    the local machine clock, so it cannot establish an order's QMT trading day.
+    """
+    return {
+        "trading_day": _authoritative_date(data, TRADING_DAY_FIELDS),
+        "order_date": _authoritative_date(data, ORDER_DATE_FIELDS),
+    }
 
 
 def is_empty(value):
@@ -291,6 +363,37 @@ def order_ref_candidates_from_data(data):
     return refs
 
 
+def qmt_ref_from_data(data):
+    """Return the QMT callback reference used in order metadata identity."""
+    if not isinstance(data, dict):
+        return ""
+    return normalize_order_ref(data.get("m_nRef"))
+
+
+def typed_order_ref_candidates_from_data(data):
+    """Return ``(kind, value)`` reference identities without cross-typing IDs."""
+    if not isinstance(data, dict):
+        return []
+    identities = []
+    seen = set()
+    for kind, names in (("internal", INTERNAL_REF_FIELDS), ("full", FULL_REF_FIELDS)):
+        for name in names:
+            ref = normalize_order_ref(data.get(name))
+            # normalize_record keeps legacy order_ref/m_strOrderRef aliases
+            # for consumers. When those aliases mirror m_nRef, they are not a
+            # second, full-ID identity and must not cross-match one.
+            if kind == "full" and name in ("order_ref", "m_strOrderRef"):
+                internal_ref = qmt_ref_from_data(data)
+                if internal_ref and ref == internal_ref:
+                    continue
+            identity = (kind, ref)
+            if not ref or identity in seen:
+                continue
+            seen.add(identity)
+            identities.append(identity)
+    return identities
+
+
 def merge_order_ref_candidates(record, refs):
     if not isinstance(record, dict):
         return []
@@ -364,8 +467,9 @@ def normalize_record(record, bridge_id=None, account_type=None, account_id=None,
         data["stock_code"] = stock_code
         data["stock_code_base"] = stock_code_base(stock_code)
 
-    if is_empty(data.get("trade_day")):
-        data["trade_day"] = current_trade_day(now)
+    dates = order_dates(data)
+    data["trading_day"] = dates["trading_day"]
+    data["order_date"] = dates["order_date"]
     if data.get("created_at") is None:
         data["created_at"] = now
     data["updated_at"] = now
@@ -417,7 +521,7 @@ def apply_record_to_callback(data, record, match_info=None):
     if order_id is not None:
         reconcile_order_id(data, order_id)
         order_id_ref = str(order_id)
-        for name in ("m_nRef", "m_nOrderID"):
+        for name in ("m_nOrderID",):
             if not normalize_order_ref(data.get(name)):
                 data[name] = order_id
         for name in ("m_strOrderRef", "m_strOrderID"):
@@ -437,11 +541,12 @@ def store_entries_for_record(record):
     record = normalize_record(record)
     payload = encode_record(record)
     entries = []
-    user_key = store_user_key(record.get("user_order_id"))
+    trading_day = record.get("trading_day")
+    user_key = store_user_key(record.get("user_order_id"), trading_day)
     if user_key:
         entries.append((user_key, payload))
-    for ref in order_ref_candidates_from_data(record):
-        ref_key = store_order_ref_key(ref)
+    for ref_kind, ref in typed_order_ref_candidates_from_data(record):
+        ref_key = store_order_ref_key(ref, trading_day, ref_kind)
         if ref_key:
             entries.append((ref_key, payload))
     return entries
@@ -476,7 +581,11 @@ class OrderMetaCache(object):
         return refs[0]
 
     def _ref_keys(self, record):
-        return [self._ctx(record) + (ref,) for ref in order_ref_candidates_from_data(record)]
+        trading_day = normalize_date(record.get("trading_day"))
+        identities = typed_order_ref_candidates_from_data(record)
+        if not trading_day or not identities:
+            return []
+        return [self._ctx(record) + (trading_day, kind, ref) for kind, ref in identities]
 
     @staticmethod
     def _callback_bound(record):
@@ -486,14 +595,17 @@ class OrderMetaCache(object):
         return bool(record.get("callback_bound_at")) or status in ("callback_bound", "callback_seen")
 
     def prune(self, trade_day=None, now=None):
-        trade_day = current_trade_day(now) if trade_day is None else trade_day
+        trade_day = normalize_date(trade_day)
         now = time.time() if now is None else now
         with self.lock:
             self._prune_locked(trade_day, now)
 
     def _prune_locked(self, trade_day, now):
         def keep(record, pending=False):
-            if normalize_text(record.get("trade_day")) != trade_day:
+            record_day = normalize_date(record.get("trading_day"))
+            # Retain records with an unknown QMT day. Dropping them based on a
+            # PC calendar date loses metadata that cannot safely be identified.
+            if pending and trade_day and record_day and record_day != trade_day:
                 return False
             if pending:
                 try:
@@ -503,7 +615,11 @@ class OrderMetaCache(object):
             return True
 
         self.by_user = {key: value for key, value in self.by_user.items() if keep(value)}
-        self.by_ref = {key: value for key, value in self.by_ref.items() if keep(value)}
+        self.by_ref = {
+            key: [record for record in records if keep(record)]
+            for key, records in self.by_ref.items()
+            if any(keep(record) for record in records)
+        }
         self.pending = [record for record in self.pending if keep(record, pending=True)]
 
     def upsert(self, record):
@@ -512,8 +628,6 @@ class OrderMetaCache(object):
             return self._upsert_locked(record)
 
     def _upsert_locked(self, record):
-        trade_day = current_trade_day()
-        self._prune_locked(trade_day, time.time())
         status = normalize_text(record.get("status")).lower()
         if status in ("delete", "deleted", "failed", "cancelled"):
             self._remove_locked(record)
@@ -524,7 +638,17 @@ class OrderMetaCache(object):
         if user_key:
             self.by_user[user_key] = record
         for ref_key in ref_keys:
-            self.by_ref[ref_key] = record
+            existing = self.by_ref.get(ref_key, [])
+            replacement_index = None
+            for index, prior in enumerate(existing):
+                if self._user_key(prior) == user_key and user_key is not None:
+                    replacement_index = index
+                    break
+            if replacement_index is None:
+                existing.append(record)
+            else:
+                existing[replacement_index] = record
+            self.by_ref[ref_key] = existing
 
         self._remove_pending_locked(record)
         if user_key and not self._callback_bound(record):
@@ -553,7 +677,14 @@ class OrderMetaCache(object):
         if user_key:
             self.by_user.pop(user_key, None)
         for ref_key in ref_keys:
-            self.by_ref.pop(ref_key, None)
+            remaining = [
+                item for item in self.by_ref.get(ref_key, [])
+                if self._user_key(item) != user_key
+            ]
+            if remaining:
+                self.by_ref[ref_key] = remaining
+            else:
+                self.by_ref.pop(ref_key, None)
         self._remove_pending_locked(record)
 
     def _remove_pending_locked(self, record):
@@ -573,7 +704,7 @@ class OrderMetaCache(object):
         store = decode_record_payload(store_value) if not isinstance(store_value, dict) else store_value
         if not isinstance(store, dict):
             return {"loaded": 0, "stale": 0}
-        trade_day = current_trade_day() if trade_day is None else trade_day
+        trade_day = normalize_date(trade_day)
         loaded = 0
         stale = 0
         for key, payload in list(store.items()):
@@ -588,7 +719,8 @@ class OrderMetaCache(object):
                 account_type=account_type or record.get("account_type"),
                 account_id=account_id or record.get("account_id"),
             )
-            if normalize_text(record.get("trade_day")) != trade_day:
+            record_day = normalize_date(record.get("trading_day"))
+            if trade_day and record_day and record_day != trade_day:
                 stale += 1
                 continue
             self.upsert(record)
@@ -603,24 +735,26 @@ class OrderMetaCache(object):
             account_id=account_id or data.get("account_id"),
         )
         with self.lock:
-            self._prune_locked(current_trade_day(), time.time())
             record = None
             confidence = ""
             order_refs = order_ref_candidates_from_data(callback_record)
-            user_order_id = normalize_text(callback_record.get("user_order_id"))
-            for order_ref in order_refs:
-                record = self.by_ref.get(self._ctx(callback_record) + (order_ref,))
-                if record:
+            ref_keys = self._ref_keys(callback_record)
+            # Metadata attribution is only safe when QMT supplied every part
+            # of its order identity: bridge, account type/id, trading day and
+            # a typed QMT reference. Unknown values must never fall back to a
+            # local date, order calendar date, user ID, or FIFO heuristic.
+            if ref_keys:
+                candidates = []
+                seen = set()
+                for ref_key in ref_keys:
+                    for candidate in self.by_ref.get(ref_key, []):
+                        ident = id(candidate)
+                        if ident not in seen:
+                            seen.add(ident)
+                            candidates.append(candidate)
+                if len(candidates) == 1:
+                    record = candidates[0]
                     confidence = "order_ref"
-                    break
-            if record is None and user_order_id:
-                record = self.by_user.get(self._ctx(callback_record) + (user_order_id,))
-                if record:
-                    confidence = "user_order_id"
-            if record is None and allow_pending:
-                record, confidence = self._match_pending_locked(callback_record)
-            if record is None:
-                record, confidence = self._match_known_locked(callback_record, order_refs)
 
             bound_order_ref = ""
             bound_order_refs = []
@@ -651,12 +785,14 @@ class OrderMetaCache(object):
         records = []
         seen = set()
         for mapping in (self.by_ref, self.by_user):
-            for record in mapping.values():
-                ident = id(record)
-                if ident in seen:
-                    continue
-                seen.add(ident)
-                records.append(record)
+            for value in mapping.values():
+                values = value if isinstance(value, list) else [value]
+                for record in values:
+                    ident = id(record)
+                    if ident in seen:
+                        continue
+                    seen.add(ident)
+                    records.append(record)
         for record in self.pending:
             ident = id(record)
             if ident in seen:
@@ -666,70 +802,25 @@ class OrderMetaCache(object):
         return records
 
     def _match_known_locked(self, callback_record, order_refs=None):
-        ctx = self._ctx(callback_record)
-        callback_refs = set(order_refs or order_ref_candidates_from_data(callback_record))
-        candidates = []
-        for record in self._unique_records_locked():
-            if self._ctx(record) != ctx:
-                continue
-            if normalize_text(record.get("trade_day")) != current_trade_day():
-                continue
-            if not self._has_callback_metadata(record):
-                continue
-            evidence = self._context_match_evidence(record, callback_record)
-            if evidence < 0:
-                continue
-            record_refs = set(order_ref_candidates_from_data(record))
-            ref_hit = bool(callback_refs and record_refs and callback_refs.intersection(record_refs))
-            if not ref_hit:
-                if not self._has_stock_context_match(record, callback_record):
-                    continue
-                if evidence < 3:
-                    continue
-            updated_at = self._record_timestamp(record)
-            score = (100 if ref_hit else 0) + evidence
-            candidates.append((record, score, ref_hit, updated_at))
-        if not candidates:
+        ref_keys = self._ref_keys(callback_record)
+        if not ref_keys:
             return None, ""
-        candidates.sort(key=lambda item: (item[1], item[3]), reverse=True)
-        top_score = candidates[0][1]
-        top = [item for item in candidates if item[1] == top_score]
-        if top[0][2]:
-            return top[0][0], "record_ref_scan"
-        if len(top) == 1:
-            return top[0][0], "record_context"
-        meta_keys = set(self._record_meta_identity(item[0]) for item in top)
-        if len(meta_keys) == 1:
-            return top[0][0], "record_context_shared_meta"
-        return None, ""
+        candidates = []
+        seen = set()
+        for ref_key in ref_keys:
+            for candidate in self.by_ref.get(ref_key, []):
+                ident = id(candidate)
+                if ident not in seen:
+                    seen.add(ident)
+                    candidates.append(candidate)
+        if len(candidates) != 1:
+            return None, ""
+        return candidates[0], "record_ref_scan"
 
     def _match_pending_locked(self, callback_record):
-        ctx = self._ctx(callback_record)
-        callback_stock = stock_code_base(callback_record.get("stock_code") or callback_record.get("stock_code_base"))
-        now = time.time()
-        matches = []
-        for record in self.pending:
-            if self._ctx(record) != ctx:
-                continue
-            try:
-                if now - float(record.get("created_at") or now) > self.pending_ttl_seconds:
-                    continue
-            except Exception:
-                pass
-            record_stock = stock_code_base(record.get("stock_code") or record.get("stock_code_base"))
-            if callback_stock and record_stock and callback_stock != record_stock:
-                continue
-            if not self._compatible_value(record.get("order_type"), callback_record.get("order_type")):
-                continue
-            if not self._compatible_number(record.get("order_volume"), callback_record.get("order_volume")):
-                continue
-            if not self._compatible_number(record.get("price"), callback_record.get("price")):
-                continue
-            matches.append(record)
-        if not matches:
-            return None, ""
-        matches.sort(key=lambda item: float(item.get("created_at") or 0))
-        return matches[0], "pending_fifo"
+        # A pending record without QMT's m_nRef cannot prove callback
+        # ownership. Resolve it only after it has the same full QMT identity.
+        return self._match_known_locked(callback_record)
 
     @staticmethod
     def _has_callback_metadata(record):

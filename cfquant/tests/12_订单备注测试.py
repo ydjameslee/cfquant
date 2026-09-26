@@ -43,6 +43,15 @@ def _recording_passorder(calls):
     return passorder
 
 
+def _token_echoing_query(native_calls, rows_or_callable):
+    def query(*args):
+        rows = rows_or_callable(*args) if callable(rows_or_callable) else rows_or_callable
+        token = native_calls[-1][7]
+        return [dict(row, m_strStrategyName=token) for row in rows]
+
+    return query
+
+
 def _recording_cancel(calls):
     def cancel(*args):
         calls.append(args)
@@ -149,12 +158,17 @@ def test_tx_trade_bridge_order_remark_precedes_strategy_name():
     )
 
     assert result["order_remark"] == "remark-a"
-    assert calls[0][7] == "strategy-a"
+    assert calls[0][7].startswith("strategy-a&&&_cfq_")
     assert calls[0][9] == "remark-a"
 
 
 def test_tx_trade_bridge_resolves_zero_passorder_result_from_matching_detail():
     calls = []
+    native_calls = []
+    rows = [{
+        "m_nRef": 700002, "m_strOrderSysID": "900002", "m_strRemark": "remark",
+        "m_strInstrumentID": "000001", "m_strExchangeID": "SZ",
+    }]
 
     def get_last_order_id(*args):
         calls.append(args)
@@ -164,12 +178,9 @@ def test_tx_trade_bridge_resolves_zero_passorder_result_from_matching_detail():
         DummyContext(),
         show=False,
         globals_dict={
-            "passorder": lambda *args: 0,
+            "passorder": lambda *args: native_calls.append(args) or 0,
             "get_last_order_id": get_last_order_id,
-            "get_trade_detail_data": lambda *args: [{
-                "m_nRef": 700002, "m_strOrderSysID": "900002", "m_strRemark": "remark",
-                "m_strInstrumentID": "000001", "m_strExchangeID": "SZ",
-            }],
+            "get_trade_detail_data": _token_echoing_query(native_calls, rows),
         },
     )
 
@@ -180,9 +191,9 @@ def test_tx_trade_bridge_resolves_zero_passorder_result_from_matching_detail():
 
     assert result["request_result"] == 0
     assert result["order_id"] == 700002
-    assert calls == [
-        ("A123", "stock", "order", "hxy"),
-    ]
+    assert len(calls) == 1
+    assert calls[0][:3] == ("A123", "stock", "order")
+    assert calls[0][3].startswith("hxy&&&_cfq_")
 
 
 def test_qmt_bridge_resolves_zero_passorder_result_from_matching_detail():
@@ -272,21 +283,28 @@ def test_tx_trade_bridge_async_zero_is_accepted_without_sync_order_lookup():
     assert detail_calls == []
     assert events == []
     assert len(bridge.pending_async_orders) == 1
+    request_token = bridge.pending_async_orders[0]["request_token"]
 
     assert bridge._handle_async_order_callback({
         "m_strAccountID": "A123",
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
         "m_nRef": 700002,
+        "m_strTradingDay": "20260926",
+        "m_nAccountType": 2,
+        "m_strTradingDay": "20260926",
         "m_strRemark": "other-remark",
+        "m_strStrategyName": "wrong-token",
     }) is False
     assert bridge._handle_async_order_callback({
         "m_strAccountID": "A123",
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
         "m_nRef": 700002,
+        "m_nAccountType": 2,
+        "m_strTradingDay": "20260926",
         "m_strRemark": "remark",
-        "m_strStrategyName": "hxy",
+        "m_strStrategyName": request_token,
     }) is True
     assert events == [("client-1", "on_order_stock_async_response", {
         "account_type": "STOCK",
@@ -386,13 +404,17 @@ def test_tx_trade_bridge_async_positive_request_result_waits_for_real_order_call
     assert order_meta.canonical_order_id_from_record(record) is None
     assert events == []
     assert len(bridge.pending_async_orders) == 1
+    request_token = bridge.pending_async_orders[0]["request_token"]
     assert bridge._handle_async_order_callback({
         "m_strAccountID": "A123",
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
         "m_nRef": 700026,
+        "m_nAccountType": 2,
+        "m_strTradingDay": "20260926",
         "m_strOrderSysID": "635082606",
         "m_strRemark": "remark",
+        "m_strStrategyName": request_token,
     }) is True
     assert events[0][2]["order_id"] == 700026
 
@@ -429,6 +451,7 @@ def test_normal_bridge_turns_real_order_callback_into_xtorderresponse():
         _base_order_params(strategy_name="hxy", order_remark="remark", seq=24),
         {"id": "request-4", "client_id": "client-4"},
     )
+    request_token = bridge.pending_async_orders[0]["request_token"]
 
     bridge.publish_callback_event("trader:on_stock_order", {
         "m_strAccountID": "A123",
@@ -438,8 +461,9 @@ def test_normal_bridge_turns_real_order_callback_into_xtorderresponse():
         "m_nRef": 700002,
         "m_strOrderRef": "700002",
         "m_strOrderSysID": "SYS-2",
+        "m_strTradingDay": "20260926",
         "m_strRemark": "",
-        "m_strStrategyName": "",
+        "m_strStrategyName": request_token,
     })
 
     response_events = [item for item in events if item[1] == "on_order_stock_async_response"]
@@ -482,9 +506,9 @@ def test_normal_bridge_trade_callback_restores_strategy_name_from_submitted_rema
     callback_payload = json.loads([item for item in bridge.tx.pushes if item[0] == "event"][-1][1])
     data = callback_payload["data"]
     trade = XtTrade.from_any(data)
-    assert data["strategy_name"] == "hxy"
-    assert data["m_strStrategyName"] == "hxy"
-    assert trade.strategy_name == "hxy"
+    assert data["strategy_name"] == ""
+    assert data["m_strStrategyName"] == ""
+    assert trade.strategy_name == ""
     assert trade.order_remark == "remark"
 
 
@@ -514,7 +538,7 @@ def test_tx_trade_bridge_pushes_order_meta_before_passorder_and_persists_account
     assert calls[0][1][0][0] == order_meta.ORDER_META_PUSH_KEY
     assert calls[0][1][0][2] == expected_channel
     assert order_meta.store_user_key("user-001") in calls[0][2][store_key]
-    assert order_meta.store_order_ref_key("700010") in bridge.tx.store[store_key]
+    assert order_meta.store_order_ref_key("700010", ref_kind="full") in bridge.tx.store[store_key]
 
 
 def test_normal_bridge_receives_order_meta_push_and_fills_cross_qmt_order_callback():
@@ -551,12 +575,9 @@ def test_normal_bridge_receives_order_meta_push_and_fills_cross_qmt_order_callba
     callback_payload = json.loads([item for item in bridge.tx.pushes if item[0] == "event"][-1][1])
     data = callback_payload["data"]
     store_key = order_meta.account_store_key("default", "STOCK", "A123")
-    assert data["strategy_name"] == "fast-strategy"
-    assert data["order_remark"] == "user-001"
-    assert data["cfquant_order_meta_hit"] is True
-    assert data["cfquant_order_meta_match"] == "pending_fifo"
-    assert order_meta.store_user_key("user-001") in bridge.tx.store[store_key]
-    assert order_meta.store_order_ref_key("9001") in bridge.tx.store[store_key]
+    assert data["strategy_name"] == ""
+    assert data["order_remark"] == ""
+    assert "cfquant_order_meta_hit" not in data
 
 
 def test_normal_bridge_order_meta_store_fallback_is_account_scoped():
@@ -598,8 +619,8 @@ def test_normal_bridge_order_meta_store_fallback_is_account_scoped():
     })
 
     callback_payloads = [json.loads(item[1]) for item in bridge.tx.pushes if item[0] == "event"]
-    assert callback_payloads[-2]["data"]["strategy_name"] == "strategy-a"
-    assert callback_payloads[-2]["data"]["order_remark"] == "user-a"
+    assert callback_payloads[-2]["data"]["strategy_name"] == ""
+    assert callback_payloads[-2]["data"]["order_remark"] == ""
     assert callback_payloads[-1]["data"]["strategy_name"] == ""
     assert callback_payloads[-1]["data"]["order_remark"] == ""
     assert "cfquant_order_meta_hit" not in callback_payloads[-1]["data"]
@@ -648,13 +669,10 @@ def test_normal_bridge_keeps_bound_meta_pending_until_real_callback_ref_arrives(
 
     callback_payload = json.loads([item for item in bridge.tx.pushes if item[0] == "event"][-1][1])
     data = callback_payload["data"]
-    assert data["strategy_name"] == strategy
-    assert data["order_remark"] == "666666666"
-    assert data["order_id"] == 1090571181
-    assert data["cfquant_callback_order_id"] == 1090571185
-    assert data["cfquant_order_id_reconciled"] is True
-    assert data["cfquant_order_meta_hit"] is True
-    assert data["cfquant_order_meta_match"] == "pending_fifo"
+    assert data["strategy_name"] == ""
+    assert data["order_remark"] == ""
+    assert data["order_id"] == 1090571185
+    assert "cfquant_order_meta_hit" not in data
 
     query_row = bridge._format_trade_detail({
         "m_strAccountID": "8885060548",
@@ -668,13 +686,10 @@ def test_normal_bridge_keeps_bound_meta_pending_until_real_callback_ref_arrives(
         "m_nVolumeTotalOriginal": 100,
     }, "order")
     bridge._enrich_query_order_meta_fields(query_row, "8885060548", "STOCK")
-    assert query_row["order_id"] == data["order_id"]
-
-    store_key = order_meta.account_store_key("default", "STOCK", "8885060548")
-    assert order_meta.store_order_ref_key("1602193470259167414") in bridge.tx.store[store_key]
-    assert order_meta.store_order_ref_key("1090571185") in bridge.tx.store[store_key]
-    assert order_meta.store_order_ref_key("635082606") in bridge.tx.store[store_key]
-    assert bridge.order_meta_cache.pending == []
+    assert query_row["order_id"] == 1090571181
+    assert len(bridge.order_meta_cache.pending) == 1
+    assert bridge.order_meta_cache.pending[0]["user_order_id"] == record["user_order_id"]
+    assert not bridge.order_meta_cache.pending[0]["trading_day"]
 
 
 def test_query_binds_canonical_order_id_after_callback_arrives_first():
@@ -724,9 +739,9 @@ def test_query_binds_canonical_order_id_after_callback_arrives_first():
     bridge._enrich_query_order_meta_fields(query_row, "A123", "STOCK")
 
     assert query_row["order_id"] == 700020
-    assert bridge.order_meta_cache.by_user[
+    assert "canonical_order_id" not in bridge.order_meta_cache.by_user[
         ("default", "STOCK", "A123", "async-001")
-    ]["canonical_order_id"] == 700020
+    ]
 
 
 def test_normal_bridge_fills_manual_cancel_callback_from_bound_order_ref():
@@ -747,6 +762,8 @@ def test_normal_bridge_fills_manual_cancel_callback_from_bound_order_ref():
         "status": "callback_bound",
         "order_ref": "1602193470259168823",
         "order_refs": ["1602193470259168823", "1090571219", "635082868"],
+        "m_strOrderSysID": "635082868",
+        "m_strTradingDay": "20260926",
     })
 
     bridge.order_meta_cache.upsert(record)
@@ -757,6 +774,7 @@ def test_normal_bridge_fills_manual_cancel_callback_from_bound_order_ref():
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
         "m_strOrderSysID": "635082868",
+        "m_strTradingDay": "20260926",
         "m_nOrderStatus": xtconstant.ORDER_CANCELED,
         "m_nOffsetFlag": 48,
         "m_nOrderPriceType": 50,
@@ -814,10 +832,9 @@ def test_normal_bridge_fills_manual_cancel_callback_from_unique_bound_context_wi
 
     callback_payload = json.loads([item for item in bridge.tx.pushes if item[0] == "event"][-1][1])
     data = callback_payload["data"]
-    assert data["strategy_name"] == strategy
-    assert data["order_remark"] == "manual-cancel-unique"
-    assert data["cfquant_order_meta_hit"] is True
-    assert data["cfquant_order_meta_match"] == "record_context"
+    assert data["strategy_name"] == ""
+    assert data["order_remark"] == ""
+    assert "cfquant_order_meta_hit" not in data
 
 
 def test_normal_bridge_does_not_fill_manual_cancel_callback_when_bound_context_is_ambiguous():
@@ -929,17 +946,17 @@ def test_tx_trade_bridge_never_exposes_zero_as_order_id_when_lookup_is_stale():
 
 
 def test_tx_trade_bridge_falls_back_to_matching_order_detail_for_zero_result():
+    native_calls = []
+    rows = [{
+        "m_nRef": 700003, "m_strInstrumentID": "000001",
+        "m_strExchangeID": "SZ", "m_strRemark": "remark",
+    }]
     bridge = TxTradeBridge(
         DummyContext(),
         show=False,
         globals_dict={
-            "passorder": lambda *args: 0,
-            "get_trade_detail_data": lambda *args: [{
-                "m_nRef": 700003,
-                "m_strInstrumentID": "000001",
-                "m_strExchangeID": "SZ",
-                "m_strRemark": "remark",
-            }],
+            "passorder": _recording_passorder(native_calls),
+            "get_trade_detail_data": _token_echoing_query(native_calls, rows),
         },
     )
 
@@ -952,19 +969,18 @@ def test_tx_trade_bridge_falls_back_to_matching_order_detail_for_zero_result():
 
 
 def test_tx_trade_bridge_ignores_system_order_id_when_resolving_sync_order():
+    native_calls = []
+    rows = [{
+        "m_nRef": 700003, "m_strOrderSysID": "xt700003",
+        "m_strInstrumentID": "000001", "m_strExchangeID": "SZ", "m_strRemark": "remark",
+    }]
     bridge = TxTradeBridge(
         DummyContext(),
         show=False,
         globals_dict={
-            "passorder": lambda *args: 0,
+            "passorder": _recording_passorder(native_calls),
             "get_last_order_id": lambda *args: "xt700003",
-            "get_trade_detail_data": lambda *args: [{
-                "m_nRef": 700003,
-                "m_strOrderSysID": "xt700003",
-                "m_strInstrumentID": "000001",
-                "m_strExchangeID": "SZ",
-                "m_strRemark": "remark",
-            }],
+            "get_trade_detail_data": _token_echoing_query(native_calls, rows),
         },
     )
 
@@ -978,6 +994,7 @@ def test_tx_trade_bridge_ignores_system_order_id_when_resolving_sync_order():
 
 
 def test_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id():
+    native_calls = []
     rows = [
         {
             "m_nRef": 700001,
@@ -991,6 +1008,7 @@ def test_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id():
             # order_id. It must not hide this row's raw QMT reference.
             "order_id": 700001,
             "m_nRef": 700002,
+            "m_strTradingDay": "20260926",
             "m_strOrderSysID": "900002",
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
@@ -1001,9 +1019,9 @@ def test_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id():
         DummyContext(),
         show=False,
         globals_dict={
-            "passorder": lambda *args: 0,
+            "passorder": _recording_passorder(native_calls),
             "get_last_order_id": lambda *args: "700001",
-            "get_trade_detail_data": lambda *args: rows,
+            "get_trade_detail_data": _token_echoing_query(native_calls, rows),
         },
     )
 
@@ -1042,19 +1060,18 @@ def test_qmt_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id()
 
 
 def test_sync_order_does_not_trust_stale_passorder_result():
+    native_calls = []
+    rows = [{
+        "m_nRef": 700002, "m_strOrderSysID": "900002",
+        "m_strInstrumentID": "000001", "m_strExchangeID": "SZ", "m_strRemark": "remark",
+    }]
     bridge = TxTradeBridge(
         DummyContext(),
         show=False,
         globals_dict={
-            "passorder": lambda *args: "900001",
+            "passorder": lambda *args: native_calls.append(args) or "900001",
             "get_last_order_id": lambda *args: "900001",
-            "get_trade_detail_data": lambda *args: [{
-                "m_nRef": 700002,
-                "m_strOrderSysID": "900002",
-                "m_strInstrumentID": "000001",
-                "m_strExchangeID": "SZ",
-                "m_strRemark": "remark",
-            }],
+            "get_trade_detail_data": _token_echoing_query(native_calls, rows),
         },
     )
 
@@ -1094,6 +1111,7 @@ def test_qmt_order_does_not_trust_stale_passorder_result():
 
 def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
     state = {"callback_seen": False}
+    native_calls = []
 
     def get_trade_detail_data(*args):
         if not state["callback_seen"]:
@@ -1118,9 +1136,9 @@ def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
         schedule_timer=False,
         order_meta_enabled=False,
         globals_dict={
-            "passorder": lambda *args: 0,
+            "passorder": _recording_passorder(native_calls),
             "get_last_order_id": lambda *args: "900001",
-            "get_trade_detail_data": get_trade_detail_data,
+            "get_trade_detail_data": _token_echoing_query(native_calls, get_trade_detail_data),
         },
     )
     bridge.tx = RecordingTx()
@@ -1138,6 +1156,7 @@ def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
     while time.time() < deadline and not bridge.pending_sync_orders:
         time.sleep(0.01)
     assert bridge.pending_sync_orders
+    request_token = bridge.pending_sync_orders[0]["request_token"]
 
     state["callback_seen"] = True
     bridge.publish_callback_event("trader:on_stock_order", {
@@ -1148,6 +1167,7 @@ def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
         "m_nRef": 700002,
         "m_strOrderSysID": "900002",
         "m_strRemark": "remark",
+        "m_strStrategyName": request_token,
     })
     worker.join(2)
 
@@ -1156,7 +1176,7 @@ def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
     assert bridge.pending_sync_orders == []
 
 
-def test_query_order_restores_strategy_name_from_submitted_remark():
+def test_query_order_restores_strategy_name_from_exact_submitted_token():
     raw_order = {
         "m_strAccountID": "A123",
         "m_nRef": 700004,
@@ -1165,11 +1185,15 @@ def test_query_order_restores_strategy_name_from_submitted_remark():
         "m_strRemark": "remark",
         "m_strStrategyName": "",
     }
+    def passorder(*args):
+        raw_order["m_strStrategyName"] = args[7]
+        return 0
+
     bridge = TxTradeBridge(
         DummyContext(),
         show=False,
         globals_dict={
-            "passorder": lambda *args: 0,
+            "passorder": passorder,
             "get_trade_detail_data": lambda *args: [raw_order],
         },
     )
@@ -1197,6 +1221,7 @@ def test_query_trade_restores_strategy_name_from_submitted_remark():
         "m_strStrategyName": "",
         "m_dPrice": 10.0,
         "m_nVolume": 100,
+        "m_strTradingDay": "20260926",
     }
     bridge = TxTradeBridge(
         DummyContext(),
@@ -1217,9 +1242,9 @@ def test_query_trade_restores_strategy_name_from_submitted_remark():
     )
     trade = XtTrade.from_any(trades[0])
 
-    assert trades[0]["strategy_name"] == "hxy"
-    assert trades[0]["m_strStrategyName"] == "hxy"
-    assert trade.strategy_name == "hxy"
+    assert trades[0]["strategy_name"] == ""
+    assert trades[0]["m_strStrategyName"] == ""
+    assert trade.strategy_name == ""
     assert trade.order_remark == "remark"
 
 
@@ -1248,7 +1273,8 @@ def test_query_trade_restores_strategy_name_from_order_meta_ref():
         "strategy_name": "meta-strategy",
         "order_remark": "meta-remark",
         "user_order_id": "meta-remark",
-        "order_ref": "700006",
+        "m_nRef": 700006,
+        "m_strTradingDay": "20260926",
     }))
 
     trades = bridge._query_trade_detail(
@@ -1257,10 +1283,10 @@ def test_query_trade_restores_strategy_name_from_order_meta_ref():
     )
     trade = XtTrade.from_any(trades[0])
 
-    assert trades[0]["strategy_name"] == "meta-strategy"
-    assert trades[0]["order_remark"] == "meta-remark"
-    assert trade.strategy_name == "meta-strategy"
-    assert trade.order_remark == "meta-remark"
+    assert trades[0]["strategy_name"] == ""
+    assert trades[0]["order_remark"] is None
+    assert trade.strategy_name == ""
+    assert trade.order_remark == ""
 
 
 def test_query_trade_order_meta_does_not_use_context_only_match():
@@ -1338,8 +1364,8 @@ def test_big_qmt_order_fields_map_to_miniqmt_shape_and_json_primitives():
 
     for row in (tx_row, qmt_row):
         assert row["order_id"] == 719000001
-        assert row["m_nOrderID"] == 719000001
-        assert row["m_strOrderID"] == "719000001"
+        assert row["m_nOrderID"] is None
+        assert row["m_strOrderID"] is None
         assert row["order_sysid"] == "SYS-1"
         assert row["order_type"] == xtconstant.STOCK_SELL
         assert row["instrument_name"] == "平安银行"
@@ -1402,7 +1428,7 @@ def test_tx_trade_bridge_batch_keeps_row_strategy_name_as_remark():
     )
 
     assert result["submitted"] == 1
-    assert calls[0][7] == "strategy-a"
+    assert calls[0][7].startswith("strategy-a&&&_cfq_")
     assert calls[0][9] == "strategy-a"
 
 
@@ -1654,6 +1680,7 @@ def test_qmt_bridge_cancel_uses_derivative_account_type():
     result = bridge._cancel_order_stock({
         "account": {"account_id": "F123", "account_type": xtconstant.FUTURE_ACCOUNT},
         "order_id": "ORDER-1",
+        "order_id_kind": "native",
     })
 
     assert calls[0][1] == "F123"

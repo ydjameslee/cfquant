@@ -100,12 +100,24 @@ def connected(request, monkeypatch):
     trader.stop()
 
 
-def complete_async_order(env, order_id, order_remark="", stock_code="600000.SH"):
+def complete_async_order(env, order_id, order_remark="", stock_code="600000.SH", native_index=None):
+    # Echo the actual per-request value sent to the fake QMT, just as a native
+    # callback would.  A user remark alone is not an async request identity.
+    if native_index is None:
+        native = next((call for call in reversed(env.native_calls)
+                       if not order_remark or call[9] == order_remark))
+    else:
+        native = env.native_calls[native_index]
     return env.bridge._handle_async_order_callback({
+        "bridge_id": env.bridge.bridge_id,
         "account_id": "TEST_ONLY",
+        "account_type": "STOCK",
         "stock_code": stock_code,
         "order_remark": order_remark,
         "order_id": order_id,
+        "m_nRef": order_id,
+        "m_strTradingDay": "20260928",
+        "m_strStrategyName": native[7],
     })
 
 
@@ -127,12 +139,12 @@ def test_async_prefixed_sysid_does_not_suppress_real_order_id(connected, batch, 
         notification["m_nRef"] = native_ref
     handler = env.client.handlers["trader:on_stock_order"]
     handler(notification)
-    if native_ref is None:
-        assert env.responses == []
-        assert seq not in env.trader._completed_async_order_seqs
-        assert any(item["seq"] == seq for item in env.trader._pending_async_orders)
-    else:
-        assert [response.order_id for response in env.responses] == [native_ref]
+    # This native notification has no authoritative QMT trading day.  Even
+    # with m_nRef it must not synthesize an async completion; wait for QMT's
+    # explicit seq response below.
+    assert env.responses == []
+    assert seq not in env.trader._completed_async_order_seqs
+    assert any(item["seq"] == seq for item in env.trader._pending_async_orders)
     assert complete_async_order(env, 1082130604, order_remark=request["order_remark"])
     handler(notification)
     assert [(response.seq, response.order_id) for response in env.responses] == [(seq, 1082130604)]
@@ -532,8 +544,8 @@ def test_lost_batch_response_never_replays_and_late_callbacks_still_work(connect
     if asynchronous:
         assert len(env.trader._pending_async_orders) == 3
         for index, row in enumerate(result['results']):
-            env.bridge._handle_async_order_callback(dict(account_id='TEST_ONLY', stock_code=row['stock_code'],
-                                                         order_remark=row['order_remark'], order_id=7000 + index))
+            assert complete_async_order(env, 7000 + index, row['order_remark'],
+                                        row['stock_code'], native_index=index)
         assert [response.seq for response in env.responses] == [row['seq'] for row in result['results']]
         assert env.trader._pending_async_orders == []
 

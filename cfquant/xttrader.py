@@ -12,7 +12,7 @@ from .client import create_rpc_client
 from .config import get_config
 from .channels import channels_for_bridge, normalize_bridge_id
 from .protocol import new_id
-from .order_meta import positive_order_id
+from .order_meta import positive_order_id, order_dates, normalize_order_ref
 from . import xtconstant
 from .xttype import (
     CreditAssure,
@@ -550,22 +550,26 @@ class XtQuantTrader(object):
             return -1
         return seq
 
-    def cancel_order_stock(self, account, order_id):
+    def cancel_order_stock(self, account, order_id, trading_day=None, order_id_kind=None):
         result = self._trade_request("xttrader.cancel_order_stock", {
             "account": _account_payload(account),
             "order_id": order_id,
+            **({"trading_day": trading_day} if trading_day is not None else {}),
+            **({"order_id_kind": order_id_kind} if order_id_kind is not None else {}),
         })
         if isinstance(result, dict):
             return result.get("cancel_result", -1)
         return result
 
-    def cancel_order_stock_async(self, account, order_id):
+    def cancel_order_stock_async(self, account, order_id, trading_day=None, order_id_kind=None):
         seq = next(self._seq)
         self._register_pending_async_cancel(seq)
         try:
             result = self._trade_request("xttrader.cancel_order_stock_async", {
                 "account": _account_payload(account),
                 "order_id": order_id,
+                **({"trading_day": trading_day} if trading_day is not None else {}),
+                **({"order_id_kind": order_id_kind} if order_id_kind is not None else {}),
                 "seq": seq,
             })
         except Exception:
@@ -576,17 +580,19 @@ class XtQuantTrader(object):
             return -1
         return seq
 
-    def cancel_order_stock_sysid(self, account, market, sysid):
+    def cancel_order_stock_sysid(self, account, market, sysid, trading_day=None):
         result = self._trade_request("xttrader.cancel_order_stock_sysid", {
             "account": _account_payload(account),
             "market": market,
             "sysid": sysid,
+            "order_id_kind": "sysid",
+            **({"trading_day": trading_day} if trading_day is not None else {}),
         })
         if isinstance(result, dict):
             return result.get("cancel_result", -1)
         return result
 
-    def cancel_order_stock_sysid_async(self, account, market, sysid):
+    def cancel_order_stock_sysid_async(self, account, market, sysid, trading_day=None):
         seq = next(self._seq)
         self._register_pending_async_cancel(seq)
         try:
@@ -594,6 +600,8 @@ class XtQuantTrader(object):
                 "account": _account_payload(account),
                 "market": market,
                 "sysid": sysid,
+                "order_id_kind": "sysid",
+                **({"trading_day": trading_day} if trading_day is not None else {}),
                 "seq": seq,
             })
         except Exception:
@@ -628,17 +636,22 @@ class XtQuantTrader(object):
     def query_stock_orders_async(self, account, callback, cancelable_only=False):
         return self._submit_query(self.query_stock_orders, (_account_payload(account), cancelable_only), callback)
 
-    def query_stock_order(self, account, order_id):
+    def query_stock_order(self, account, order_id, trading_day=None):
         orders = self.query_stock_orders(account) or []
         target_order_id = str(order_id)
+        day = order_dates({"trading_day": trading_day})["trading_day"]
+        if trading_day not in (None, "") and not day:
+            raise ValueError("invalid trading_day")
+        matches = []
         for order in orders:
-            if str(getattr(order, "order_id", "")) == target_order_id:
-                return order
-            if str(getattr(order, "m_strOrderSysID", "")) == target_order_id:
-                return order
-            if str(getattr(order, "order_sysid", "")) == target_order_id:
-                return order
-        return None
+            if day and order_dates(vars(order))["trading_day"] != day:
+                continue
+            if any(str(getattr(order, field, "")) == target_order_id
+                   for field in ("order_id", "m_strOrderSysID", "order_sysid")):
+                matches.append(order)
+        if len(matches) > 1:
+            raise ValueError("ambiguous order identity; specify authoritative QMT trading_day")
+        return matches[0] if matches else None
 
     def query_stock_trades(self, account):
         result = self._trade_request("xttrader.query_stock_trades", {
@@ -861,10 +874,12 @@ class XtQuantTrader(object):
                 event_name = "%s:trader:%s" % (bridge_id, name)
                 if event_name in self._registered_events:
                     continue
-                client.add_callback("trader:%s" % name, self._make_trader_handler(name))
+                client.add_callback("trader:%s" % name, self._make_trader_handler(name, bridge_id=bridge_id))
                 self._registered_events.add(event_name)
 
-    def _make_trader_handler(self, name):
+    def _make_trader_handler(self, name, bridge_id=None):
+        source_bridge_id = normalize_bridge_id(bridge_id or self.bridge_id)
+
         def handler(data):
             data_account_id = _event_account_id(data)
             if self.account_id and data_account_id and data_account_id != self.account_id:
@@ -895,7 +910,7 @@ class XtQuantTrader(object):
                 return
             async_response = None
             if name == "on_stock_order":
-                async_response = self._async_order_response_from_order(data)
+                async_response = self._async_order_response_from_order(data, bridge_id=source_bridge_id)
             func = getattr(self.callback, name, None)
             if callable(func):
                 if name in ("on_connected", "on_disconnected"):
@@ -930,7 +945,14 @@ class XtQuantTrader(object):
                     break
         if not order_id:
             return True
-        key = (_event_account_id(order), order_id)
+        day = order_dates(vars(order))["trading_day"]
+        account_type = _event_account_type(order)
+        account_id = _event_account_id(order)
+        internal_ref = normalize_order_ref(getattr(order, "m_nRef", None))
+        if not day or account_type is None or not account_id or not internal_ref:
+            return True
+        key = (getattr(order, "bridge_id", None) or self.bridge_id,
+               account_type, account_id, day, internal_ref, order_id)
         partial = getattr(xtconstant, "ORDER_PART_SUCC", 55)
         succeeded = getattr(xtconstant, "ORDER_SUCCEEDED", 56)
         with self._order_terminal_statuses_lock:
@@ -946,11 +968,16 @@ class XtQuantTrader(object):
         account = request.get("account") or {}
         record = {
             "seq": request.get("seq"),
+            "bridge_id": normalize_bridge_id(_bridge_id_from_account(account) or self.bridge_id),
             "account_id": str(account.get("account_id") or "").strip(),
-            "account_type": account.get("account_type", xtconstant.SECURITY_ACCOUNT),
+            "account_type": _account_type_value(account.get("account_type")),
             "stock_code": str(request.get("stock_code") or "").strip().upper(),
             "strategy_name": str(request.get("strategy_name") or ""),
             "order_remark": str(request.get("order_remark") or ""),
+            # Synthetic async responses are safe only when both sides carry
+            # QMT's complete order identity. Do not derive a day from this PC.
+            "trading_day": order_dates(request)["trading_day"],
+            "m_nRef": positive_order_id(request.get("m_nRef")),
             "created_at": time.time(),
         }
         with self._pending_async_orders_lock:
@@ -988,9 +1015,18 @@ class XtQuantTrader(object):
             self._completed_async_order_seqs[seq] = time.time()
         return True
 
-    def _async_order_response_from_order(self, order):
+    def _async_order_response_from_order(self, order, bridge_id=None):
         # Cross-QMT notifications can carry a market-prefixed broker sysid.
         # It must not complete the seq and suppress the real async response.
+        # A native update without QMT day/ref is intentionally left pending for
+        # QMT's explicit async response, rather than guessed from local state.
+        callback_ref = positive_order_id(getattr(order, "m_nRef", None))
+        callback_day = order_dates(vars(order))["trading_day"]
+        account_id = _event_account_id(order)
+        account_type = _event_account_type(order)
+        callback_bridge_id = normalize_bridge_id(bridge_id or getattr(order, "bridge_id", None) or self.bridge_id)
+        if callback_ref is None or not callback_day or not account_id or account_type is None:
+            return None
         order_id = None
         for name in ("order_id", "m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID"):
             order_id = positive_order_id(getattr(order, name, None))
@@ -998,26 +1034,20 @@ class XtQuantTrader(object):
                 break
         if order_id is None:
             return None
-        account_id = _event_account_id(order)
-        stock_code = str(getattr(order, "stock_code", "") or "").strip().upper()
-        stock_code_base = stock_code.split(".", 1)[0]
-        order_remark = str(getattr(order, "order_remark", "") or "")
         with self._pending_async_orders_lock:
             self._prune_async_order_state_locked()
-            matched = None
-            for index, item in enumerate(self._pending_async_orders):
-                if account_id and item.get("account_id") and item.get("account_id") != account_id:
-                    continue
-                expected_code = str(item.get("stock_code") or "").upper()
-                if expected_code and stock_code and expected_code.split(".", 1)[0] != stock_code_base:
-                    continue
-                expected_remark = str(item.get("order_remark") or "")
-                if order_remark and expected_remark and order_remark != expected_remark:
-                    continue
-                matched = self._pending_async_orders.pop(index)
-                break
-            if matched is None:
+            matches = [
+                index
+                for index, item in enumerate(self._pending_async_orders)
+                if item.get("account_id") == account_id
+                and item.get("bridge_id") == callback_bridge_id
+                and item.get("account_type") == account_type
+                and item.get("trading_day") == callback_day
+                and item.get("m_nRef") == callback_ref
+            ]
+            if len(matches) != 1:
                 return None
+            matched = self._pending_async_orders.pop(matches[0])
             self._completed_async_order_seqs[matched.get("seq")] = time.time()
         order.order_remark = matched.get("order_remark", "")
         order.strategy_name = matched.get("strategy_name", "")

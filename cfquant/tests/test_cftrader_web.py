@@ -94,7 +94,13 @@ def test_external_sdk_batch_is_forwarded_once_and_executed_inside_qmt(routing, m
 def test_external_sdk_cancel_batch_is_forwarded_once_and_executed_inside_qmt(routing, monkeypatch, asynchronous):
     clients, calls = routing
     native = []
-    bridge = TxTradeBridge(None, show=False, globals_dict={'cancel': lambda *args: native.append(args) or True})
+    bridge = TxTradeBridge(None, show=False, globals_dict={
+        'cancel': lambda *args: native.append(args) or True,
+        'get_trade_detail_data': lambda *args: [
+            dict(m_strAccountID='TEST_ONLY', m_nBrokerType=2, m_strOrderSysID='1001'),
+            dict(m_strAccountID='TEST_ONLY', m_nBrokerType=2, m_strOrderSysID='1002'),
+        ],
+    })
     bridge.order_meta_enabled = False
     bridge._send_trader_event = lambda *args: None
     def request(bridge_id, channel, action, params, **kwargs):
@@ -116,10 +122,29 @@ def test_external_sdk_cancel_batch_is_forwarded_once_and_executed_inside_qmt(rou
         assert len(outer) == len(calls) == 1
         assert calls[0][0:2] == ('test_bridge', 'trade')
         assert len(calls[0][3]['cancels']) == len(native) == 2
+        assert [args[0] for args in native] == ['1001', '1002']
         assert calls[0][4]['mode'] == 'lttx'
     finally:
         bridge.close()
         trader.stop()
+
+
+def test_unmatched_cancel_query_never_calls_native_cancel():
+    native = []
+    bridge = TxTradeBridge(None, show=False, globals_dict={
+        'cancel': lambda *args: native.append(args) or True,
+        'get_trade_detail_data': lambda *args: [
+            dict(m_strAccountID='TEST_ONLY', m_nBrokerType=2, m_strOrderSysID='OTHER-ORDER'),
+        ],
+    })
+    try:
+        with pytest.raises(ValueError, match='not a verified QMT cancellable counter id'):
+            bridge._cancel_order_stock(dict(
+                account=dict(account_id='TEST_ONLY', account_type='STOCK'), order_id='1001',
+            ))
+        assert native == []
+    finally:
+        bridge.close()
 
 
 @pytest.mark.parametrize('asynchronous', [False, True])

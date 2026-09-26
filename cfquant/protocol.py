@@ -80,7 +80,9 @@ def loads_message(raw):
         raw = raw.decode("utf-8", errors="replace")
     if not isinstance(raw, str):
         return None
-    if "|" in raw:
+    # LTtx may prepend "key|"; named pipes deliver the protocol frame directly.
+    # A pipe inside a broker error/remark belongs to JSON, not the envelope.
+    if not raw.startswith(MESSAGE_PREFIX) and "|" in raw:
         _, raw = raw.split("|", 1)
     if not raw.startswith(MESSAGE_PREFIX):
         return None

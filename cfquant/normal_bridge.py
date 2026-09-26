@@ -381,32 +381,10 @@ class NormalQmtBridge(TxTradeBridge):
         return record
 
     def _maybe_reset_order_meta_stores(self):
-        if not self.order_meta_enabled:
-            return
-        now = dt.datetime.now()
-        slot = ""
-        if now.hour == 9 and now.minute == 0:
-            slot = "0900"
-        elif now.hour >= 16:
-            slot = "after_1600"
-        if not slot:
-            return
-        trade_day = now.strftime("%Y%m%d")
-        with self.order_meta_subscription_lock:
-            self.order_meta_reset_slots = set(
-                item for item in self.order_meta_reset_slots
-                if item and item[0] == trade_day
-            )
-            accounts = list(self.order_meta_accounts)
-            markers = []
-            for account_type, account_id in accounts:
-                marker = (trade_day, slot, account_type, account_id)
-                if marker in self.order_meta_reset_slots:
-                    continue
-                self.order_meta_reset_slots.add(marker)
-                markers.append((account_type, account_id, marker))
-        for account_type, account_id, marker in markers:
-            self._reset_order_meta_store(account_id, account_type, reason=marker[1])
+        # Wall-clock session cutoffs cannot identify a broker trading day.
+        # Keep next-session metadata; only expire pending entries by their TTL.
+        if self.order_meta_enabled:
+            self.order_meta_cache.prune()
 
     def _publish_runtime_report(self, reason):
         super(NormalQmtBridge, self)._publish_runtime_report(reason)
@@ -727,6 +705,7 @@ class NormalQmtBridge(TxTradeBridge):
         record = self._register_pending_sync_order(
             account_id, account_type, params.get("stock_code", params.get("code", "")), remark, strategy, None,
         )
+        params["_cfquant_sync_pending"] = record
         try:
             result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False)
             if self._is_failed_order_result(result.get("request_result")):
@@ -882,11 +861,21 @@ class NormalQmtBridge(TxTradeBridge):
             if not account_type and account_id:
                 data["cfquant_account_type_unresolved"] = True
         if account_id:
-            data.setdefault("account_id", account_id)
+            if not data.get("account_id"):
+                data["account_id"] = account_id
         if account_type:
-            data.setdefault("account_type", account_type)
+            if not data.get("account_type"):
+                data["account_type"] = account_type
+        if event_name == "trader:on_stock_order":
+            # Match the exact QMT-echoed request token before any public field
+            # restoration replaces it with the user's strategy name.
+            self._resolve_pending_sync_order_callback(data)
+            relay_sync_order_callback(self.context, data)
+            self._handle_async_order_callback(data)
         if event_name == "trader:on_order_error":
             self._enrich_qmt_order_error_fields(data)
+            if not account_type and data.get("account_type"):
+                account_type = data["account_type"]
             if not force_order_error:
                 self._queue_pending_order_error(data)
                 return
@@ -900,13 +889,6 @@ class NormalQmtBridge(TxTradeBridge):
         ):
             self._enrich_order_request_fields(data)
         self._enrich_callback_order_meta(event_name, data, account_id, account_type)
-        if event_name == "trader:on_stock_order":
-            # A synchronous passorder has no reliable return value.  Wake its
-            # resolver as soon as the matching QMT callback arrives; the
-            # resolver then reads the canonical id from the ORDER query.
-            self._resolve_pending_sync_order_callback(data)
-            relay_sync_order_callback(self.context, data)
-            self._handle_async_order_callback(data)
         payload = {
             "type": "event",
             "event": event_name,
@@ -968,7 +950,12 @@ class NormalQmtBridge(TxTradeBridge):
         code = str(order.get("stock_code") or "").upper().split(".", 1)[0]
         strategy = str(order.get("strategy_name") or "")
         remark = str(order.get("order_remark") or "")
+        day = order_meta.order_dates(order)["trading_day"]
+        internal_ref = order_meta.normalize_order_ref(order.get("m_nRef"))
+        if not account or not account_type or not day or not internal_ref:
+            return None
         with self.pending_order_errors_lock:
+            candidates = []
             for index, item in enumerate(self.pending_order_errors):
                 error = item.get("data") or {}
                 error_account = str(error.get("account_id") or "").strip()
@@ -978,6 +965,17 @@ class NormalQmtBridge(TxTradeBridge):
                     continue
                 if account_type and error_account_type and account_type != error_account_type:
                     continue
+                error_day = order_meta.order_dates(error)["trading_day"]
+                if (error_day != day or error_account != account or error_account_type != account_type
+                        or order_meta.normalize_order_ref(error.get("m_nRef")) != internal_ref):
+                    continue
+                if order.get("bridge_id") and error.get("bridge_id") and order["bridge_id"] != error["bridge_id"]:
+                    continue
+                # Compare like identifiers; internal and counter IDs are distinct namespaces.
+                if any(order.get(field) not in (None, "") and error.get(field) not in (None, "")
+                       and str(order[field]) != str(error[field])
+                       for field in ("m_nRef", "order_id", "order_sysid", "m_strOrderRef")):
+                    continue
                 if code and error_code and code != error_code:
                     continue
                 error_strategy = str(error.get("strategy_name") or error.get("strategyName") or "")
@@ -986,8 +984,9 @@ class NormalQmtBridge(TxTradeBridge):
                 error_remark = str(error.get("order_remark") or error.get("m_strRemark") or "")
                 if error_remark and remark and error_remark != remark:
                     continue
-                self.pending_order_errors.pop(index)
-                return error
+                candidates.append(index)
+            if len(candidates) == 1:
+                return self.pending_order_errors.pop(candidates[0])["data"]
         return None
 
     def _flush_pending_order_errors(self, force=False):
@@ -1044,10 +1043,11 @@ class NormalQmtBridge(TxTradeBridge):
             match = re.search(r"(?:^|[\[,;\s])p_stock_code\s*=\s*([A-Za-z0-9_.-]+)", message, re.IGNORECASE)
             if match:
                 data["stock_code"] = match.group(1)
-        internal_strategy = data.get("strategy_name") or data.get("strategyName")
+        internal_strategy = data.get("strategy_name") or data.get("m_strStrategyName") or data.get("strategyName")
+        account_id, account_type = self._strict_order_callback_scope(data)
         context = self._consume_order_error_context(
-            data.get("account_id") or data.get("accountID"),
-            data.get("stock_code") or data.get("orderCode"),
+            account_id,
+            account_type,
             internal_strategy,
         ) if internal_strategy else None
         if context:
@@ -1056,6 +1056,9 @@ class NormalQmtBridge(TxTradeBridge):
             data["strategyName"] = context.get("strategy_name", "")
             data["order_remark"] = context.get("order_remark", "")
             data["m_strRemark"] = context.get("order_remark", "")
+            data["m_strOrderRemark"] = context.get("order_remark", "")
+            if not data.get("account_type"):
+                data["account_type"] = context.get("account_type", "")
             data["cfquant_order_error_context_consumed"] = True
         return data
 
@@ -1079,10 +1082,14 @@ class NormalQmtBridge(TxTradeBridge):
         if not order_id:
             return True
         account_type = self._callback_account_type(None, data)
-        key = (str(data.get("account_id") or ""), account_type, order_id)
+        day = order_meta.order_dates(data)["trading_day"]
+        internal_ref = order_meta.normalize_order_ref(data.get("m_nRef"))
+        if not day or not account_type or not data.get("account_id") or not internal_ref:
+            return True
+        key = (str(data.get("bridge_id") or self.bridge_id), str(data["account_id"]), account_type, day, internal_ref, order_id)
         with self.order_terminal_statuses_lock:
             if status == partial and self.order_terminal_statuses.get(key) == succeeded:
-                self._log("drop stale partial order callback account=%s order=%s" % key)
+                self._log("drop stale partial order callback identity=%r" % (key,))
                 return False
             if status == succeeded:
                 self.order_terminal_statuses[key] = succeeded
@@ -1118,6 +1125,9 @@ class NormalQmtBridge(TxTradeBridge):
 
     def _callback_object_to_dict(self, obj):
         fields = [
+            "trading_day", "trade_day", "trade_date", "order_date",
+            "m_strTradingDay", "m_strTradeDate", "m_nTradingDay", "m_nTradeDate",
+            "m_strOrderDate", "m_nOrderDate",
             "account_id",
             "accountID",
             "account_type",

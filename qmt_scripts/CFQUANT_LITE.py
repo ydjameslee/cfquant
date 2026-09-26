@@ -938,7 +938,7 @@ def loads_message(raw):
         raw = raw.decode("utf-8", errors="replace")
     if not isinstance(raw, str):
         return None
-    if "|" in raw:
+    if not raw.startswith(MESSAGE_PREFIX) and "|" in raw:
         _, raw = raw.split("|", 1)
     if not raw.startswith(MESSAGE_PREFIX):
         return None
