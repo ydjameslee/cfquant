@@ -1319,7 +1319,10 @@ class TxTradeBridge(object):
                 expected_strategy = str(record.get("strategy_name") or "")
                 expected_token = str(record.get("request_token") or "")
                 if expected_token and strategy_name != expected_token:
-                    continue
+                    # Stock Connect callbacks omit the request token; for those
+                    # accounts fall back to the remark-based identity match.
+                    if not (connect_account_type(account_type) in CONNECT_MARKETS and not strategy_name):
+                        continue
                 if not expected_token and not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
                     continue
                 if self._is_previous_order_detail(order, record.get("previous_order_id")):
@@ -1386,13 +1389,18 @@ class TxTradeBridge(object):
                 pending_sync_order["event"].clear()
                 continue
             try:
-                orders = self._query_trade_detail({
-                    "account": {"account_id": account_id, "account_type": account_type},
-                    "_qmt_strategy_name": (
-                        pending_sync_order.get("request_token", "")
-                        if pending_sync_order is not None else ""
-                    ),
-                }, "order")
+                query = {"account": {"account_id": account_id, "account_type": account_type}}
+                # QMT does not echo the request token as m_strStrategyName for
+                # Stock Connect orders, so scoping the query by it would hide
+                # the order we just placed and the sync call would return -1.
+                # Those orders are identified by account, remark and code, and
+                # a single candidate is still required below.
+                if (
+                    pending_sync_order is not None
+                    and connect_account_type(account_type) not in CONNECT_MARKETS
+                ):
+                    query["_qmt_strategy_name"] = pending_sync_order.get("request_token", "")
+                orders = self._query_trade_detail(query, "order")
                 candidates = []
                 callback_candidates = []
                 callback_sysid = self._order_reference_key(
@@ -2228,7 +2236,14 @@ class TxTradeBridge(object):
                         local_matches.append((row, native_id))
                     break
         if local_matches and not trading_day:
-            raise ValueError("internal/local order_id cancellation requires authoritative trading_day")
+            # When QMT exposes an authoritative day on the matched row, the
+            # caller must supply it so a same-reference order from another day
+            # cannot be cancelled.  Stock Connect rows omit the day, so a local
+            # reference that resolves to exactly one native sysid is safe.
+            matched_days = {self._order_dates(row).get("trading_day") for row, _ in local_matches}
+            native_ids = {entry[1] for entry in native_matches + local_matches}
+            if any(matched_days) or len(native_ids) != 1:
+                raise ValueError("internal/local order_id cancellation requires authoritative trading_day")
         matches = native_matches + local_matches
         if trading_day and len(matches) != 1:
             raise ValueError(

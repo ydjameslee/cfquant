@@ -1146,7 +1146,14 @@ class CfquantQmtBridge(object):
                         local_matches.append((row, native_id))
                     break
         if local_matches and not trading_day:
-            raise ValueError("internal/local order_id cancellation requires authoritative trading_day")
+            # When QMT exposes an authoritative day on the matched row, the
+            # caller must supply it so a same-reference order from another day
+            # cannot be cancelled.  Stock Connect rows omit the day, so a local
+            # reference that resolves to exactly one native sysid is safe.
+            matched_days = {self._order_dates(row).get("trading_day") for row, _ in local_matches}
+            native_ids = {entry[1] for entry in native_matches + local_matches}
+            if any(matched_days) or len(native_ids) != 1:
+                raise ValueError("internal/local order_id cancellation requires authoritative trading_day")
         matches = native_matches + local_matches
         if trading_day and len(matches) != 1:
             raise ValueError(

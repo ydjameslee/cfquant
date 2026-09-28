@@ -177,3 +177,93 @@ def test_batch_cancel_canonical_hk_code_does_not_infer_a_share_market(kind):
     assert result["submitted"] == 1
     assert calls[0]["market"] == "HK"
     assert calls[0]["account"]["account_type"] == kind
+
+
+def _connect_order_row(**overrides):
+    # Mirrors the live Galaxy response: QMT omits m_strStrategyName and the
+    # authoritative trading day, but echoes the remark and supplies a sysid.
+    row = {
+        "m_strAccountID": "CONNECT-1",
+        "m_nBrokerType": 11,
+        "m_strInstrumentID": "02828",
+        "m_strExchangeID": "SGT",
+        "m_nDirection": 48,
+        "m_nOffsetFlag": 48,
+        "m_nVolumeTotalOriginal": 200,
+        "m_nOrderPriceType": 92,
+        "m_dLimitPrice": 83.5,
+        "m_nOrderStatus": 50,
+        "m_strRemark": "cfq_connect_probe",
+        "m_strOrderRef": "2491947194236123799",
+        "order_id": 2491947194236123799,
+        "m_nRef": -1,
+        "m_strOrderSysID": "42859",
+        "stock_code": "02828.HK",
+        "m_strTradingDay": None,
+    }
+    row.update(overrides)
+    return row
+
+
+class _ConnectContext:
+    def set_account(self, *args):
+        pass
+
+
+def test_connect_sync_order_id_resolves_when_qmt_omits_strategy_token():
+    bridge = TxTradeBridge(_ConnectContext(), show=False, globals_dict={
+        "passorder": lambda *args: None,
+        "get_instrument_detail": lambda code: {"VolumeMultiple": 200, "PriceTick": 0.001},
+        "get_trade_detail_data": lambda *args: [_connect_order_row()],
+    })
+    bridge._log = lambda msg: None
+    try:
+        result = bridge._order_stock({
+            "account": {"account_id": "CONNECT-1", "account_type": 11},
+            "stock_code": "02828.HK", "order_type": 23, "price_type": 11,
+            "price": 83.5, "order_volume": 200, "order_remark": "cfq_connect_probe",
+        }, {"id": "test"}, capture_previous_id=True)
+        assert result["order_id"] == 2491947194236123799
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("cls", [TxTradeBridge, CfquantQmtBridge])
+def test_connect_cancel_uses_native_sysid_when_no_trading_day(cls):
+    cancels = []
+    bridge = cls(None, show=False, globals_dict={
+        "cancel": lambda *args: cancels.append(args) or True,
+        "get_trade_detail_data": lambda *args: [_connect_order_row()],
+    })
+    bridge._log = lambda msg: None
+    try:
+        result = bridge._cancel_order_stock({
+            "account": {"account_id": "CONNECT-1", "account_type": 11},
+            "order_id": "2491947194236123799",
+        })
+        assert result["cancel_result"] == 0
+        assert cancels[0][0] == "42859"
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("cls", [TxTradeBridge, CfquantQmtBridge])
+def test_connect_cancel_ambiguous_local_id_without_trading_day_is_rejected(cls):
+    calls = []
+    bridge = cls(None, show=False, globals_dict={
+        "cancel": lambda *args: calls.append(args) or True,
+        "get_trade_detail_data": lambda *args: [
+            _connect_order_row(),
+            _connect_order_row(m_strOrderSysID="99999", order_id=2),
+        ],
+    })
+    bridge._log = lambda msg: None
+    try:
+        with pytest.raises(ValueError, match="trading_day"):
+            bridge._cancel_order_stock({
+                "account": {"account_id": "CONNECT-1", "account_type": 11},
+                "order_id": "2491947194236123799",
+            })
+        assert calls == []
+    finally:
+        bridge.close()
