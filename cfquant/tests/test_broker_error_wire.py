@@ -48,5 +48,8 @@ def test_callback_start_loads_channels_after_config_is_ready(monkeypatch):
     monkeypatch.setattr(web.CLIENTS, "add_callback", lambda *args: None)
     monkeypatch.setattr(store, "_start_pipe_clients", lambda: started.extend(store.channels) or len(store.channels))
     monkeypatch.setattr(store, "_start_lttx_client", lambda: 0)
-    store.start()
-    assert started == channels
+    try:
+        store.start()
+        assert started == channels
+    finally:
+        store.close()

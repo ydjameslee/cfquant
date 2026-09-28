@@ -12,7 +12,7 @@ from .pipe_transport import (
     normalize_pipe_name,
     wait_for_pipe_client,
 )
-from .protocol import loads_message, pack_event, pack_response
+from .protocol import dumps_message, loads_message, pack_event, pack_response
 from .version import __version__ as CORE_VERSION
 
 
@@ -287,7 +287,13 @@ class CfquantPipeHub(object):
                 if envelope.get("role"):
                     meta["role"] = envelope.get("role")
                 if envelope.get("bridge_id"):
-                    meta["bridge_id"] = str(envelope.get("bridge_id"))
+                    registered_bridge_id = str(meta.get("bridge_id") or "").strip()
+                    envelope_bridge_id = str(envelope.get("bridge_id") or "").strip()
+                    if envelope_bridge_id != registered_bridge_id:
+                        self._log(
+                            "pipe ignored qmt bridge_id change registered=%s envelope=%s"
+                            % (registered_bridge_id, envelope_bridge_id)
+                        )
                 if envelope.get("endpoint_name"):
                     meta["endpoint_name"] = str(envelope.get("endpoint_name"))
                 if envelope.get("instance_id"):
@@ -300,6 +306,36 @@ class CfquantPipeHub(object):
                 except Exception:
                     pass
             return True
+
+    def _registered_qmt_bridge_id(self, conn):
+        with self.qmt_lock:
+            bridge_id = str((self.qmt_conn_meta_by_conn.get(conn) or {}).get("bridge_id") or "").strip()
+        return bridge_id if bridge_id not in ("", "-") else ""
+
+    def _normalize_qmt_event(self, conn, envelope, raw, msg):
+        bridge_id = self._registered_qmt_bridge_id(conn)
+        if not bridge_id:
+            return raw
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+        for claimed_bridge_id in (
+            envelope.get("bridge_id"),
+            msg.get("bridge_id"),
+            meta.get("bridge_id"),
+            data.get("bridge_id"),
+        ):
+            claimed_bridge_id = str(claimed_bridge_id or "").strip()
+            if claimed_bridge_id and claimed_bridge_id != bridge_id:
+                self._log(
+                    "pipe dropped qmt event with conflicting bridge_id registered=%s claimed=%s event=%s"
+                    % (bridge_id, claimed_bridge_id, msg.get("event") or "-")
+                )
+                return None
+        normalized = dict(msg)
+        normalized_meta = dict(meta)
+        normalized_meta["bridge_id"] = bridge_id
+        normalized["meta"] = normalized_meta
+        return dumps_message(normalized)
 
     def _handle_qmt_heartbeat(self, conn, envelope):
         if self._touch_qmt_conn(conn, envelope):
@@ -416,6 +452,10 @@ class CfquantPipeHub(object):
                     )
                 )
         elif msg_type == "event":
+            raw = self._normalize_qmt_event(conn, envelope, raw, msg)
+            if raw is None:
+                return
+            msg = loads_message(raw)
             client_id = msg.get("client_id") or envelope.get("channel")
             with self.state_lock:
                 target = self.client_by_id.get(client_id)

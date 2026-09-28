@@ -6755,6 +6755,11 @@ class CallbackEventStore(object):
         self._thread = None
         self._running = False
         self._pipe_clients = {}
+        self._pipe_lifecycle_lock = threading.RLock()
+        self._pipe_stop = threading.Event()
+        self._pipe_thread = None
+        self._pipe_retry_interval = 1.0
+        self._pipe_errors = {}
         self._mode = None
 
     def start(self):
@@ -6765,6 +6770,7 @@ class CallbackEventStore(object):
             self.channels = callback_channels()
         self._mode = "mixed"
         self._running = True
+        self._pipe_stop = threading.Event()
         try:
             CLIENTS.add_callback("__event__", self._on_client_event)
         except Exception as e:
@@ -6774,6 +6780,10 @@ class CallbackEventStore(object):
             safe_print("cfquant callback pipe listeners started count=%s channels=%s" % (pipe_count, ",".join(self.channels)))
         except Exception as e:
             safe_print("cfquant callback pipe listeners start failed: %s" % e)
+        self._pipe_thread = threading.Thread(
+            target=self._maintain_pipe_clients, args=(self._pipe_stop,))
+        self._pipe_thread.daemon = True
+        self._pipe_thread.start()
         try:
             lttx_count = self._start_lttx_client()
             if lttx_count:
@@ -6784,11 +6794,20 @@ class CallbackEventStore(object):
 
     def close(self):
         self._running = False
+        self._pipe_stop.set()
+        pipe_thread = self._pipe_thread
+        if pipe_thread is not None and pipe_thread is not threading.current_thread():
+            pipe_thread.join(timeout=5)
+        self._pipe_thread = None
         try:
             CLIENTS.remove_callback("__event__", self._on_client_event)
         except Exception:
             pass
-        for client in list(self._pipe_clients.values()):
+        with self._pipe_lifecycle_lock:
+            pipe_clients = list(self._pipe_clients.values())
+            self._pipe_clients = {}
+            self._pipe_errors.clear()
+        for client in pipe_clients:
             try:
                 client.remove_callback("__event__", self._on_channel_event)
             except Exception:
@@ -6801,7 +6820,6 @@ class CallbackEventStore(object):
                 client.close()
             except Exception:
                 pass
-        self._pipe_clients = {}
         tx = self._tx
         self._tx = None
         if tx is not None:
@@ -7022,9 +7040,23 @@ class CallbackEventStore(object):
         self._thread.start()
         return len(channels)
 
-    def _start_pipe_clients(self):
+    def _maintain_pipe_clients(self, stop):
+        # These clients only receive pushes: no subsequent RPC can call start()
+        # for them after a Hub restart. Reconnect explicitly without replaying
+        # any request, and keep a per-start stop token so close stays final.
+        while not stop.wait(self._pipe_retry_interval):
+            if not self._running or stop is not self._pipe_stop:
+                return
+            try:
+                self._start_pipe_clients(stop)
+            except Exception:
+                # Individual failures are logged once until their reason changes.
+                pass
+
+    def _start_pipe_clients(self, stop=None):
         from cfquant.pipe_client import PipeRpcClient
 
+        stop = stop or self._pipe_stop
         cfg = get_cfquant_config()
         pipe_name = os.environ.get("CFQUANT_PIPE_NAME") or cfg.get("pipe_name") or DEFAULT_PIPE_NAME
         connect_timeout_ms = cfg.get("pipe_connect_timeout_ms")
@@ -7034,25 +7066,34 @@ class CallbackEventStore(object):
         for channel in self.channels:
             if not channel:
                 continue
-            client = PipeRpcClient(
-                pipe_name=pipe_name,
-                request_channel=channel,
-                timeout=timeout,
-                client_id=channel,
-                connect_timeout_ms=connect_timeout_ms,
-            )
-            try:
-                client.start()
-                client.add_callback("__event__", self._on_channel_event)
-                self._pipe_clients[channel] = client
-                started += 1
-            except Exception as e:
-                errors.append("%s: %s" % (channel, e))
+            with self._pipe_lifecycle_lock:
+                if stop.is_set() or stop is not self._pipe_stop or not self._running:
+                    break
+                client = self._pipe_clients.get(channel)
+                if client is None:
+                    client = PipeRpcClient(
+                        pipe_name=pipe_name,
+                        request_channel=channel,
+                        timeout=timeout,
+                        client_id=channel,
+                        connect_timeout_ms=connect_timeout_ms,
+                    )
+                    # Register before connecting so an immediate push is retained.
+                    client.add_callback("__event__", self._on_channel_event)
                 try:
-                    client.close()
-                except Exception:
-                    pass
-                safe_print("callback pipe client start failed channel=%s error=%s" % (channel, e))
+                    client.start()  # Idempotent for a healthy receiver.
+                    self._pipe_clients[channel] = client
+                    self._pipe_errors.pop(channel, None)
+                    started += 1
+                except Exception as e:
+                    errors.append("%s: %s" % (channel, e))
+                    try:
+                        client.close()  # Also closes a partially opened pair.
+                    except Exception:
+                        pass
+                    if self._pipe_errors.get(channel) != str(e):
+                        safe_print("callback pipe client start failed channel=%s error=%s" % (channel, e))
+                    self._pipe_errors[channel] = str(e)
         if started <= 0:
             detail = "; ".join(errors)
             raise RuntimeError("no callback pipe clients started%s" % (": " + detail if detail else ""))

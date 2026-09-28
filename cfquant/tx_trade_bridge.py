@@ -4340,7 +4340,9 @@ class TxTradeBridge(object):
     def _send_event(self, client_id, name, data, subscription_id=None, meta=None):
         if not client_id or self.tx is None:
             return
-        event = pack_event(name, data=data, client_id=client_id, subscription_id=subscription_id, meta=meta)
+        event_meta = dict(meta or {})
+        event_meta["bridge_id"] = self.bridge_id
+        event = pack_event(name, data=data, client_id=client_id, subscription_id=subscription_id, meta=event_meta)
         self.tx.push("event", event, client_id)
 
     def _call_variants(self, func, variants):

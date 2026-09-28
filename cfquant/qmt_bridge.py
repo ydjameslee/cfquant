@@ -49,6 +49,7 @@ class CfquantQmtBridge(object):
         self.ip = ip or cfg["host"]
         self.port = int(port or cfg["port"])
         self.token = token or cfg["token"]
+        self.bridge_id = cfg.get("bridge_id") or "default"
         self.request_channel = request_channel or cfg["request_channel"]
         self.show = show
         self.globals_dict = globals_dict or {}
@@ -1782,12 +1783,14 @@ class CfquantQmtBridge(object):
         self._send_event(client_id, "trader:%s" % name, data)
 
     def _send_event(self, client_id, name, data, subscription_id=None, meta=None):
+        event_meta = dict(meta or {})
+        event_meta["bridge_id"] = self.bridge_id
         event = pack_event(
             name,
             data=data,
             client_id=client_id,
             subscription_id=subscription_id,
-            meta=meta,
+            meta=event_meta,
         )
         self._push("event", event, client_id)
 
