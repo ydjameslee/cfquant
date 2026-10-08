@@ -5889,6 +5889,23 @@ class LttxWebRouteServer(object):
 LTTX_WEB_ROUTE = LttxWebRouteServer()
 
 
+def safe_print(message):
+    line = str(message)
+    printed_to_log = False
+    try:
+        print(line)
+        printed_to_log = getattr(sys, "stdout", None) is _LOG_FP
+    except Exception:
+        pass
+    if printed_to_log:
+        return
+    try:
+        if _LOG_FP is not None:
+            _LOG_FP.write(line + "\n")
+    except Exception:
+        pass
+
+
 class RuntimeVersionRegistry(object):
     def __init__(self, ttl_seconds=RUNTIME_REPORT_TTL_SECONDS, persist_file=None):
         self.ttl_seconds = float(ttl_seconds)
@@ -7237,22 +7254,6 @@ def runtime_python_executable():
         pass
     return sys.executable
 
-
-def safe_print(message):
-    line = str(message)
-    printed_to_log = False
-    try:
-        print(line)
-        printed_to_log = getattr(sys, "stdout", None) is _LOG_FP
-    except Exception:
-        pass
-    if printed_to_log:
-        return
-    try:
-        if _LOG_FP is not None:
-            _LOG_FP.write(line + "\n")
-    except Exception:
-        pass
 
 
 def cleanup_files_by_age(root_dir, patterns=None, retention_days=LOG_RETENTION_DAYS, recursive=True):

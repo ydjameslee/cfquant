@@ -591,7 +591,7 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.44"
+CORE_VERSION = "0.2.45"
 LITE_ENTRY_VERSION = "lite_20260828_01"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
@@ -1398,73 +1398,157 @@ def configured_bridges():
         }
     return result
 
+# BEGIN GENERATED ACCOUNT ROUTING
+# -*- coding: utf-8 -*-
+
+
 _ACCOUNT_ROUTE_LOCK = threading.RLock()
 _ACCOUNT_ROUTE_SUBSCRIBERS = {}
 _ACCOUNT_ROUTE_CLIENT_ACCOUNTS = {}
 
 
-def _account_route_type(account):
-    if account is None:
-        return ""
-    return str(getattr(account, "m_nAccountType", "") or getattr(account, "account_type", "") or "")
+def _account_route_type(account_type):
+    value = connect_account_type(account_type or "STOCK")
+    mapping = {
+        "1": "FUTURE",
+        "FUTURE_ACCOUNT": "FUTURE",
+        "2": "STOCK",
+        "SECURITY": "STOCK",
+        "SECURITY_ACCOUNT": "STOCK",
+        "STOCK_ACCOUNT": "STOCK",
+        "7": "HUGANGTONG",
+        "HGT": "HUGANGTONG",
+        "HUGANGTONG_ACCOUNT": "HUGANGTONG",
+        "SHANGHAI_HK_CONNECT": "HUGANGTONG",
+        "11": "SHENGANGTONG",
+        "SGT": "SHENGANGTONG",
+        "SHENGANGTONG_ACCOUNT": "SHENGANGTONG",
+        "SHENZHEN_HK_CONNECT": "SHENGANGTONG",
+        "3": "CREDIT",
+        "CREDIT_ACCOUNT": "CREDIT",
+        "MARGIN": "CREDIT",
+        "5": "FUTURE_OPTION",
+        "FUTURE_OPTION_ACCOUNT": "FUTURE_OPTION",
+        "FUTUREOPTION": "FUTURE_OPTION",
+        "6": "STOCK_OPTION",
+        "STOCK_OPTION_ACCOUNT": "STOCK_OPTION",
+        "STOCKOPTION": "STOCK_OPTION",
+        "OPTION": "STOCK_OPTION",
+    }
+    return mapping.get(value, value or "STOCK")
 
 
-def _account_route_id(account):
-    if account is None:
-        return ""
-    return str(getattr(account, "m_strAccountID", "") or getattr(account, "account_id", "") or account or "")
+def _account_route_key(bridge_id, account_id, account_type=None):
+    return (
+        str(bridge_id or "default").strip(),
+        _account_route_type(account_type),
+        str(account_id or "").strip(),
+    )
 
 
-def _account_route_key(account):
-    return (_account_route_type(account), _account_route_id(account))
-
-
-def account_route_subscribe(account, client_id, *, strategy=None, sync_account_status=None):
-    if account is None or not client_id:
+def account_route_subscribe(bridge_id, account_id, client_id, account_type=None):
+    bridge_id, account_type, account_id = _account_route_key(bridge_id, account_id, account_type)
+    client_id = str(client_id or "").strip()
+    if not account_id or not client_id:
         return
-    key = _account_route_key(account)
     with _ACCOUNT_ROUTE_LOCK:
-        subscribers = _ACCOUNT_ROUTE_SUBSCRIBERS.setdefault(key, set())
-        subscribers.add(str(client_id))
-        account_text = "{}:{}".format(key[0], key[1])
-        _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.setdefault(str(client_id), set()).add(account_text)
+        _ACCOUNT_ROUTE_SUBSCRIBERS.setdefault((bridge_id, account_type, account_id), set()).add(client_id)
+        _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.setdefault((bridge_id, client_id), set()).add((account_type, account_id))
 
 
-def account_route_unsubscribe(account, client_id, *, strategy=None):
-    if not client_id:
-        return
-    client_id = str(client_id)
-    keys = []
-    if account is not None:
-        keys.append(_account_route_key(account))
+def account_route_unsubscribe(bridge_id, account_id=None, client_id=None, account_type=None):
+    bridge_id = str(bridge_id or "default").strip()
+    account_type = _account_route_type(account_type) if account_type not in (None, "") else ""
+    account_id = str(account_id or "").strip()
+    client_id = str(client_id or "").strip()
     with _ACCOUNT_ROUTE_LOCK:
-        if not keys:
-            keys = list(_ACCOUNT_ROUTE_SUBSCRIBERS.keys())
-        for key in keys:
-            subscribers = _ACCOUNT_ROUTE_SUBSCRIBERS.get(key)
-            if subscribers:
-                subscribers.discard(client_id)
-                if not subscribers:
-                    _ACCOUNT_ROUTE_SUBSCRIBERS.pop(key, None)
-        for accounts in _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.values():
-            accounts.discard(client_id)
-        empty_clients = [cid for cid, accounts in _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.items() if not accounts]
-        for cid in empty_clients:
-            _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.pop(cid, None)
+        if account_id and client_id:
+            if account_type:
+                _account_route_remove_pair(bridge_id, account_id, client_id, account_type)
+            else:
+                for item_type in _account_route_types_for_account_locked(bridge_id, account_id):
+                    _account_route_remove_pair(bridge_id, account_id, client_id, item_type)
+            return
+        if client_id:
+            accounts = _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.pop((bridge_id, client_id), set())
+            for item in accounts:
+                if isinstance(item, tuple):
+                    item_type, item_account_id = item
+                else:
+                    item_type, item_account_id = "STOCK", item
+                subscribers = _ACCOUNT_ROUTE_SUBSCRIBERS.get((bridge_id, item_type, item_account_id))
+                if subscribers:
+                    subscribers.discard(client_id)
+                    if not subscribers:
+                        _ACCOUNT_ROUTE_SUBSCRIBERS.pop((bridge_id, item_type, item_account_id), None)
+            return
+        if account_id:
+            types = [account_type] if account_type else _account_route_types_for_account_locked(bridge_id, account_id)
+            for item_type in types:
+                subscribers = _ACCOUNT_ROUTE_SUBSCRIBERS.pop((bridge_id, item_type, account_id), set())
+                for item in subscribers:
+                    accounts = _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.get((bridge_id, item))
+                    if accounts:
+                        accounts.discard((item_type, account_id))
+                        accounts.discard(account_id)
+                        if not accounts:
+                            _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.pop((bridge_id, item), None)
 
 
-def account_route_client_ids(account):
-    key = _account_route_key(account)
+def account_route_client_ids(bridge_id, account_id, account_type=None):
+    bridge_id, account_type, account_id = _account_route_key(bridge_id, account_id, account_type)
+    if not account_id:
+        return []
     with _ACCOUNT_ROUTE_LOCK:
-        return list(_ACCOUNT_ROUTE_SUBSCRIBERS.get(key, set()))
+        return sorted(_ACCOUNT_ROUTE_SUBSCRIBERS.get((bridge_id, account_type, account_id), set()))
 
 
-def account_route_status():
+def account_types(bridge_id, account_id):
+    """Return explicitly subscribed account types for one bridge/account id."""
+    bridge_id = str(bridge_id or "default").strip()
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return []
     with _ACCOUNT_ROUTE_LOCK:
-        return {
-            "accounts": {"{}:{}".format(key[0], key[1]): sorted(values) for key, values in _ACCOUNT_ROUTE_SUBSCRIBERS.items()},
-            "clients": {client_id: sorted(accounts) for client_id, accounts in _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.items()},
-        }
+        return sorted({
+            account_type
+            for item_bridge_id, account_type, item_account_id in _ACCOUNT_ROUTE_SUBSCRIBERS
+            if item_bridge_id == bridge_id and item_account_id == account_id
+        })
+
+
+def account_route_status(bridge_id):
+    bridge_id = str(bridge_id or "default").strip()
+    with _ACCOUNT_ROUTE_LOCK:
+        return dict(
+            ("%s:%s" % (account_type, account_id), len(account_route_client_ids))
+            for (item_bridge_id, account_type, account_id), account_route_client_ids in _ACCOUNT_ROUTE_SUBSCRIBERS.items()
+            if item_bridge_id == bridge_id
+        )
+
+
+def _account_route_types_for_account_locked(bridge_id, account_id):
+    return [
+        account_type
+        for item_bridge_id, account_type, item_account_id in _ACCOUNT_ROUTE_SUBSCRIBERS.keys()
+        if item_bridge_id == bridge_id and item_account_id == account_id
+    ] or ["STOCK"]
+
+
+def _account_route_remove_pair(bridge_id, account_id, client_id, account_type="STOCK"):
+    account_type = _account_route_type(account_type)
+    subscribers = _ACCOUNT_ROUTE_SUBSCRIBERS.get((bridge_id, account_type, account_id))
+    if subscribers:
+        subscribers.discard(client_id)
+        if not subscribers:
+            _ACCOUNT_ROUTE_SUBSCRIBERS.pop((bridge_id, account_type, account_id), None)
+    accounts = _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.get((bridge_id, client_id))
+    if accounts:
+        accounts.discard((account_type, account_id))
+        accounts.discard(account_id)
+        if not accounts:
+            _ACCOUNT_ROUTE_CLIENT_ACCOUNTS.pop((bridge_id, client_id), None)
+# END GENERATED ACCOUNT ROUTING
 
 XTTRADER_COMPAT_CANDIDATES = {
     "query_account_info": ("query_account_info", "get_account_info"),

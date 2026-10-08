@@ -19,6 +19,7 @@ if not defined WEB_LOG_RUN_ID set "WEB_LOG_RUN_ID=%RANDOM%"
 set "WEB_LOG_RUN_ID=%WEB_LOG_RUN_ID%_%RANDOM%"
 set "WEB_STDOUT=%LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stdout.log"
 set "WEB_STDERR=%LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stderr.log"
+set "CFQUANT_START_PID_FILE="
 call :log "start_cfquant.bat invoked"
 
 set "PYTHON_EXE=python"
@@ -106,8 +107,9 @@ if not errorlevel 1 (
 )
 
 rem Hide only the new service process, never the management console.
+set "CFQUANT_START_PID_FILE=%LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.pid"
 set "CFQUANT_START_ROOT=%~dp0"
-powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $script=Join-Path $env:CFQUANT_START_ROOT 'cfquant_web_server.py'; $arguments=[char]34 + $script + [char]34 + ' --port ' + $env:WEB_PORT; Start-Process -FilePath $env:PYTHON_EXE -ArgumentList $arguments -WorkingDirectory $env:CFQUANT_START_ROOT -WindowStyle Hidden -RedirectStandardOutput $env:WEB_STDOUT -RedirectStandardError $env:WEB_STDERR -ErrorAction Stop | Out-Null; exit 0 } catch { Write-Output ('[ERROR] Cannot launch web service: ' + $_.Exception.Message); exit 1 }"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $script=Join-Path $env:CFQUANT_START_ROOT 'cfquant_web_server.py'; $arguments=[char]34 + $script + [char]34 + ' --port ' + $env:WEB_PORT; $child=Start-Process -PassThru -FilePath $env:PYTHON_EXE -ArgumentList $arguments -WorkingDirectory $env:CFQUANT_START_ROOT -WindowStyle Hidden -RedirectStandardOutput $env:WEB_STDOUT -RedirectStandardError $env:WEB_STDERR -ErrorAction Stop; [IO.File]::WriteAllText($env:CFQUANT_START_PID_FILE, [string]$child.Id); exit 0 } catch { Write-Output ('[ERROR] Cannot launch web service: ' + $_.Exception.Message); exit 1 }"
 if errorlevel 1 (
     call :show_logs
     call :pause_on_error
@@ -118,7 +120,7 @@ echo [STEP] Waiting for the web health check...
 
 call :wait_for_cfquant_web %WEB_PORT% %CFQUANT_START_WAIT_SECONDS%
 if errorlevel 1 (
-    echo [ERROR] cfquant web dashboard did not start within %CFQUANT_START_WAIT_SECONDS% seconds.
+    echo [ERROR] cfquant web dashboard exited before becoming ready or did not start within %CFQUANT_START_WAIT_SECONDS% seconds.
     echo [ERROR] Please check the logs below.
     call :log "web dashboard failed to become ready port=%WEB_PORT%"
     call :show_logs
@@ -188,9 +190,10 @@ exit /b %PORT_RESULT%
 :wait_for_cfquant_web
 set "CFQUANT_START_PORT=%~1"
 set "CFQUANT_START_WAIT=%~2"
-powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$port=[int]$env:CFQUANT_START_PORT; $wait=[int]$env:CFQUANT_START_WAIT; $deadline=(Get-Date).AddSeconds($wait); $url='http://127.0.0.1:' + $port + '/api/health'; while ((Get-Date) -lt $deadline) { try { $req=[Net.WebRequest]::Create($url); $req.Method='GET'; $req.Timeout=1000; $req.ReadWriteTimeout=1000; $req.UserAgent='cfquant-start'; $res=$req.GetResponse(); try { if ([int]$res.StatusCode -eq 200) { $reader=[IO.StreamReader]::new($res.GetResponseStream(), [Text.Encoding]::UTF8); $content=$reader.ReadToEnd(); $reader.Close(); $payload=$content | ConvertFrom-Json; if ($payload.ok -eq $true -and $payload.data.status -eq 'ok') { exit 0 } } } finally { $res.Close() } } catch {}; Start-Sleep -Milliseconds 500 }; exit 1"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$port=[int]$env:CFQUANT_START_PORT; $wait=[int]$env:CFQUANT_START_WAIT; $deadline=(Get-Date).AddSeconds($wait); $url='http://127.0.0.1:' + $port + '/api/health'; while ((Get-Date) -lt $deadline) { if ($env:CFQUANT_START_PID_FILE -and (Test-Path -LiteralPath $env:CFQUANT_START_PID_FILE)) { $childId=[int]([IO.File]::ReadAllText($env:CFQUANT_START_PID_FILE)); if (-not (Get-Process -Id $childId -ErrorAction SilentlyContinue)) { Write-Output ('[ERROR] Web service exited before readiness (PID=' + $childId + ').'); exit 1 } }; try { $req=[Net.WebRequest]::Create($url); $req.Method='GET'; $req.Timeout=1000; $req.ReadWriteTimeout=1000; $req.UserAgent='cfquant-start'; $res=$req.GetResponse(); try { if ([int]$res.StatusCode -eq 200) { $reader=[IO.StreamReader]::new($res.GetResponseStream(), [Text.Encoding]::UTF8); $content=$reader.ReadToEnd(); $reader.Close(); $payload=$content | ConvertFrom-Json; if ($payload.ok -eq $true -and $payload.data.status -eq 'ok') { exit 0 } } } finally { $res.Close() } } catch {}; Start-Sleep -Milliseconds 500 }; exit 1"
 set "WAIT_RESULT=0"
 if errorlevel 1 set "WAIT_RESULT=1"
+if defined CFQUANT_START_PID_FILE del /q "%CFQUANT_START_PID_FILE%" >nul 2>nul
 set "CFQUANT_START_PORT="
 set "CFQUANT_START_WAIT="
 exit /b %WAIT_RESULT%

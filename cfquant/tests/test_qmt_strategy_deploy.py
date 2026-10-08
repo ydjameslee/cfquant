@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import tokenize
 from xml.dom import minidom
 
 import pytest
@@ -545,6 +546,19 @@ def test_all_managed_entry_variants_compile_without_executing(mode, deployment):
     assert document["detail"]["realName"] == role["name"] + ".py"
     assert document["formulaCatalog"][0].encode("utf-8", "surrogateescape").hex() == "ced2b5c4b2dfc2d4"
     ast.parse(document["content"], feature_version=(3, 6))
+    if mode == "lite":
+        embedded = [node.args[0].value for node in ast.walk(ast.parse(document["content"]))
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "compile" and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)]
+        assert len(embedded) == 1
+        with tokenize.open(str(SCRIPTS / "CFQUANT_LITE.py")) as stream:
+            original = ast.parse(stream.read())
+        actual = ast.parse(embedded[0], feature_version=(3, 6))
+        definitions = lambda tree: {node.name for node in tree.body
+                                    if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+        assert definitions(actual) == definitions(original)
+        assert len(embedded[0].splitlines()) > 7000
     descriptor = {"mode": mode, "generation": "test", "role": "SH", "control_path": "test", "lease_dir": "test"}
     variants = list((SCRIPTS / "同账号独立市场").glob("*.py")) + [SCRIPTS / "CFQUANT_TRADE_LOWLAT.py"]
     for path in variants:

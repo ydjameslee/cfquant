@@ -1,14 +1,18 @@
-"""Sync shared batch helpers and compatible adapters into GBK QMT scripts."""
+"""Sync shared batch helpers, account routing and compatible adapters into GBK QMT scripts."""
 
 import argparse
 import ast
+import io
 import re
+import tokenize
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 START = "# BEGIN GENERATED CFTRADER BATCH\n"
 END = "# END GENERATED CFTRADER BATCH\n"
+ROUTING_START = "# BEGIN GENERATED ACCOUNT ROUTING\n"
+ROUTING_END = "# END GENERATED ACCOUNT ROUTING\n"
 
 
 def shared_source():
@@ -22,6 +26,43 @@ def shared_source():
     normalizer = normalizer.replace("def normalize_account_type(", "def _lite_normalize_account_type(")
     normalizer = normalizer.replace("return DEFAULT_ACCOUNT_TYPE", 'return "STOCK"')
     return connect.rstrip() + '\n\n' + normalizer + '\n\n' + batch
+
+
+def account_routing_source():
+    source = (ROOT / 'cfquant/account_routing.py').read_text(encoding='utf-8')
+    source = '\n'.join(line for line in source.split('\n')
+                       if not line.startswith(('import threading', 'from .stock_connect import ')))
+    # Keep the standalone script self-contained, with distinct global names.
+    names = {
+        '_lock': '_ACCOUNT_ROUTE_LOCK',
+        '_subscribers': '_ACCOUNT_ROUTE_SUBSCRIBERS',
+        '_client_accounts': '_ACCOUNT_ROUTE_CLIENT_ACCOUNTS',
+        '_account_type': '_account_route_type',
+        '_key': '_account_route_key',
+        '_account_types_for_account_locked': '_account_route_types_for_account_locked',
+        '_remove_pair': '_account_route_remove_pair',
+        'subscribe': 'account_route_subscribe',
+        'unsubscribe': 'account_route_unsubscribe',
+        'client_ids': 'account_route_client_ids',
+        'status': 'account_route_status',
+    }
+    tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+    return tokenize.untokenize(
+        token._replace(string=names.get(token.string, token.string))
+        if token.type == tokenize.NAME else token for token in tokens
+    ).strip() + '\n'
+
+
+def sync_account_routing(source):
+    block = ROUTING_START + account_routing_source() + ROUTING_END
+    if ROUTING_START in source:
+        start = source.index(ROUTING_START)
+        end = source.index(ROUTING_END, start) + len(ROUTING_END)
+    else:
+        start = source.index('_ACCOUNT_ROUTE_LOCK = threading.RLock()')
+        end = source.index('XTTRADER_COMPAT_CANDIDATES =', start)
+        block += '\n'
+    return source[:start] + block + source[end:]
 
 
 def _class_method(source, class_name, method_name):
@@ -50,6 +91,7 @@ def _replace_class_method(source, class_name, method_name, replacement):
 
 def updated_source(source):
     source = source.replace("\r\n", "\n")
+    source = sync_account_routing(source)
     shared = shared_source()
     block = START + shared.rstrip() + "\n" + END
     if START in source:

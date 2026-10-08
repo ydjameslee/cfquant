@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = 'web_20260926_01';
+const FRONTEND_VERSION = 'web_20261008_01';
 
 const state = {
   accountId: '',
@@ -5322,6 +5322,8 @@ function hideSetupOverlay() {
 
 async function submitSetupForm(event) {
   if (event) event.preventDefault();
+  const form = $('setupForm');
+  if (form.dataset.saving === 'true') return;
   const status = $('setupStatus');
   const adminRequired = setupRequiresAdminRegistration();
   const body = {
@@ -5396,9 +5398,22 @@ async function submitSetupForm(event) {
       return;
     }
   }
-  if (status) status.textContent = '正在保存...';
-  updateSetupSteps('identity');
+  form.dataset.saving = 'true';
+  const submitButton = form.querySelector('[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
   try {
+    const processTargets = [
+      { label: 'QMT', path: body.qmt_dir },
+      ...(normalizeTransportMode(body.mode) === 'lttx'
+        ? [{ label: '交易端 QMT', path: body.qmt_trade_dir }] : []),
+    ].filter((item) => item.path);
+    if (status) status.textContent = '正在检测 QMT...';
+    if (!await ensureBindingQmtStopped(processTargets, { failOnError: true })) {
+      if (status) status.textContent = '已取消保存';
+      return;
+    }
+    if (status) status.textContent = '正在保存...';
+    updateSetupSteps('identity');
     const data = await api('/api/setup/initialize', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -5418,6 +5433,7 @@ async function submitSetupForm(event) {
     }
     await loadConfig();
     hideSetupOverlay();
+    await restartBindingQmtProcessesAfterSave();
     await startAuthenticatedApp();
     localStorage.setItem(onboardingAutoShownKey(), '1');
     showBindingQmtGuide({
@@ -5447,6 +5463,9 @@ async function submitSetupForm(event) {
     updateSetupSteps('config');
     if (status) status.textContent = error.message;
     log('初始化配置保存失败', { error: error.message });
+  } finally {
+    delete form.dataset.saving;
+    if (submitButton) submitButton.disabled = false;
   }
 }
 
@@ -9674,8 +9693,15 @@ async function restartBindingQmtProcessesAfterSave() {
 }
 
 async function recheckBindingQmtProcesses() {
-  const targets = bindingQmtProcessTargetsFromForm();
+  const targets = (state.bindingQmtProcessPromptResults || []).map((item) => ({
+    label: item.label, path: item.qmt_dir,
+  })).filter((item) => item.path);
   const results = await checkBindingQmtProcesses(targets);
+  if (results.some((item) => item.error)) {
+    const status = $('bindingQmtProcessPromptStatus');
+    if (status) status.textContent = results.filter((item) => item.error).map((item) => item.error).join('；');
+    return;
+  }
   if (results.some((item) => item.running)) {
     const status = $('bindingQmtProcessPromptStatus');
     if (status) status.textContent = results.filter((item) => item.running).map((item) => `${item.label || 'QMT'}：仍在运行，PID ${item.pids.join(', ')}`).join('；');
@@ -9684,10 +9710,14 @@ async function recheckBindingQmtProcesses() {
   closeBindingQmtProcessPrompt(true);
 }
 
-async function ensureBindingQmtStopped(targets) {
+async function ensureBindingQmtStopped(targets, options = {}) {
   const results = await checkBindingQmtProcesses(targets);
+  const errors = results.filter((item) => item.error);
+  if (errors.length && options.failOnError) throw new Error(`QMT 检测失败：${errors.map((item) => item.error).join('；')}`);
   if (!results.some((item) => item.running)) return true;
-  return showBindingQmtProcessPrompt(results);
+  return showBindingQmtProcessPrompt(results.map((item, index) => ({
+    ...item, qmt_dir: item.qmt_dir || targets[index].path,
+  })));
 }
 
 async function submitBindingForm(event) {
