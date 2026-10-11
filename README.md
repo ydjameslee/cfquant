@@ -131,9 +131,9 @@ set CFQUANT_PYTHON_EXE=C:\Users\用户名\anaconda3\envs\quant\python.exe
 start_cfquant.bat
 ```
 
-Web 控制台启动后，请在初始化配置中确认或修改 Python 解释器路径。后续启动会优先使用已保存的路径；启动选择结果和失败原因记录在 `log\cfquant_startup.log`。
+Web 控制台启动后，请在初始化配置中确认或修改 Python 解释器路径。后续启动会优先使用已保存的路径；启动选择结果和失败原因记录在 `log\startup\cfquant_startup.log`。
 
-自动安装失败时，启动窗口会保持打开，并把安装日志写入 `log\cfquant_startup.log`，修复 Python、网络或权限问题后重新启动即可。
+自动安装失败时，启动窗口会保持打开，并把安装日志写入 `log\startup\cfquant_startup.log`，修复 Python、网络或权限问题后重新启动即可。
 
 项目默认使用清华 PyPI 镜像安装依赖，适合中国大陆网络环境。启动脚本、网页源码更新、`requirements.txt` 安装以及 LTtx 缺失依赖自动安装都会遵循这个设置。需要切换到企业私有源或其他镜像时，可在启动前设置 `CFQUANT_PIP_INDEX_URL` 环境变量。
 
@@ -184,7 +184,7 @@ cfquant run
 
 - 源码部署后，网页里的“版本/更新”功能会按完整项目目录更新，适合从官网或 GitHub 拉取新版本。
 - 更新时会尽量保留本地配置、数据库、日志和运行目录，便于日常升级和回滚。
-- 如果新版本修改了 `qmt_scripts/` 里的入口脚本，网页会提示你重新更新 QMT 侧脚本并重启对应 QMT 策略。
+- 完整项目更新会先关闭已绑定且正在运行的 QMT，按绑定模式覆盖 `qmt_scripts/` 里的入口脚本，然后重启对应 QMT 策略。
 - 建议把源码目录固定下来，例如 `D:\cfquant`，不要频繁挪动目录。
 
 新用户建议先使用**通用模式**。所有部署配置都在 Web 控制台完成，保存绑定后系统会自动准备并管理 QMT 托管策略。
@@ -214,14 +214,51 @@ cfquant Web 每次启动时都会读取已保存的绑定：只要账号处于�
 
 | 现象 | 优先检查 |
 |---|---|
-| 双击启动窗口后立即退出 | 查看 `log\cfquant_startup.log`；确认 Python 路径存在，或设置 `CFQUANT_PYTHON_EXE`。 |
-| 页面打不开 | 查看最新的 `log\cfquant_web_server.*.stderr.log`；确认 8765 端口没有被其他程序占用。 |
+| 双击启动窗口后立即退出 | 查看 `log\startup\cfquant_startup.log`；确认 Python 路径存在，或设置 `CFQUANT_PYTHON_EXE`。 |
+| 页面打不开 | 查看最新的 `log\web\cfquant_web_server.*.stderr.log`；确认 8765 端口没有被其他程序占用。 |
 | 页面在线但 QMT 不在线 | 确认 QMT 已登录、QMT 目录正确，并按绑定页提示重新导入或启动入口策略。 |
 | `ModuleNotFoundError: cfquant` | 在运行策略的同一个解释器中执行 `python -m pip install --upgrade cfquant`，再用 `python -c "import cfquant; print(cfquant.__file__)"` 验证。 |
 | 行情为空 | 先用页面接口测试确认证券代码、周期和行情权限；标准行情异常时可对照 `xtdata.get_market_data_ex`。 |
 | 不确定应该使用哪种模式 | 先选通用模式；极致模式用于 QMT 导入受限的情况，高级模式需要额外准备两个 QMT 环境。 |
 
 完整日志位于项目的 `log` 目录。提交问题时，请附上启动日志、页面状态和使用的 Python 版本，删除账号、密码、Token、订单和持仓等敏感信息后再提交。
+
+## 第三方项目自动化接入
+
+`cfquant.management.RuntimeManager` 支持隐藏启动后台服务、通过代码初始化及绑定账号、配置是否自动启动 QMT，并通过官网或 GitHub 更新服务和回滚。无需打开网页，后台服务使用独立目录，更新不会覆盖第三方进程已经导入的 SDK。
+
+```python
+from cfquant.management import RuntimeManager
+
+runtime = RuntimeManager(home=r"D:\MyApp\cfquant")
+runtime.start()  # 隐藏启动；遵循各账号保存的 QMT 启动设置
+runtime.initialize(
+    account_id="YOUR_ACCOUNT_ID", account_type="STOCK",
+    qmt_dir=r"D:\QMT", mode="ctypes",
+    auto_start_qmt=False, strategy_autorun=True, live=False,
+)
+# 用户自行启动并登录 QMT；首次部署前需关闭 QMT。
+runtime.wait_ready("YOUR_ACCOUNT_ID", timeout=120)
+runtime.configure_client()
+
+# 用户关闭 QMT 后，可通过 runtime.updates.apply() 更新后台服务。
+```
+
+查询当前运行版本、已安装版本和远端版本，以及按需自动更新：
+
+```python
+versions = runtime.version_info(force=True)
+print(versions["running_version"], versions["installed_version"], versions["latest_version"])
+
+result = runtime.updates.ensure_latest()  # 重新检查；有更新才安装并重启后台服务
+print(result["status"], result["message"])
+# up_to_date / 已是最新版本：不会下载、重启或关闭 QMT。
+# updated / 已更新；check_failed / 无法确认远端版本；local_newer / 本地版本更高。
+```
+
+`version_info(include_remote=False)` 只查询本地版本；`updates.check(force=True)` 只检查更新。按需更新也识别同版本号的安装包变化，首次安装包哈希未知时会执行一次更新以建立记录。真正需要更新时，默认要求先关闭相关 QMT；也可显式传入 `auto_close_qmt=True` 允许自动关闭。`restart=False` 可留待调用方重启。部分 QMT 部署失败返回 `update_incomplete`，已安装但尚未重启返回 `restart_required`；执行更新失败会抛出 `ManagementError`。
+
+模拟／实盘参数需与实际账号一致。完整的启动策略、更新接口、重复绑定行为与错误处理见 [第三方项目管理 SDK](docs/第三方项目管理SDK.md)。
 
 ## 从 `xtquant` 迁移到 `cfquant`
 

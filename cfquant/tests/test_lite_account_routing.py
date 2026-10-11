@@ -126,3 +126,26 @@ def test_routing_normalizes_numeric_account_types(lite, numeric, name):
     scope['account_route_unsubscribe']('bridge', account_id='TEST_ONLY', account_type=name)
     assert scope['account_route_status']('bridge') == {}
     assert scope['_ACCOUNT_ROUTE_CLIENT_ACCOUNTS'] == {}
+
+
+@pytest.mark.parametrize('raw, expected', [
+    (1, 'FUTURE'), (3, 'CREDIT'), (5, 'FUTURE_OPTION'), (6, 'STOCK_OPTION'),
+    ('CREDIT_ACCOUNT', 'CREDIT'), ('FUTURE_ACCOUNT', 'FUTURE'), ('OPTION', 'STOCK_OPTION'),
+    (7, 'HUGANGTONG'), (11, 'SHENGANGTONG'),
+])
+@pytest.mark.parametrize('path', LITE_PATHS, ids=lambda path: path.stem)
+def test_lite_callback_publishes_canonical_account_type(path, raw, expected):
+    source = path.read_text(encoding='gbk')
+    shared = source.split('# BEGIN GENERATED CFTRADER BATCH\n', 1)[1].split('# END GENERATED CFTRADER BATCH', 1)[0]
+    namespace = {}
+    exec(compile(shared, str(path), 'exec'), namespace)
+    tree = ast.parse(source, feature_version=(3, 6))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'NormalQmtBridge')
+    cls.bases = []
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+                and n.name in ('_callback_account_type', '_account_type_from_account_key')]
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), 'exec'), namespace)
+    bridge = namespace['NormalQmtBridge']()
+    bridge._get_value = lambda obj, key: obj.get(key) if isinstance(obj, dict) else None
+    assert bridge._callback_account_type(None, {'m_nBrokerType': raw}) == expected
+    assert bridge._callback_account_type(None, {'m_strAccountKey': str(raw) + '____TEST_ONLY'}) == expected

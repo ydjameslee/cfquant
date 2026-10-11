@@ -9,6 +9,7 @@ import threading
 import time
 
 from . import account_routing, order_meta
+from .order_identity import order_remark_key, prepare_order_remark, restore_order_remark
 from .level2 import L2_THOUSAND_SUBSCRIPTIONS, quote_callback_data, quote_plain, require_l2_callable, thousand_price
 from .protocol import loads_message, pack_event, pack_response
 from .tx_trade_bridge import TxTradeBridge, relay_sync_order_callback
@@ -696,7 +697,7 @@ class NormalQmtBridge(TxTradeBridge):
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        remark = self._first_param(params, ("order_remark", "remark", "strategy_name"), msg.get("id", "tx_order"))
+        remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy = params.get("strategy_name", "")
         try:
             wait = max(0.0, float(params.get("find_order_wait", os.environ.get("CFQUANT_ORDER_ID_WAIT_SECONDS", 2.0)) or 0))
@@ -889,6 +890,7 @@ class NormalQmtBridge(TxTradeBridge):
         ):
             self._enrich_order_request_fields(data)
         self._enrich_callback_order_meta(event_name, data, account_id, account_type)
+        restore_order_remark(data)
         payload = {
             "type": "event",
             "event": event_name,
@@ -949,7 +951,7 @@ class NormalQmtBridge(TxTradeBridge):
         account_type = self._callback_account_type(None, order)
         code = str(order.get("stock_code") or "").upper().split(".", 1)[0]
         strategy = str(order.get("strategy_name") or "")
-        remark = str(order.get("order_remark") or "")
+        remark = order_remark_key(order)
         day = order_meta.order_dates(order)["trading_day"]
         internal_ref = order_meta.normalize_order_ref(order.get("m_nRef"))
         if not account or not account_type or not day or not internal_ref:
@@ -981,7 +983,7 @@ class NormalQmtBridge(TxTradeBridge):
                 error_strategy = str(error.get("strategy_name") or error.get("strategyName") or "")
                 if error_strategy and strategy and error_strategy != strategy and not strategy.startswith(error_strategy + "&&&"):
                     continue
-                error_remark = str(error.get("order_remark") or error.get("m_strRemark") or "")
+                error_remark = order_remark_key(error)
                 if error_remark and remark and error_remark != remark:
                     continue
                 candidates.append(index)
@@ -1028,7 +1030,7 @@ class NormalQmtBridge(TxTradeBridge):
             data["strategy_name"] = data["strategyName"]
         message = data.get("error_msg") or data.get("m_strErrorMsg") or data.get("message") or data.get("msg")
         if not message:
-            return data
+            return restore_order_remark(data)
         message = str(message)
         if data.get("error_id") in (None, "", 0, "0") and data.get("m_nErrorID") in (None, "", 0, "0") and data.get("error_code") in (None, "", 0, "0"):
             for token in re.findall(r"\[(\d+)\]", message):
@@ -1057,10 +1059,13 @@ class NormalQmtBridge(TxTradeBridge):
             data["order_remark"] = context.get("order_remark", "")
             data["m_strRemark"] = context.get("order_remark", "")
             data["m_strOrderRemark"] = context.get("order_remark", "")
+            restore_order_remark(data)
+            data["m_strRemark"] = data.get("order_remark", "")
+            data["m_strOrderRemark"] = data.get("order_remark", "")
             if not data.get("account_type"):
                 data["account_type"] = context.get("account_type", "")
             data["cfquant_order_error_context_consumed"] = True
-        return data
+        return restore_order_remark(data)
 
     def _accept_order_callback(self, data):
         """Filter a stale partial-fill update emitted after a filled update."""

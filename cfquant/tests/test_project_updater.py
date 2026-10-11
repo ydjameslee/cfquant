@@ -30,7 +30,7 @@ def project_updater(tmp_path, monkeypatch):
     monkeypatch.setattr(
         web,
         "auto_deploy_qmt_core_for_all_accounts",
-        lambda source_dir: {"summary": {"ok": True, "target_count": 0}},
+        lambda source_dir, **kwargs: {"summary": {"ok": True, "target_count": 0}},
     )
     updater = web.CfquantProjectUpdater()
     monkeypatch.setattr(

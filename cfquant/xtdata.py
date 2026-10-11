@@ -409,13 +409,15 @@ def download_financial_data2(stock_list, table_list=None, start_time="", end_tim
 
 
 def get_trading_dates(market, start_time="", end_time="", count=-1):
-    """Return market trading dates as millisecond timestamps (xtquant signature)."""
-    return get_client().request("xtdata.get_trading_dates", {
-        "market": market,
-        "start_time": start_time,
-        "end_time": end_time,
-        "count": count,
-    })
+    """Return SH/SZ/BJ/HK session dates as UTC+8 midnight milliseconds.
+
+    Uses pandas_market_calendars locally; no QMT connection is required.
+    count=-1 returns all dates in range, count>0 the last N, count=0 none.
+    Dates stop at today. History starts in 1991 (BJ: 2021-11-15).
+    """
+    from .trading_calendar import get_trading_dates as calendar_dates
+
+    return calendar_dates(market, start_time, end_time, count)
 
 
 def is_stock(stock_code):

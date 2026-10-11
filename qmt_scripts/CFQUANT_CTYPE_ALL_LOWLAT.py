@@ -94,7 +94,7 @@ def _runtime_log_path():
     try:
         base_dir = _entry_base_dir()
         parent_dir = os.path.dirname(base_dir)
-        configured = os.environ.get("CFQUANT_QMT_LOG_DIR") or os.environ.get("CFQUANT_LOG_DIR")
+        configured = os.environ.get("CFQUANT_QMT_LOG_DIR") or (os.path.join(os.environ.get("CFQUANT_LOG_DIR"), "qmt_bridge") if os.environ.get("CFQUANT_LOG_DIR") else "")
         if configured:
             candidates = [configured]
         elif os.path.basename(base_dir).lower() == "python":

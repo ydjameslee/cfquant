@@ -23,7 +23,7 @@ def test_initialize_web_setup_can_skip_optional_admin_registration(web_config, m
     monkeypatch.setattr(web, "write_qmt_bridge_identity", lambda row: {"written": True, "path": "fake"})
     monkeypatch.setattr(web, "write_qmt_market_bridge_identities", lambda row: [])
     monkeypatch.setattr(web, "configure_account_qmt_strategies", lambda row, identity: {})
-    monkeypatch.setattr(web, "qmt_auto_login_apply_for_account", lambda row, request=None, strategy_deploy=None: {
+    monkeypatch.setattr(web, "qmt_auto_login_apply_for_account", lambda row, request=None, **kwargs: {
         "enabled": False,
     })
     monkeypatch.setattr(web, "ensure_account_runtime", lambda mode: {"mode": mode})
@@ -77,7 +77,7 @@ def test_initialize_web_setup_persists_custom_python_environment(web_config, mon
     monkeypatch.setattr(web, "write_qmt_bridge_identity", lambda row: {"written": True})
     monkeypatch.setattr(web, "write_qmt_market_bridge_identities", lambda row: [])
     monkeypatch.setattr(web, "configure_account_qmt_strategies", lambda row, identity: {})
-    monkeypatch.setattr(web, "qmt_auto_login_apply_for_account", lambda row, request=None, strategy_deploy=None: {"enabled": False})
+    monkeypatch.setattr(web, "qmt_auto_login_apply_for_account", lambda row, request=None, **kwargs: {"enabled": False})
     monkeypatch.setattr(web, "ensure_account_runtime", lambda mode: {"mode": mode})
     result = web.initialize_web_setup({
         "account_id": "1000000001",
@@ -282,8 +282,9 @@ def test_save_and_delete_call_deployment_manager(web_config, monkeypatch):
     class Manager:
         def reconcile(self, accounts):
             calls.append(("reconcile", set(accounts)))
-        def configure(self, row, identities, force=False):
+        def configure(self, row, identities, force=False, scripts_dir=None):
             assert force is True
+            assert scripts_dir == os.path.join(web.BASE_DIR, "qmt_scripts")
             calls.append(("configure", row["qmt_strategy"], identities))
             return {"enabled": True, "targets": [{"state": "waiting_exit"}]}
     monkeypatch.setattr(web, "QMT_STRATEGIES", Manager())
@@ -315,7 +316,7 @@ def test_save_can_start_qmt_auto_login_and_persist_restart_times(web_config, mon
     monkeypatch.setattr(web.STATUS_MONITOR, "wake", lambda: None)
     monkeypatch.setattr(web.CALLBACKS, "refresh_channels", lambda channels: None)
 
-    def apply(row, request=None, strategy_deploy=None):
+    def apply(row, request=None, **kwargs):
         calls.append((row["account_id"], request, row["qmt_auto_login"]))
         return {"enabled": True, "started": True, "pid": 1234,
                 "restart_times": row["qmt_auto_login"]["restart_times"]}

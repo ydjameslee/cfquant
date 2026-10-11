@@ -8,6 +8,27 @@ import uuid
 from pathlib import Path
 
 
+LOG_COMPONENTS = ("web", "startup", "lttx", "pipe_hub", "qmt_bridge")
+
+
+def component_log_dirs(root, create=True):
+    """Return the stable component directories below one cfquant log root."""
+    root = Path(root).expanduser().resolve()
+    rows = {name: root / name for name in LOG_COMPONENTS}
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+        for path in rows.values():
+            path.mkdir(parents=True, exist_ok=True)
+    return {name: str(path) for name, path in rows.items()}
+
+
+def component_log_dir(root, component, create=True):
+    component = str(component or "").strip().lower()
+    if component not in LOG_COMPONENTS:
+        raise ValueError("unknown log component: %s" % component)
+    return component_log_dirs(root, create=create)[component]
+
+
 def retention_days(value):
     if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
         raise ValueError("retention_days must be an integer between 1 and 3650")
@@ -28,7 +49,7 @@ def log_files(root, day):
         dirs[:] = [d for d in dirs if not Path(current, d).is_symlink()]
         for name in files:
             path = Path(current, name)
-            if path.is_symlink() or path.suffix.lower() != '.log':
+            if path.is_symlink() or path.suffix.lower() not in {'.log', '.csv', '.txt'}:
                 continue
             try:
                 stat = path.stat()
@@ -48,7 +69,7 @@ def log_files(root, day):
 def read_log(root, name, limit=256 * 1024):
     root = Path(root).resolve()
     path = (root / name).resolve()
-    if not name or root not in path.parents or path.suffix.lower() != '.log':
+    if not name or root not in path.parents or path.suffix.lower() not in {'.log', '.csv', '.txt'}:
         raise ValueError('Invalid log file')
     with path.open('rb') as stream:
         stream.seek(0, 2)

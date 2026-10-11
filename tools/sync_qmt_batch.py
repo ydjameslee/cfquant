@@ -17,15 +17,16 @@ ROUTING_END = "# END GENERATED ACCOUNT ROUTING\n"
 
 def shared_source():
     connect = (ROOT / "cfquant/stock_connect.py").read_text(encoding="utf-8")
+    identity = (ROOT / "cfquant/order_identity.py").read_text(encoding="utf-8")
     batch = (ROOT / "cfquant/batch_orders.py").read_text(encoding="utf-8")
     batch = '\n'.join(line for line in batch.split('\n')
-                      if not line.startswith('from .stock_connect import '))
+                      if not line.startswith(('from .stock_connect import ', 'from .order_identity import ')))
     meta = (ROOT / "cfquant/order_meta.py").read_text(encoding="utf-8")
     node = next(n for n in ast.parse(meta).body if isinstance(n, ast.FunctionDef) and n.name == "normalize_account_type")
     normalizer = "".join(meta.splitlines(keepends=True)[node.lineno - 1:node.end_lineno])
     normalizer = normalizer.replace("def normalize_account_type(", "def _lite_normalize_account_type(")
     normalizer = normalizer.replace("return DEFAULT_ACCOUNT_TYPE", 'return "STOCK"')
-    return connect.rstrip() + '\n\n' + normalizer + '\n\n' + batch
+    return connect.rstrip() + '\n\n' + normalizer + '\n\n' + identity.rstrip() + '\n\n' + batch
 
 
 def account_routing_source():

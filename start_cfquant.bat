@@ -10,15 +10,18 @@ set "PYTHONDONTWRITEBYTECODE=1"
 set "PYTHONIOENCODING=utf-8"
 if not defined CFQUANT_START_WAIT_SECONDS set "CFQUANT_START_WAIT_SECONDS=90"
 set "LOG_DIR=%~dp0log"
-set "START_LOG=%LOG_DIR%\cfquant_startup.log"
+set "STARTUP_LOG_DIR=%LOG_DIR%\startup"
+set "WEB_LOG_DIR=%LOG_DIR%\web"
+set "START_LOG=%STARTUP_LOG_DIR%\cfquant_startup.log"
 
-if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>nul
+if not exist "%STARTUP_LOG_DIR%" mkdir "%STARTUP_LOG_DIR%" >nul 2>nul
+if not exist "%WEB_LOG_DIR%" mkdir "%WEB_LOG_DIR%" >nul 2>nul
 set "WEB_LOG_RUN_ID="
 for /f "usebackq delims=" %%T in (`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Date -Format 'yyyyMMdd_HHmmss_ffff'"`) do set "WEB_LOG_RUN_ID=%%T"
 if not defined WEB_LOG_RUN_ID set "WEB_LOG_RUN_ID=%RANDOM%"
 set "WEB_LOG_RUN_ID=%WEB_LOG_RUN_ID%_%RANDOM%"
-set "WEB_STDOUT=%LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stdout.log"
-set "WEB_STDERR=%LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stderr.log"
+set "WEB_STDOUT=%WEB_LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stdout.log"
+set "WEB_STDERR=%WEB_LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stderr.log"
 set "CFQUANT_START_PID_FILE="
 call :log "start_cfquant.bat invoked"
 

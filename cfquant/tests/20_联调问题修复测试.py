@@ -14,6 +14,7 @@ import cfquant_web_server as web
 import cfquant.tx_trade_bridge as tx_trade_bridge_module
 from cfquant import order_meta
 from cfquant import xtconstant
+from cfquant.order_identity import prepare_order_remark
 from cfquant.normal_bridge import NormalQmtBridge
 from cfquant.pipe_bridge import PipeNormalQmtBridge, PipeTradeBridge
 from cfquant.protocol import loads_message
@@ -198,7 +199,7 @@ def test_trade_callback_is_forwarded_with_trade_fields_and_sdk_shape():
     trade = XtTrade.from_any(data)
     assert trade.account_id == "A123"
     assert trade.stock_code == "000001.SZ"
-    assert trade.traded_id == 90001
+    assert trade.traded_id == "90001"
     assert trade.traded_price == 10.25
     assert trade.traded_volume == 100
     assert trade.traded_amount == 1025.0
@@ -257,10 +258,11 @@ def test_order_callback_reconciles_order_id_from_request_metadata(bridge_class):
     bridge = bridge_class(None, **bridge_kwargs)
     tx = RecordingTx()
     bridge.tx = tx
+    internal_remark = prepare_order_remark({"order_remark": "user-014"})
     bridge._remember_order_request(
         "A123",
         "000001.SZ",
-        "user-014",
+        internal_remark,
         "fast-strategy",
         order_id=700014,
     )
@@ -270,7 +272,7 @@ def test_order_callback_reconciles_order_id_from_request_metadata(bridge_class):
             "m_strAccountID": "A123",
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "user-014",
+            "m_strRemark": internal_remark,
             "m_nRef": 700015,
             "m_nOrderID": 700015,
             "m_strOrderSysID": "SYS-15",
@@ -289,6 +291,7 @@ def test_order_callback_reconciles_order_id_from_request_metadata(bridge_class):
     assert XtOrder.from_any(data).order_id == 700014
 
 
+
 @pytest.mark.parametrize("bridge_class", [NormalQmtBridge, PipeNormalQmtBridge])
 def test_order_error_callback_restores_strategy_and_order_id_from_request_metadata(bridge_class):
     class RecordingTx(object):
@@ -301,10 +304,11 @@ def test_order_error_callback_restores_strategy_and_order_id_from_request_metada
     bridge = bridge_class(None, show=False, schedule_timer=False)
     tx = RecordingTx()
     bridge.tx = tx
+    internal_remark = prepare_order_remark({"order_remark": "user-001"})
     bridge._remember_order_request(
         "A123",
         "000001.SZ",
-        "user-001",
+        internal_remark,
         "fast-strategy",
         order_id=700010,
     )
@@ -315,7 +319,7 @@ def test_order_error_callback_restores_strategy_and_order_id_from_request_metada
             "m_nAccountType": 2,
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "user-001",
+            "m_strRemark": internal_remark,
             "m_strStrategyName": "",
             "order_id": 0,
             "m_nRef": 0,
@@ -335,6 +339,7 @@ def test_order_error_callback_restores_strategy_and_order_id_from_request_metada
     assert error.order_id == -1
     assert error.error_id == 101
     assert error.error_msg == "rejected"
+
 
 
 def test_order_error_callback_restores_order_id_from_rich_order_metadata():
@@ -419,7 +424,7 @@ def test_order_error_callback_can_match_lightweight_request_before_passorder_ret
             "m_nAccountType": 2,
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "user-003",
+            "m_strRemark": args[9],
             "m_nRef": 0,
             "m_nErrorID": 103,
             "m_strErrorMsg": "rejected before return",

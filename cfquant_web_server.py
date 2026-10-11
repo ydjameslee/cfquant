@@ -32,7 +32,13 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from cfquant.log_management import RollingLogWriter, retention_days as validate_log_retention_days, log_files as list_log_files, read_log as read_managed_log
+from cfquant.log_management import (
+    RollingLogWriter,
+    component_log_dirs,
+    retention_days as validate_log_retention_days,
+    log_files as list_log_files,
+    read_log as read_managed_log,
+)
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import wraps
@@ -103,7 +109,8 @@ from cfquant.batch_orders import (
 )
 from cfquant import _editable_install
 from cfquant import xtconstant as cf_xtconstant
-from cfquant.qmt_strategy_deploy import QmtStrategyManager, account_qmt_roots, normalize_strategy_settings, qmt_root
+from cfquant.qmt_strategy_deploy import (QmtStrategyManager, account_qmt_roots,
+    normalize_strategy_settings, qmt_root, entry_script_for_mode, read_entry_source)
 from cfquant.channels import configured_bridges, normalize_bridge_id
 from cfquant.config import get_config as get_cfquant_config
 from cfquant.logging_i18n import normalize_log_enabled, normalize_log_language
@@ -184,14 +191,15 @@ except Exception:
             pass
 LOG_DIR = os.path.abspath(os.environ.get("CFQUANT_LOG_DIR") or os.path.join(STATE_DIR, "log"))
 try:
-    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_COMPONENT_DIRS = component_log_dirs(LOG_DIR)
 except Exception:
     LOG_DIR = os.path.join(tempfile.gettempdir(), "cfquant", "log")
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        LOG_COMPONENT_DIRS = component_log_dirs(LOG_DIR)
     except Exception:
         LOG_DIR = tempfile.gettempdir()
-LOG_FILE = os.path.join(LOG_DIR, "cfquant_web_server.runtime.log")
+        LOG_COMPONENT_DIRS = {name: LOG_DIR for name in ("web", "startup", "lttx", "pipe_hub", "qmt_bridge")}
+LOG_FILE = os.path.join(LOG_COMPONENT_DIRS["web"], "cfquant_web_server.runtime.log")
 LOG_RETENTION_DAYS = int(os.environ.get("CFQUANT_LOG_RETENTION_DAYS", "30"))
 LOG_RETENTION_DAYS = max(1, min(3650, LOG_RETENTION_DAYS))
 LOG_CLEANUP_INTERVAL_SECONDS = float(os.environ.get("CFQUANT_LOG_CLEANUP_INTERVAL_SECONDS", "21600"))
@@ -435,12 +443,12 @@ LTTX_HOST = os.environ.get("CFQUANT_LTTX_HOST", "127.0.0.1")
 LTTX_PORT = int(os.environ.get("CFQUANT_LTTX_PORT", "2049"))
 LTTX_DIR = os.path.join(BASE_DIR, "LTtx", "tx")
 LTTX_ENTRY = os.environ.get("CFQUANT_LTTX_ENTRY") or os.path.join(LTTX_DIR, "LTtx_server.py")
-LTTX_STDOUT_LOG = os.path.join(LOG_DIR, "lttx_server.stdout.log")
-LTTX_STDERR_LOG = os.path.join(LOG_DIR, "lttx_server.stderr.log")
+LTTX_STDOUT_LOG = os.path.join(LOG_COMPONENT_DIRS["lttx"], "lttx_server.stdout.log")
+LTTX_STDERR_LOG = os.path.join(LOG_COMPONENT_DIRS["lttx"], "lttx_server.stderr.log")
 PIPE_HUB_ENTRY = os.environ.get("CFQUANT_PIPE_HUB_ENTRY") or os.path.join(_SOURCE_ROOT, "cfquant_pipe_hub.py")
 PIPE_HUB_MODULE = "cfquant_pipe_hub"
-PIPE_HUB_STDOUT_LOG = os.path.join(LOG_DIR, "cfquant_pipe_hub.stdout.log")
-PIPE_HUB_STDERR_LOG = os.path.join(LOG_DIR, "cfquant_pipe_hub.stderr.log")
+PIPE_HUB_STDOUT_LOG = os.path.join(LOG_COMPONENT_DIRS["pipe_hub"], "cfquant_pipe_hub.stdout.log")
+PIPE_HUB_STDERR_LOG = os.path.join(LOG_COMPONENT_DIRS["pipe_hub"], "cfquant_pipe_hub.stderr.log")
 PIPE_HUB_STATUS_FILE = os.environ.get("CFQUANT_PIPE_HUB_STATUS_FILE") or os.path.join(
     RUNTIME_STATUS_DIR,
     "cfquant_pipe_hub_status.json",
@@ -550,9 +558,26 @@ QMT_ENTRY_SCRIPT_NAMES = (
     os.path.join("同账号独立市场", "CFQUANT_LITE_SH.py"),
     os.path.join("同账号独立市场", "CFQUANT_LITE_SZ.py"),
 )
+
+
+def qmt_entry_script_name_for_target(mode, qmt_role="normal", market=""):
+    """Return the source entry script used by a saved QMT binding target."""
+    return entry_script_for_mode(mode, str(qmt_role or "normal").strip().lower(), market)
+
+
 WEB_BOUND_HOST = None
 WEB_BOUND_PORT = None
 WEB_RESTART_REQUEST = None
+MANAGEMENT_BOOT_ID = uuid.uuid4().hex
+MANAGEMENT_STARTED_AT = time.time()
+MANAGEMENT_READY = False
+MANAGEMENT_API_PATHS = frozenset({
+    "/api/management/status", "/api/management/restart", "/api/management/stop",
+    "/api/setup/initialize", "/api/account-config", "/api/account-config/delete",
+    "/api/bindings/status", "/api/project-updates/status", "/api/project-updates/official",
+    "/api/project-updates/github", "/api/project-updates/rollback", "/api/project-updates/ensure-latest",
+    "/api/version", "/api/config",
+})
 WEB_RESTART_LOCK = threading.RLock()
 WEB_RELOAD_WAIT_HOST_ENV = "CFQUANT_WEB_RELOAD_WAIT_HOST"
 WEB_RELOAD_WAIT_PORT_ENV = "CFQUANT_WEB_RELOAD_WAIT_PORT"
@@ -2679,7 +2704,7 @@ class WebRuntimeConfig(object):
         display_name=None,
         qmt_dir=None,
         qmt_trade_dir=None,
-        mode="ctypes",
+        mode=None,
         data_provider=False,
         enabled=True,
         market_routing_enabled=None,
@@ -2694,23 +2719,25 @@ class WebRuntimeConfig(object):
         display_name = None if display_name is None else str(display_name).strip()
         qmt_dir = normalize_optional_path(qmt_dir)
         qmt_trade_dir = normalize_optional_path(qmt_trade_dir)
-        mode = normalize_transport_mode(mode)
         enabled = parse_config_bool(enabled, True) if enabled is not None else None
-        if mode == "lttx" and enabled is not False:
-            if not qmt_dir:
-                raise ValueError("高级模式需要填写普通 QMT 核心目录")
-            if not qmt_trade_dir:
-                raise ValueError("高级模式需要填写极速交易端 QMT 核心目录")
-            if os.path.normcase(str(qmt_root(qmt_dir))) == os.path.normcase(str(qmt_root(qmt_trade_dir))):
-                raise ValueError("高级模式的两个 QMT 核心目录必须不同")
-        if mode != "lttx":
-            qmt_trade_dir = ""
         now = time.time()
         with self._lock:
             configs = self._data.setdefault("account_configs", {})
             bridge_id = self._account_bridge_id_locked(account_id, account_type, bridge_id, qmt_dir)
             account_key = account_key_for(account_id, account_type, bridge_id)
             existing = configs.get(account_key)
+            # Older clients may omit mode when editing an existing binding.
+            # Preserve its strategy selection instead of silently choosing ctypes.
+            mode = normalize_transport_mode(mode or (existing or {}).get("mode") or "ctypes")
+            if mode == "lttx" and enabled is not False:
+                if not qmt_dir:
+                    raise ValueError("高级模式需要填写普通 QMT 核心目录")
+                if not qmt_trade_dir:
+                    raise ValueError("高级模式需要填写极速交易端 QMT 核心目录")
+                if os.path.normcase(str(qmt_root(qmt_dir))) == os.path.normcase(str(qmt_root(qmt_trade_dir))):
+                    raise ValueError("高级模式的两个 QMT 核心目录必须不同")
+            if mode != "lttx":
+                qmt_trade_dir = ""
             strategy_settings = normalize_strategy_settings(
                 qmt_strategy if qmt_strategy is not None else (existing or {}).get("qmt_strategy")
             )
@@ -3235,6 +3262,8 @@ class WebRuntimeConfig(object):
             "retention_days": configured_days,
             "local_cfquant_logs_enabled": True,
             "qmt_userdata_log_cleanup_enabled": self.qmt_userdata_log_cleanup_enabled(),
+            "log_root": LOG_DIR,
+            "log_directories": dict(LOG_COMPONENT_DIRS),
         }
 
     def set_log_cleanup_settings(self, cleanup_qmt_userdata_logs=None, retention_days=None):
@@ -4817,6 +4846,32 @@ def data_account_route_candidates(account_id, account_type, account_key, bridge_
     return candidates
 
 
+def trading_dates_count(value):
+    # HTTP form fields may be strings; keep numeric values intact so the
+    # calendar validates booleans and fractional counts instead of truncating.
+    return int(value) if isinstance(value, str) else value
+
+
+def local_trading_dates_request(action, params, bridge_id=None):
+    if action != "xtdata.get_trading_dates" or "market" not in (params or {}):
+        return None
+    from cfquant.trading_calendar import get_trading_dates as calendar_dates
+
+    return {
+        "result": calendar_dates(
+            params["market"], params.get("start_time", ""),
+            params.get("end_time", ""), trading_dates_count(params.get("count", -1)),
+        ),
+        "source": "pandas_market_calendars",
+        "mode": "local",
+        "channel": "local",
+        "bridge_id": normalize_bridge_id(bridge_id or DEFAULT_BRIDGE_ID),
+        "fallback": False,
+        "fallback_reason": "",
+        "attempts": [],
+    }
+
+
 def routed_xtdata_account_request(
     account_id,
     bridge_id,
@@ -4833,6 +4888,10 @@ def routed_xtdata_account_request(
     account_id = str(account_id or "").strip()
     account_type = normalize_account_type(account_type or "STOCK")
     account_key = str(account_key or "").strip()
+    local = local_trading_dates_request(action, params, bridge_id)
+    if local is not None:
+        local.update(account_id=account_id, account_type=account_type, account_key=account_key)
+        return local
     attempts = []
     last_error = None
     candidates = data_account_route_candidates(
@@ -4900,6 +4959,9 @@ def data_provider_request(
     timeout=12.0,
     bridge_id=None,
 ):
+    local = local_trading_dates_request(action, params, bridge_id)
+    if local is not None:
+        return local
     attempts = []
     last_error = None
     for account in data_provider_candidates():
@@ -6465,7 +6527,7 @@ class QuoteSubscriptionStore(object):
 
     def _subscribe_whole(self, body):
         body = body or {}
-        markets = self._normalize_markets(body.get("markets", body.get("code_list", ["SH", "SZ"])))
+        markets = self._normalize_markets(body.get("markets", body.get("code_list", ["SH", "SZ", "BJ"])))
         requested_channel = body.get("channel")
         timeout = request_timeout_value(body.get("timeout"), default=12.0)
         started = time.perf_counter()
@@ -7816,6 +7878,120 @@ class CfquantUpdater(object):
             )
             return result
 
+    def install_local_entry_script_to_qmt_dir(
+        self,
+        qmt_dir,
+        entry_script,
+        bridge_id=None,
+        qmt_role="normal",
+        account_keys=None,
+        source_dir=None,
+    ):
+        """Replace one bound QMT entry script with the current project copy.
+
+        The caller must stop the target QMT before invoking this method.  The
+        old file is kept in a per-target entry backup and is restored if the
+        replacement fails.
+        """
+        configured_dir = normalize_optional_path(qmt_dir)
+        bridge_id = normalize_bridge_id(bridge_id or DEFAULT_BRIDGE_ID)
+        entry_script = _normalize_qmt_entry_script_name(entry_script)
+        result = {
+            "bridge_id": bridge_id,
+            "qmt_role": str(qmt_role or "normal"),
+            "account_keys": list(account_keys or []),
+            "configured_dir": configured_dir,
+            "qmt_dir": configured_dir,
+            "python_dir": "",
+            "script_dir": "",
+            "entry_script": entry_script,
+            "entry_file": "",
+            "updated": False,
+            "skipped": False,
+            "backup": "",
+            "error": "",
+            "warning": "",
+            "message": "",
+        }
+        if not configured_dir:
+            result.update(
+                skipped=True,
+                warning="QMT directory is empty; entry script sync was skipped",
+                message="QMT directory is empty; entry script sync was skipped",
+            )
+            return result
+
+        target = None
+        source_path = ""
+        entry_file = ""
+        temp_file = ""
+        backup_file = ""
+        try:
+            with self._lock:
+                target = self._target_paths(configured_dir)
+                result.update({
+                    "python_dir": target.get("python_dir") or "",
+                    "script_dir": target.get("script_dir") or "",
+                })
+                script_dir = normalize_optional_path(target.get("script_dir"))
+                if not script_dir or not os.path.isdir(script_dir):
+                    raise RuntimeError("QMT entry script directory does not exist: %s" % (script_dir or configured_dir))
+                source_root = normalize_optional_path(source_dir or BASE_DIR)
+                source_root = self._find_source_project_root(source_root) or source_root
+                source_path = os.path.abspath(os.path.join(source_root, "qmt_scripts", *entry_script.split("/")))
+                if not os.path.isfile(source_path):
+                    raise RuntimeError("QMT entry script not found in update source: %s" % entry_script)
+                read_entry_source(source_path)
+                entry_file = os.path.abspath(os.path.join(script_dir, os.path.basename(entry_script)))
+                result["entry_file"] = entry_file
+                if file_content_equal(source_path, entry_file):
+                    result.update(
+                        skipped=True,
+                        message="QMT entry script is already the current version",
+                    )
+                    return result
+
+                entry_backup_dir = os.path.join(target["updates_dir"], "entry_backups")
+                os.makedirs(entry_backup_dir, exist_ok=True)
+                if os.path.isfile(entry_file):
+                    backup_file = os.path.join(
+                        entry_backup_dir,
+                        "%s_%s_%s" % (
+                            self._timestamp(),
+                            uuid.uuid4().hex[:8],
+                            os.path.basename(entry_script),
+                        ),
+                    )
+                    shutil.copy2(entry_file, backup_file)
+                temp_file = os.path.join(
+                    script_dir,
+                    ".cfquant_entry_%s_%s.tmp" % (uuid.uuid4().hex, os.path.basename(entry_script)),
+                )
+                shutil.copy2(source_path, temp_file)
+                os.replace(temp_file, entry_file)
+                result.update({
+                    "updated": True,
+                    "backup": backup_file,
+                    "source_file": source_path,
+                    "message": "QMT entry script synchronized: %s" % entry_file,
+                })
+                return result
+        except Exception as e:
+            try:
+                if temp_file and os.path.exists(temp_file):
+                    os.remove(temp_file)
+                if backup_file and os.path.isfile(backup_file) and entry_file:
+                    shutil.copy2(backup_file, entry_file)
+            except Exception as restore_error:
+                safe_print("QMT entry script restore failed: %s" % restore_error)
+            result["error"] = str(e)
+            result["message"] = "QMT entry script sync failed: %s" % e
+            safe_print(
+                "cfquant QMT entry sync failed bridge_id=%s role=%s qmt_dir=%s entry=%s error=%s"
+                % (bridge_id, qmt_role, configured_dir, entry_script, e)
+            )
+            return result
+
     def _rollback_legacy(self, bridge_id, backup_name=None):
         with self._lock:
             target = self._require_ready_target(bridge_id)
@@ -9030,7 +9206,7 @@ class CfquantProjectUpdater(object):
                 self._operation_state["phase"] = phase
                 self._operation_state["message"] = message
 
-    def status(self, repo_url=None, ref=None, include_remote=True):
+    def status(self, repo_url=None, ref=None, include_remote=True, force=False):
         repo_url = str(repo_url or DEFAULT_UPDATE_REPO_URL).strip()
         ref = str(ref or DEFAULT_UPDATE_REF).strip() or "main"
         errors = []
@@ -9055,6 +9231,7 @@ class CfquantProjectUpdater(object):
                 include_remote=include_remote,
                 repo_url=repo_url,
                 ref=ref,
+                force_remote=force,
             ),
             "default_repo_url": repo_url,
             "default_official_site_url": DEFAULT_OFFICIAL_SITE_URL,
@@ -9081,36 +9258,76 @@ class CfquantProjectUpdater(object):
                 })
 
     def update_from_official(self, site_url="", fallback_repo_url="", fallback_ref=""):
+        with self._operation("update"):
+            return self._update_from_official(site_url, fallback_repo_url, fallback_ref)
+
+    def ensure_latest(self, auto_close_qmt=False):
+        from cfquant.management import summarize_update_status
+        if not isinstance(auto_close_qmt, bool):
+            raise ValueError("auto_close_qmt must be a bool")
+        with self._operation("update"):
+            self._set_operation_phase("check", "正在检查最新项目版本")
+            check = summarize_update_status(self.status(include_remote=True, force=True))
+            result = {
+                "status": "check_failed", "message": "无法确认远端版本，请稍后重试",
+                "updated": False, "current_version": check["current_version"],
+                "running_version": check["running_version"], "latest_version": check["latest_version"],
+                "restart_required": check["restart_required"], "check": check, "update": None,
+            }
+            if check["available"] is None:
+                return result
+            if not check["available"]:
+                if check["reason"] == "local_newer":
+                    result.update(status="local_newer", message="本地版本高于远端版本，无需更新")
+                elif check["restart_required"]:
+                    result.update(status="restart_required", message="已安装最新版本，需重启后台服务生效")
+                else:
+                    result.update(status="up_to_date", message="已是最新版本")
+                return result
+            if not _RUNNING_FROM_SOURCE:
+                raise RuntimeError("Use RuntimeManager.ensure_installed() to update an isolated service")
+            # Entry scripts are replaced during a project update, so every
+            # bound QMT must be stopped before any project or QMT file changes.
+            qmt_update_preflight(body={"auto_close_qmt": True}, rows=WEB_CONFIG.account_configs().values())
+            update = self._update_from_official()
+            complete = update.get("update_completed", True)
+            result.update(status="updated" if complete else "update_incomplete",
+                          message="已更新，需重启后台服务生效" if complete else "服务文件已更新，部分 QMT 部署未完成，请检查详情",
+                          updated=True, restart_required=True, update=update,
+                          current_version=update.get("current_version") or check["current_version"])
+            return result
+
+    def _update_from_official(self, site_url="", fallback_repo_url="", fallback_ref=""):
+        """Download/install with the caller holding the project operation lock."""
         site_url = normalize_official_site_url(site_url)
         fallback_repo_url = str(fallback_repo_url or DEFAULT_UPDATE_REPO_URL).strip()
         fallback_ref = str(fallback_ref or DEFAULT_UPDATE_REF).strip()
         official_error = ""
-        with self._operation("update"):
-            with tempfile.TemporaryDirectory(prefix="cfquant_project_update_") as work_dir:
-                source_dir = os.path.join(work_dir, "source")
-                self._set_operation_phase("download", "正在从官网下载完整项目版本")
-                try:
-                    fetched = UPDATER._fetch_official_package(site_url, source_dir)
-                    return self._install_source(source_dir, {
-                        "source": "official_site",
-                        "site_url": site_url or DEFAULT_OFFICIAL_SITE_URL,
-                        "fetch": fetched,
-                    })
-                except Exception as e:
-                    official_error = str(e) or repr(e)
-                    safe_print("official site project update failed, fallback to GitHub: %s" % official_error)
-                if not fallback_repo_url:
-                    raise RuntimeError("官网下载失败且未配置 GitHub 回退源: %s" % official_error)
-                source_dir = os.path.join(work_dir, "github_source")
-                self._set_operation_phase("download", "官网不可用，正在从 GitHub 下载回退版本")
-                fetched = UPDATER._fetch_github(fallback_repo_url, fallback_ref, source_dir)
+        with tempfile.TemporaryDirectory(prefix="cfquant_project_update_") as work_dir:
+            source_dir = os.path.join(work_dir, "source")
+            self._set_operation_phase("download", "正在从官网下载完整项目版本")
+            try:
+                fetched = UPDATER._fetch_official_package(site_url, source_dir)
                 return self._install_source(source_dir, {
-                    "source": "github_fallback",
-                    "repo_url": fallback_repo_url,
-                    "ref": fallback_ref,
-                    "official_site_error": official_error,
+                    "source": "official_site",
+                    "site_url": site_url or DEFAULT_OFFICIAL_SITE_URL,
                     "fetch": fetched,
                 })
+            except Exception as e:
+                official_error = str(e) or repr(e)
+                safe_print("official site project update failed, fallback to GitHub: %s" % official_error)
+            if not fallback_repo_url:
+                raise RuntimeError("官网下载失败且未配置 GitHub 回退源: %s" % official_error)
+            source_dir = os.path.join(work_dir, "github_source")
+            self._set_operation_phase("download", "官网不可用，正在从 GitHub 下载回退版本")
+            fetched = UPDATER._fetch_github(fallback_repo_url, fallback_ref, source_dir)
+            return self._install_source(source_dir, {
+                "source": "github_fallback",
+                "repo_url": fallback_repo_url,
+                "ref": fallback_ref,
+                "official_site_error": official_error,
+                "fetch": fetched,
+            })
 
     def update_from_zip(self, filename, content):
         content = content or b""
@@ -9142,6 +9359,7 @@ class CfquantProjectUpdater(object):
                     raise RuntimeError("project backup not found: %s" % backup_name)
             else:
                 selected = backups[0]
+            self._require_management_support(os.path.join(self._safe_backup_dir(selected), "files"))
             self._set_operation_phase(
                 "backup",
                 "正在备份当前版本，确保回滚失败时可以恢复",
@@ -9162,11 +9380,15 @@ class CfquantProjectUpdater(object):
                 self._set_operation_phase("restore", "正在恢复选中的项目版本")
                 self._restore_backup(selected)
                 editable_install = {"deferred": True, "attempted": False}
-                self._set_operation_phase("deploy", "正在同步回滚后的 cfquant 核心到 QMT 目录")
-                qmt_core_deploy = auto_deploy_qmt_core_for_all_accounts(source_dir=BASE_DIR)
+                self._set_operation_phase("deploy", "正在同步回滚后的 cfquant 核心和入口策略到 QMT 目录")
+                qmt_core_deploy = auto_deploy_qmt_core_for_all_accounts(
+                    source_dir=BASE_DIR,
+                    sync_entry_scripts=True,
+                )
             except Exception:
                 self._restore_backup(rollback_backup)
                 raise
+            entry_info = _qmt_entry_info_after_auto_sync(entry_info, qmt_core_deploy)
             self._write_rollback_meta(
                 selected,
                 rollback_backup,
@@ -9195,10 +9417,22 @@ class CfquantProjectUpdater(object):
                 "entry_manual_update": entry_info,
             }
 
+    def _require_management_support(self, source_root):
+        if os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE"):
+            management_module = os.path.join(source_root, "cfquant", "management.py")
+            server_module = os.path.join(source_root, "cfquant_web_server.py")
+            supports_management = False
+            if os.path.isfile(server_module):
+                with open(server_module, encoding="utf-8") as stream:
+                    supports_management = "def management_status(" in stream.read()
+            if not os.path.isfile(management_module) or not supports_management:
+                raise RuntimeError("Target release does not support the management API; service was not changed")
+
     def _install_source(self, source_dir, meta):
         source_root = self._find_source_project(source_dir)
         if not source_root:
             raise RuntimeError("源码中未找到完整 cfquant 项目目录")
+        self._require_management_support(source_root)
         rel_files = self._source_rel_files(source_root)
         if not rel_files:
             raise RuntimeError("源码中没有可更新的项目文件")
@@ -9230,9 +9464,13 @@ class CfquantProjectUpdater(object):
                 copied.append(rel_path)
             entry_info = self._entry_update_info(changed)
             editable_install = {"deferred": True, "attempted": False}
-            self._set_operation_phase("deploy", "正在同步最新 cfquant 核心到 QMT 目录")
-            qmt_core_deploy = auto_deploy_qmt_core_for_all_accounts(source_dir=BASE_DIR)
+            self._set_operation_phase("deploy", "正在同步最新 cfquant 核心和入口策略到 QMT 目录")
+            qmt_core_deploy = auto_deploy_qmt_core_for_all_accounts(
+                source_dir=BASE_DIR,
+                sync_entry_scripts=True,
+            )
             qmt_deploy_summary = qmt_core_deploy.get("summary") or {}
+            entry_info = _qmt_entry_info_after_auto_sync(entry_info, qmt_core_deploy)
             self._write_install_meta(
                 meta,
                 source_root,
@@ -9241,6 +9479,7 @@ class CfquantProjectUpdater(object):
                 changed,
                 entry_info,
                 editable_install=editable_install,
+                qmt_core_deploy=qmt_core_deploy,
             )
             removed = self._prune_backups()
             return {
@@ -9515,6 +9754,7 @@ class CfquantProjectUpdater(object):
         changed,
         entry_info,
         editable_install=None,
+        qmt_core_deploy=None,
     ):
         payload = {
             "updated_at": time.time(),
@@ -9527,6 +9767,7 @@ class CfquantProjectUpdater(object):
             "changed_files": changed,
             "entry_manual_update": entry_info,
             "editable_install": editable_install or {},
+            "qmt_core_deploy": qmt_core_deploy or {},
             "current_version": self._read_project_version(BASE_DIR) or current_core_version(),
         }
         os.makedirs(PROJECT_UPDATE_DIR, exist_ok=True)
@@ -9760,7 +10001,7 @@ QMT_STRATEGIES = QmtStrategyManager(
 )
 
 
-def configure_account_qmt_strategies(row, identity):
+def configure_account_qmt_strategies(row, identity, source_dir=None, force=True):
     identities = [identity]
     if identity.get("trade_identity"):
         identities.append(identity["trade_identity"])
@@ -9769,7 +10010,10 @@ def configure_account_qmt_strategies(row, identity):
         QMT_STRATEGIES.reconcile(WEB_CONFIG.account_configs())
         # Explicit binding saves and updates must replace even an unchanged
         # managed slot with a newly built package for the selected mode.
-        return QMT_STRATEGIES.configure(row, identities, force=True)
+        return QMT_STRATEGIES.configure(
+            row, identities, force=force,
+            scripts_dir=os.path.join(source_dir or BASE_DIR, "qmt_scripts"),
+        )
     except Exception as error:
         detail = str(error or "").strip()
         if not detail or detail in ("策略部署失败", "error"):
@@ -10049,24 +10293,51 @@ def write_qmt_market_bridge_identities(row):
     return results
 
 
+def _qmt_entry_info_after_auto_sync(entry_info, deploy):
+    """Turn the legacy manual-update notice into an automatic-sync receipt."""
+    entry_info = dict(entry_info or {})
+    results = [
+        item.get("entry_deploy")
+        for item in (deploy or {}).get("results", [])
+        if isinstance(item, dict) and isinstance(item.get("entry_deploy"), dict)
+    ]
+    if (not results or any(item.get("error") for item in results)
+            or (deploy or {}).get("summary", {}).get("ok") is False):
+        return entry_info
+    entry_info.update({
+        "required": False,
+        "auto_updated": True,
+        "reason": "QMT 入口策略已按绑定模式自动覆盖",
+        "message": "QMT 入口策略已按绑定目录和运行模式自动覆盖，重启 QMT 后生效",
+    })
+    return entry_info
+
+
 def _auto_deploy_qmt_core_result_summary(results):
     results = [item for item in (results or []) if isinstance(item, dict)]
     updated = [item for item in results if item.get("updated")]
     skipped = [item for item in results if item.get("skipped")]
     errors = [item for item in results if item.get("error")]
     warnings = [item for item in results if item.get("warning")]
+    entry_updated = [item for item in results if item.get("entry_updated")]
     restart_required = any(
         isinstance(item.get("qmt_restart_required"), dict)
         and item["qmt_restart_required"].get("required")
         for item in results
-    )
+    ) or bool(entry_updated)
     if errors:
         message = "cfquant 核心包自动同步部分失败：%s" % "；".join(
             "%s(%s)" % (item.get("qmt_role") or item.get("market") or "QMT", item.get("error"))
             for item in errors[:3]
         )
-    elif updated:
-        message = "cfquant 核心包已自动同步到 %d 个 QMT 目录" % len(updated)
+    elif updated or entry_updated:
+        message = (
+            "cfquant 核心包已自动同步到 %d 个 QMT 目录" % len(updated)
+            if updated else
+            "cfquant 核心包无需变更"
+        )
+        if entry_updated:
+            message += "，入口策略已覆盖 %d 个绑定目标" % len(entry_updated)
     elif skipped:
         message = "cfquant 核心包无需同步或已跳过"
     elif warnings:
@@ -10079,12 +10350,27 @@ def _auto_deploy_qmt_core_result_summary(results):
     return {
         "ok": not errors,
         "updated_count": len(updated),
+        "entry_updated_count": len(entry_updated),
         "skipped_count": len(skipped),
         "error_count": len(errors),
         "warning_count": len(warnings),
         "restart_required": restart_required,
         "message": message,
     }
+
+
+def _deploy_qmt_entry_for_target(result, target, source_dir=None):
+    entry_result = UPDATER.install_local_entry_script_to_qmt_dir(
+        target["qmt_dir"], entry_script=target["entry_script"],
+        bridge_id=target["bridge_id"], qmt_role=target["qmt_role"],
+        account_keys=target["account_keys"], source_dir=source_dir or BASE_DIR,
+    )
+    result.update(entry_deploy=entry_result, entry_script=target["entry_script"], mode=target["mode"])
+    if entry_result.get("error"):
+        result["error"] = entry_result["error"]
+        result["message"] = entry_result.get("message") or result.get("message")
+    elif entry_result.get("updated"):
+        result["entry_updated"] = True
 
 
 def auto_deploy_qmt_core_for_account(row, enabled=True):
@@ -10104,6 +10390,9 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
         except Exception:
             resolved_dir = qmt_dir
         key = os.path.normcase(os.path.abspath(os.path.normpath(resolved_dir)))
+        mode = normalize_transport_mode(row.get("mode") or "ctypes")
+        entry_script = qmt_entry_script_name_for_target(mode, qmt_role, market)
+        key = (key, entry_script)
         for target in targets:
             if target["key"] == key:
                 if account_keys:
@@ -10118,6 +10407,8 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
             "bridge_id": normalize_bridge_id(bridge_id or row.get("bridge_id") or DEFAULT_BRIDGE_ID),
             "account_keys": list(account_keys or []),
             "market": market,
+            "mode": mode,
+            "entry_script": entry_script,
         })
 
     account_key = str(row.get("account_key") or "").strip()
@@ -10193,6 +10484,7 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
                 qmt_role=target.get("qmt_role") or "normal",
                 account_keys=target.get("account_keys") or [],
             )
+            _deploy_qmt_entry_for_target(result, target)
             if target.get("market"):
                 result["market"] = target.get("market")
             results.append(result)
@@ -10498,8 +10790,12 @@ def qmt_process_preflight(body=None, row=None):
             "%s (PID %s)" % (item.get("qmt_dir") or item.get("bin_dir"), ",".join(str(pid) for pid in item.get("pids") or []))
             for item in running
         )
-        raise RuntimeError("QMT is running for configured directory; close it before strategy deployment: %s" % details)
+        raise QmtRunningError("QMT is running for configured directory; close it before strategy deployment: %s" % details)
     return snapshots
+
+
+class QmtRunningError(RuntimeError):
+    """A caller must close QMT or explicitly opt in to auto_close_qmt."""
 
 
 def qmt_update_preflight(body=None, rows=None):
@@ -10891,6 +11187,9 @@ def _qmt_auto_login_first_pid(processes, launch=None):
 def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="save", strategy_deploy=None):
     row = row or {}
     settings = normalize_qmt_auto_login_settings(request, existing=row.get("qmt_auto_login"))
+    policy = management_qmt_start_policy()
+    if policy is not None:
+        settings["enabled"] = policy
     qmt_dir = normalize_optional_path(row.get("qmt_dir") or row.get("python_dir"))
     result = {
         "enabled": bool(settings["enabled"]),
@@ -11046,6 +11345,8 @@ class QmtAutoLoginRestartScheduler:
                 safe_print("QMT 自动重启调度失败: %s" % error)
 
     def run_pending(self, now=None):
+        if management_qmt_start_policy() is False:
+            return []
         if WEB_CONFIG is None:
             return []
         now = now or time.localtime()
@@ -11083,7 +11384,8 @@ def start_configured_qmt_on_web_startup():
         if not isinstance(row, dict) or not account_config_is_enabled(row):
             continue
         settings = normalize_qmt_auto_login_settings(row.get("qmt_auto_login"))
-        if not settings["enabled"]:
+        policy = management_qmt_start_policy()
+        if policy is False or (policy is None and not settings["enabled"]):
             continue
         qmt_dir = normalize_optional_path(row.get("qmt_dir") or row.get("python_dir"))
         key = os.path.normcase(os.path.abspath(qmt_dir)) if qmt_dir else ""
@@ -11119,8 +11421,12 @@ def start_configured_qmt_on_web_startup():
     return results
 
 
-def auto_deploy_qmt_core_for_all_accounts(source_dir=None):
-    """Copy the current core into every distinct QMT directory in saved bindings."""
+def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=False):
+    """Copy the current core into every distinct QMT directory in saved bindings.
+
+    Full updates also replace raw entry files and rebuild managed import
+    packages. Plain startup core sync leaves entries to the strategy manager.
+    """
     configs = WEB_CONFIG.account_configs() if WEB_CONFIG is not None else {}
     targets = []
     seen = {}
@@ -11137,6 +11443,10 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None):
         except Exception:
             resolved_dir = qmt_dir
         key = os.path.normcase(os.path.abspath(os.path.normpath(resolved_dir)))
+        mode = normalize_transport_mode(row.get("mode") or "ctypes")
+        entry_script = qmt_entry_script_name_for_target(mode, qmt_role, market)
+        if sync_entry_scripts:
+            key = (key, entry_script)
         account_key = str(row.get("account_key") or "").strip()
         if key in seen:
             if account_key and account_key not in seen[key]["account_keys"]:
@@ -11149,7 +11459,10 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None):
             "bridge_id": normalize_bridge_id(bridge_id or row.get("bridge_id") or DEFAULT_BRIDGE_ID),
             "account_keys": [account_key] if account_key else [],
             "market": market,
+            "mode": mode,
         }
+        if sync_entry_scripts:
+            target["entry_script"] = entry_script
         seen[key] = target
         targets.append(target)
 
@@ -11211,11 +11524,15 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None):
             account_keys=target["account_keys"],
             source_dir=source_dir or BASE_DIR,
         )
+        if sync_entry_scripts and target.get("entry_script"):
+            _deploy_qmt_entry_for_target(result, target, source_dir)
         if target.get("market"):
             result["market"] = target["market"]
         results.append(result)
 
     identity_results = sync_qmt_bridge_identities() if targets else []
+    strategy_results = refresh_bound_qmt_strategies(source_dir, force=True) if sync_entry_scripts else []
+    strategy_errors = [item for item in strategy_results if item.get("error")]
     summary = _auto_deploy_qmt_core_result_summary(results)
     identity_errors = [
         item for item in identity_results
@@ -11224,7 +11541,8 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None):
     summary.update({
         "target_count": len(targets),
         "identity_error_count": len(identity_errors),
-        "ok": bool(summary.get("ok", True) and not identity_errors),
+        "strategy_error_count": len(strategy_errors),
+        "ok": bool(summary.get("ok", True) and not identity_errors and not strategy_errors),
     })
     if not targets:
         summary["message"] = "未配置 QMT 绑定目录，Web 已更新；绑定 QMT 后会自动同步核心包"
@@ -11233,14 +11551,39 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None):
             summary.get("message") or "核心包同步完成",
             len(identity_errors),
         )
+    if strategy_errors:
+        summary["message"] += "；托管策略同步失败：" + "；".join(item["error"] for item in strategy_errors)
     return {
         "enabled": True,
         "source_dir": normalize_optional_path(source_dir or BASE_DIR),
         "target_count": len(targets),
         "results": results,
         "identity_results": identity_results,
+        "strategy_results": strategy_results,
         "summary": summary,
     }
+
+
+def refresh_bound_qmt_strategies(source_dir=None, force=False):
+    """Rebuild actual import packages, including upgrades run by older Web code."""
+    results = []
+    configs = WEB_CONFIG.account_configs() if WEB_CONFIG is not None else {}
+    for row in configs.values():
+        if (not isinstance(row, dict) or not account_config_is_enabled(row)
+                or not (row.get("qmt_strategy") or {}).get("enabled")):
+            continue
+        try:
+            identity = write_qmt_bridge_identity(row)
+            identity["market_identities"] = write_qmt_market_bridge_identities(row)
+            result = configure_account_qmt_strategies(row, identity, source_dir=source_dir, force=force)
+            errors = [target.get("error") for target in result.get("targets", []) if target.get("error")]
+            if errors and not result.get("error"):
+                result["error"] = "；".join(errors)
+        except Exception as error:
+            result = {"error": str(error)}
+        result["account_key"] = row["account_key"]
+        results.append(result)
+    return results
 
 
 def sync_qmt_bridge_identities():
@@ -13733,7 +14076,7 @@ def save_account_runtime_config(body):
         or body.get("advanced_qmt_dir")
         or body.get("qmt_trade_core_dir")
     )
-    mode = body.get("mode") or body.get("transport_mode") or "ctypes"
+    mode = body.get("mode") or body.get("transport_mode")
     market_bridges = body.get("market_bridges") if "market_bridges" in body else body.get("market_routes") if "market_routes" in body else None
     market_routing_enabled = body.get("market_routing_enabled") if "market_routing_enabled" in body else None
     account_enabled = parse_config_bool(body.get("enabled"), True) if "enabled" in body else None
@@ -13947,7 +14290,7 @@ def initialize_web_setup(body):
             or body.get("advanced_qmt_dir")
             or body.get("qmt_trade_core_dir")
         ),
-        mode=body.get("mode") or "ctypes",
+        mode=body.get("mode") or body.get("transport_mode"),
         data_provider=True,
         enabled=True,
         market_routing_enabled=body.get("market_routing_enabled") if "market_routing_enabled" in body else None,
@@ -14427,6 +14770,47 @@ def web_auth_logout(token):
     return web_auth_status()
 
 
+def management_qmt_start_policy():
+    value = os.environ.get("CFQUANT_QMT_AUTO_START", "saved").lower()
+    if value in ("0", "false"):
+        return False
+    if value in ("1", "true"):
+        return True
+    return None
+
+
+def management_status():
+    return {
+        "api_version": 1,
+        "ready": MANAGEMENT_READY,
+        "boot_id": MANAGEMENT_BOOT_ID,
+        "pid": os.getpid(),
+        "state_dir": STATE_DIR,
+        "project_dir": BASE_DIR,
+        "running_from_source": bool(_RUNNING_FROM_SOURCE),
+        "core_version": current_core_version(),
+        "web_version": WEB_VERSION,
+        "auto_start_qmt": management_qmt_start_policy(),
+        "setup": WEB_CONFIG.setup_info(),
+        "account_configs": WEB_CONFIG.account_configs(),
+        "lttx_host": LTTX_HOST,
+        "lttx_port": LTTX_PORT,
+        **management_version_state(),
+    }
+
+
+def management_version_state():
+    installed = current_core_version()
+    version_text = _read_text_file(CORE_VERSION_PATH)
+    web_match = re.search(r"(?m)^WEB_VERSION\s*=\s*['\"]([^'\"]+)['\"]", version_text)
+    installed_web = web_match.group(1) if web_match else WEB_VERSION
+    receipt = PROJECT_UPDATER._read_install_meta()
+    pending = float(receipt.get("updated_at") or 0) > MANAGEMENT_STARTED_AT
+    return {"running_core_version": CORE_VERSION, "installed_core_version": installed,
+            "installed_web_version": installed_web,
+            "restart_required": bool(pending or installed != CORE_VERSION or installed_web != WEB_VERSION)}
+
+
 def web_reload_info(reason="settings"):
     access = server_access_info()
     previous_host = WEB_BOUND_HOST or access.get("bound_host") or ""
@@ -14866,6 +15250,7 @@ def project_system_info(version_info=None):
         "state_dir": STATE_DIR,
         "runtime_dir": RUNTIME_DIR,
         "log_dir": LOG_DIR,
+        "log_directories": dict(LOG_COMPONENT_DIRS),
         "start_script": start_script,
         "start_script_exists": os.path.isfile(start_script),
         "restart_script": restart_script,
@@ -14991,7 +15376,7 @@ def _remote_project_version_info(repo_url=None, ref=None, force=False):
     return result
 
 
-def project_version_info(include_remote=False, force=False, repo_url=None, ref=None, bridge_id=None):
+def project_version_info(include_remote=False, force=False, repo_url=None, ref=None, bridge_id=None, force_remote=False):
     repo_url = str(repo_url or DEFAULT_UPDATE_REPO_URL).strip()
     ref = str(ref or DEFAULT_UPDATE_REF).strip() or "main"
     bridge_id = normalize_bridge_id(bridge_id or DEFAULT_BRIDGE_ID)
@@ -15027,9 +15412,10 @@ def project_version_info(include_remote=False, force=False, repo_url=None, ref=N
         "remote": None,
         "comparison": "unchecked",
         "update_available": None,
+        **management_version_state(),
     }
     if include_remote:
-        remote = _remote_project_version_info(repo_url=repo_url, ref=ref, force=force)
+        remote = _remote_project_version_info(repo_url=repo_url, ref=ref, force=force or force_remote)
         core_comparison = _compare_project_versions(core_version, remote.get("core_version") or remote.get("version"))
         comparison = core_comparison
         web_comparison = _compare_project_versions(WEB_VERSION, remote.get("web_version")) if remote.get("web_version") else "unknown"
@@ -15039,6 +15425,7 @@ def project_version_info(include_remote=False, force=False, repo_url=None, ref=N
         data["core_comparison"] = core_comparison
         data["comparison"] = comparison
         data["web_comparison"] = web_comparison
+        data["installed_web_comparison"] = _compare_project_versions(data["installed_web_version"], remote.get("web_version")) if remote.get("web_version") else "unknown"
         data["update_available"] = comparison in ("newer", "different") or web_comparison in ("newer", "different")
         qmt_runtime_comparison = _compare_project_versions(qmt_runtime_version, remote.get("core_version") or remote.get("version")) if qmt_runtime_version else "unknown"
         qmt_saved_comparison = _compare_project_versions(latest_qmt_core_version, remote.get("core_version") or remote.get("version")) if latest_qmt_core_version else "unknown"
@@ -15088,13 +15475,13 @@ def bridge_update_rollback(body):
     return UPDATER.rollback(bridge_id, body.get("backup") or body.get("backup_name"))
 
 
-def project_update_status(repo_url=None, ref=None, include_remote=True):
-    return PROJECT_UPDATER.status(repo_url=repo_url, ref=ref, include_remote=include_remote)
+def project_update_status(repo_url=None, ref=None, include_remote=True, force=False):
+    return PROJECT_UPDATER.status(repo_url=repo_url, ref=ref, include_remote=include_remote, force=force)
 
 
 def project_update_github(body):
     body = body or {}
-    qmt_update_preflight(body=body, rows=WEB_CONFIG.account_configs().values())
+    qmt_update_preflight(body=dict(body, auto_close_qmt=True), rows=WEB_CONFIG.account_configs().values())
     repo_url = body.get("repo_url") or body.get("url") or DEFAULT_UPDATE_REPO_URL
     ref = body.get("ref") or body.get("branch") or body.get("tag") or DEFAULT_UPDATE_REF
     return PROJECT_UPDATER.update_from_github(repo_url, ref)
@@ -15102,7 +15489,7 @@ def project_update_github(body):
 
 def project_update_official(body):
     body = body or {}
-    qmt_update_preflight(body=body, rows=WEB_CONFIG.account_configs().values())
+    qmt_update_preflight(body=dict(body, auto_close_qmt=True), rows=WEB_CONFIG.account_configs().values())
     return PROJECT_UPDATER.update_from_official(
         site_url=body.get("site_url") or body.get("official_site_url") or DEFAULT_OFFICIAL_SITE_URL,
         fallback_repo_url=body.get("repo_url") or body.get("url") or DEFAULT_UPDATE_REPO_URL,
@@ -15112,7 +15499,7 @@ def project_update_official(body):
 
 def project_update_rollback(body):
     body = body or {}
-    qmt_update_preflight(body=body, rows=WEB_CONFIG.account_configs().values())
+    qmt_update_preflight(body=dict(body, auto_close_qmt=True), rows=WEB_CONFIG.account_configs().values())
     return PROJECT_UPDATER.rollback(body.get("backup") or body.get("backup_name"))
 
 
@@ -15186,21 +15573,24 @@ def data_channel_request(body, action, params, default_channel="normal", force_c
             timeout=timeout,
             bridge_id=body.get("bridge_id"),
         )
-        provider_account_id = route.get("data_provider") or configured_default_account_id()
-        provider_account_type = route.get("data_provider_account_type") or configured_default_account_type()
+        provider_account_id = "" if route.get("mode") == "local" else route.get("data_provider") or configured_default_account_id()
+        provider_account_type = "" if route.get("mode") == "local" else route.get("data_provider_account_type") or configured_default_account_type()
         provider_account_key = route.get("data_provider_account_key") or ""
         provider_fallback = bool(route.get("provider_fallback"))
         provider_attempts = route.get("provider_attempts") or []
-    effective_preferred_channel = (
-        preferred_channel
-        or force_channel
-        or default_channel_for_action(
-            action,
-            mode=route.get("mode") or default_runtime_client_mode(),
-            default=default_channel,
-            params=params,
+    if route.get("mode") == "local":
+        effective_preferred_channel = "local"
+    else:
+        effective_preferred_channel = (
+            preferred_channel
+            or force_channel
+            or default_channel_for_action(
+                action,
+                mode=route.get("mode") or default_runtime_client_mode(),
+                default=default_channel,
+                params=params,
+            )
         )
-    )
     return {
         "bridge_id": route["bridge_id"],
         "account_id": provider_account_id,
@@ -15215,6 +15605,7 @@ def data_channel_request(body, action, params, default_channel="normal", force_c
         "provider_fallback": provider_fallback,
         "provider_attempts": provider_attempts,
         "action": action,
+        "source": route.get("source", "qmt"),
         "result": route["result"],
         "attempts": route["attempts"],
         "latency_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -15458,7 +15849,7 @@ def get_trading_dates(body):
         "market": market,
         "start_time": str(body.get("start_time") or ""),
         "end_time": str(body.get("end_time") or ""),
-        "count": int(body.get("count", -1)),
+        "count": body.get("count", -1),
     })
 
 
@@ -15485,7 +15876,7 @@ def python_xtdata_request(body):
     if method == "get_divid_factors":
         args = {"stock_code": str(body.get("stock_code") or ""), "start_time": str(body.get("start_time") or ""), "end_time": str(body.get("end_time") or "")}
     elif method == "get_trading_dates":
-        args = {"market": str(body.get("market") or ""), "start_time": str(body.get("start_time") or ""), "end_time": str(body.get("end_time") or ""), "count": int(body.get("count", -1))}
+        args = {"market": str(body.get("market") or ""), "start_time": str(body.get("start_time") or ""), "end_time": str(body.get("end_time") or ""), "count": trading_dates_count(body.get("count", -1))}
     return {"python_method": method, "result": func(**args)}
 
 
@@ -15887,6 +16278,17 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(result))
                 if reload_requested:
                     schedule_web_reload(self.server, result["reload"])
+            elif parsed.path == "/api/project-updates/ensure-latest":
+                reload_requested = body.get("reload", True)
+                if not isinstance(reload_requested, bool):
+                    raise ValueError("reload must be a bool")
+                result = PROJECT_UPDATER.ensure_latest(auto_close_qmt=body.get("auto_close_qmt", False))
+                reload_requested = reload_requested and result["restart_required"] and result["status"] != "check_failed"
+                if reload_requested:
+                    result["reload"] = {"host": WEB_BOUND_HOST, "port": WEB_BOUND_PORT, "reason": "ensure-latest"}
+                self._write_json(ok(result))
+                if reload_requested:
+                    schedule_web_reload(self.server, result["reload"])
             elif parsed.path == "/api/project-updates/rollback":
                 result = project_update_rollback(body)
                 reload_requested = parse_bool(body.get("reload")) if "reload" in body else True
@@ -15939,6 +16341,21 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(delete_account_pair(body)))
             elif parsed.path == "/api/account-pairs/verify":
                 self._write_json(ok(verify_account_pair(body)))
+            elif parsed.path in ("/api/management/restart", "/api/management/stop"):
+                if PROJECT_UPDATER.is_busy():
+                    raise ProjectUpdateBusyError("Project update in progress; wait before restarting or stopping")
+                if parsed.path.endswith("/restart"):
+                    if "auto_start_qmt" in body:
+                        policy = body["auto_start_qmt"]
+                        if policy is not None and not isinstance(policy, bool):
+                            raise ValueError("auto_start_qmt must be true, false or null")
+                        os.environ["CFQUANT_QMT_AUTO_START"] = "saved" if policy is None else str(int(policy))
+                    info = {"host": WEB_BOUND_HOST, "port": WEB_BOUND_PORT, "reason": "management"}
+                    self._write_json(ok({"restarting": True, "boot_id": MANAGEMENT_BOOT_ID}))
+                    schedule_web_reload(self.server, info)
+                else:
+                    self._write_json(ok({"stopping": True, "boot_id": MANAGEMENT_BOOT_ID}))
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif parsed.path == "/api/account-config":
                 self._write_json(ok(save_account_runtime_config(body)))
             elif parsed.path == "/api/qmt/processes/stop":
@@ -15967,7 +16384,9 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             else:
                 self._write_json(fail("not found", 404), status=404)
         except ProjectUpdateBusyError as e:
-            self._write_json(fail(e, 409), status=409)
+            self._write_json(dict(fail(e, 409), code="project_update_busy"), status=409)
+        except QmtRunningError as e:
+            self._write_json(dict(fail(e, 409), code="qmt_running"), status=409)
         except Exception as e:
             self._write_json(fail(e, 400), status=400)
         finally:
@@ -16068,9 +16487,27 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         return bool(web_auth_token_info(self._provided_web_token(parsed)))
 
     def _has_access_token(self, parsed):
-        return self._web_token_valid(parsed) or self._api_key_valid(parsed)
+        return self._web_token_valid(parsed) or self._api_key_valid(parsed) or self._management_key_valid(parsed)
+
+    def _management_key_valid(self, parsed):
+        if parsed.path not in MANAGEMENT_API_PATHS:
+            return False
+        path = os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE")
+        provided = self.headers.get("X-CFQuant-Management-Key") or ""
+        if not path or not provided:
+            return False
+        try:
+            with open(path, "r", encoding="ascii") as stream:
+                expected = stream.read().strip()
+            return bool(expected) and secrets.compare_digest(provided, expected)
+        except (OSError, ValueError):
+            return False
 
     def _authorized(self, parsed):
+        if parsed.path.startswith("/api/management/") or parsed.path == "/api/project-updates/ensure-latest":
+            return self._has_access_token(parsed)
+        if os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE") and parsed.path in MANAGEMENT_API_PATHS:
+            return self._has_access_token(parsed)
         if parsed.path == "/api/config" or parsed.path in PUBLIC_API_PATHS:
             return True
         if parsed.path in INTERNAL_API_PATHS:
@@ -16138,6 +16575,10 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             if not file_item:
                 self._write_json(fail("file is required", 400), status=400)
                 return
+            qmt_update_preflight(
+                body={"auto_close_qmt": True},
+                rows=WEB_CONFIG.account_configs().values(),
+            )
             result = PROJECT_UPDATER.update_from_zip(
                 file_item.get("filename") or "upload.zip",
                 file_item.get("content") or b"",
@@ -16224,6 +16665,8 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/health":
                 self._write_json(ok({"status": "ok"}))
+            elif parsed.path == "/api/management/status":
+                self._write_json(ok(management_status()))
             elif parsed.path == "/api/internal/runtime-route":
                 self._write_json(ok(internal_runtime_route_info()))
             elif parsed.path == "/api/config":
@@ -16319,6 +16762,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     repo_url=repo_url,
                     ref=ref,
                     include_remote=include_remote,
+                    force=parse_bool((query.get("force") or ["0"])[0]),
                 )))
             elif parsed.path == "/api/version":
                 include_remote = parse_bool((query.get("remote") or ["1"])[0])
@@ -16332,6 +16776,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     repo_url=repo_url,
                     ref=ref,
                     bridge_id=bridge_id,
+                    force_remote=parse_bool((query.get("force_remote") or ["0"])[0]),
                 )
                 version_info["system_info"] = project_system_info(version_info)
                 self._write_json(ok(version_info))
@@ -16756,7 +17201,8 @@ def spawn_reloaded_web_server(reload_request):
         port = fallback_port
     restart_script = os.path.join(BASE_DIR, "restart_cfquant.bat")
     hidden_batch_runner = os.path.join(BASE_DIR, "run_hidden_batch.vbs")
-    use_restart_script = os.name == "nt" and os.path.isfile(restart_script)
+    use_restart_script = (os.name == "nt" and os.path.isfile(restart_script)
+                          and not os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE"))
     if use_restart_script:
         # WScript starts the batch through a hidden cmd host. This prevents
         # every nested PowerShell/cmd helper in restart_cfquant.bat from
@@ -16801,7 +17247,7 @@ def spawn_reloaded_web_server(reload_request):
     reload_log = None
     try:
         try:
-            reload_log = open(os.path.join(LOG_DIR, "cfquant_web_reload.log"), "ab")
+            reload_log = open(os.path.join(LOG_COMPONENT_DIRS["startup"], "cfquant_web_reload.log"), "ab")
         except Exception:
             reload_log = None
         process = subprocess.Popen(
@@ -16826,6 +17272,7 @@ def spawn_reloaded_web_server(reload_request):
 
 
 def main(argv=None):
+    global MANAGEMENT_READY
     parser = argparse.ArgumentParser(description="Run cfquant local web dashboard.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -16876,6 +17323,11 @@ def main(argv=None):
             % args.port
         )
     ensure_lttx_started("Web 启动预启动")
+    # Older updater processes only copied raw entries. Refresh managed sources
+    # before auto-login so QMT imports the selected mode's current package.
+    for result in refresh_bound_qmt_strategies():
+        if result.get("error"):
+            safe_print("cfquant managed QMT strategy refresh failed: %s" % result["error"])
     start_configured_qmt_on_web_startup()
     server = ThreadingHTTPServer((args.host, args.port), CfquantWebHandler)
     try:
@@ -16910,9 +17362,11 @@ def main(argv=None):
     QUOTES.start()
     LOG_CLEANUP.start()
     safe_print("cfquant web dashboard listening on http://%s:%s" % (args.host, args.port))
+    MANAGEMENT_READY = True
     try:
         server.serve_forever()
     finally:
+        MANAGEMENT_READY = False
         LOG_CLEANUP.close()
         STATUS_MONITOR.close()
         QMT_AUTO_LOGIN_RESTART_SCHEDULER.close()

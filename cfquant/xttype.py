@@ -4,6 +4,7 @@ import re
 
 from . import xtconstant
 from .stock_connect import connect_account_type
+from .order_identity import restore_order_remark
 
 
 _QMT_COMPACT_PREFIXES = (
@@ -61,7 +62,7 @@ def _with_qmt_compact_aliases(*names):
 
 class DictObject(object):
     def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+        self.__dict__.update(restore_order_remark(kwargs))
 
     @classmethod
     def from_any(cls, value):

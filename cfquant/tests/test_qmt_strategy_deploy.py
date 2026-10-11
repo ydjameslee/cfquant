@@ -16,6 +16,7 @@ from cfquant.qmt_strategy_deploy import (
     QmtStrategyManager, _account_binding, _atomic_write, _read_document,
     _write_json, _resolve_account_binding, account_qmt_roots, managed_source, normalize_strategy_settings,
     normalize_strategy_mode,
+    entry_script_for_mode, read_entry_source,
     _strategy_slot_name,
     _digest,
 )
@@ -44,6 +45,14 @@ def test_existing_legacy_job_keeps_control_path_after_type_isolation_upgrade(dep
 @pytest.mark.parametrize("value, expected", [("extreme", "lite"), ("ultimate", "lite"), ("pipe", "ctypes"), ("socket", "lttx")])
 def test_strategy_mode_aliases_are_canonical(value, expected):
     assert normalize_strategy_mode(value) == expected
+
+
+def test_lite_entry_mapping_rejects_generic_source(tmp_path):
+    assert entry_script_for_mode("extreme") == "CFQUANT_LITE.py"
+    source = tmp_path / "CFQUANT_LITE.py"
+    source.write_text("from cfquant import __version__\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="通用模式代码"):
+        read_entry_source(source)
 
 
 def test_strategy_name_contains_mode_and_shortens_long_account():

@@ -7,8 +7,9 @@ for %%A in (%*) do if /i "%%~A"=="--no-pause" set "CFQUANT_RESTART_NO_PAUSE=1"
 echo [STEP] Restart operation started. Please wait...
 
 set "LOG_DIR=%~dp0log"
-set "START_LOG=%LOG_DIR%\cfquant_startup.log"
-if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>nul
+set "STARTUP_LOG_DIR=%LOG_DIR%\startup"
+set "START_LOG=%STARTUP_LOG_DIR%\cfquant_startup.log"
+if not exist "%STARTUP_LOG_DIR%" mkdir "%STARTUP_LOG_DIR%" >nul 2>nul
 call :log "restart_cfquant.bat invoked"
 
 set "WEB_PORT=8765"

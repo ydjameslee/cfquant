@@ -34,7 +34,7 @@
 | `download_history_data2` | 批量下载历史行情数据，支持 `callback_event` 事件转发。 |
 | `get_instrument_detail` | 查询证券合约详情。 |
 | `get_stock_list_in_sector` | 查询板块成分。 |
-| `get_trading_dates` | 查询交易日历。 |
+| `get_trading_dates` | 查询交易日历。外部 Python 使用 pandas_market_calendars 生成 SH/SZ/BJ/HK 日历，不再依赖大 QMT 的 get_trading_calendar。 |
 | `is_stock` / `is_fund` / `is_future` | 证券类型判断。 |
 | `get_stock_type` / `get_stock_name` / `get_open_date` | 基础资料查询。 |
 | `get_contract_expire_date` / `get_contract_multiplier` | 合约到期日和乘数查询。 |

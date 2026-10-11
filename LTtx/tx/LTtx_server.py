@@ -88,6 +88,8 @@ def ensure_modules_with_version(modules: dict):
                 else:
                     print(f"[AutoInstall] {import_name} 已安装，版本为 {installed_version}，满足要求")
         except ImportError:
+            if os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE"):
+                raise RuntimeError("Managed cfquant requires %s; install it in the configured Python environment" % pip_name)
             # 安装或升级
             install_target = pip_name if required_version == "latest" else "%s>=%s" % (pip_name, required_version)
             print(f"[AutoInstall] 正在安装/升级 {pip_name} → {required_version}...")
@@ -204,7 +206,10 @@ def _lttx_log_dir():
     log_dir = os.environ.get("CFQUANT_LOG_DIR")
     if log_dir:
         return os.path.abspath(os.path.join(log_dir, "lttx"))
-    return os.path.abspath("log_data")
+    home = os.environ.get("CFQUANT_HOME")
+    if home:
+        return os.path.abspath(os.path.join(home, "log", "lttx"))
+    return os.path.join(_project_root(), "log", "lttx")
 
 def _cleanup_lttx_logs(log_dir):
     try:
@@ -234,7 +239,7 @@ def main_save_log():
         os.makedirs(log_dir, exist_ok=True)
         _cleanup_lttx_logs(log_dir)
     except:
-        log_dir = os.path.abspath("log_data")
+        log_dir = os.path.join(_project_root(), "log", "lttx")
         try:
             os.makedirs(log_dir, exist_ok=True)
         except:
@@ -250,7 +255,8 @@ def main_save_log():
             f.write(str(data)+'\n')
             
 msg = '%s>>>>>>>[info] LTtx程序启动'%(time.strftime("%Y-%m-%d %H:%M:%S"))
-threading.Thread(target = main_save_log).start()
+log_thread = threading.Thread(target=main_save_log, name="lttx-log-writer", daemon=True)
+log_thread.start()
 
 def close_con(client):
     try:
@@ -1111,7 +1117,7 @@ def main():
     update_time = '2025-09-04'
     import multiprocessing
     config = load_config()
-    port = int(config['port'])
+    port = int(os.environ.get('CFQUANT_LTTX_PORT') or config['port'])
     tocken = config['token']
     ip = get_local_ip()
     if tcp_port_open('127.0.0.1', port):

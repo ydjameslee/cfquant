@@ -42,7 +42,7 @@ REQUEST_TIMEOUT = 15.0
 全推行情回调测试，写法接近 xtquant：
 
 ```python
-xtdata.subscribe_whole_quote(["SH", "SZ"], callback=on_whole_quote)
+xtdata.subscribe_whole_quote(["SH", "SZ", "BJ"], callback=on_whole_quote)
 ```
 
 全推不设市场或证券代码白名单，列表会传给 QMT。例如可以把 `MARKETS` 改为 `"SH,SZ,BJ"`，或用 `xtdata.subscribe_whole_quote(["830799.BJ"], callback=on_whole_quote)` 订阅单只证券的全推。具体可用市场、代码和行情权限由券商 QMT 决定；期货等代码的大小写应按 QMT 要求填写。返回订阅号不代表当前时段一定有行情回调。
@@ -67,7 +67,7 @@ D:\ProgramData\anaconda3\python.exe .\cfquant\tests\1_行情接收测试.py
 常用代码配置：
 
 ```python
-MARKETS = "SH,SZ"
+MARKETS = "SH,SZ,BJ"
 SAMPLE_CODES = 3
 ```
 

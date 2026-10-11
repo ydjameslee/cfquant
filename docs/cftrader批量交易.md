@@ -63,9 +63,11 @@ orders_api = cftrader.CfQuantTrader(trader)
 | `price_type` | 是 | 原 `xtconstant` 报价类型常量，整数 |
 | `price` | 是 | 有限数值；行情价模式也显式传入原接口要求的占位价格 |
 | `strategy_name` | 否 | 覆盖批次默认策略名；显式空字符串保留为空 |
-| `order_remark` | 否 | 非空值原样使用；缺失或为空时使用“批次备注或自动批次 ID + 行号” |
+| `order_remark` | 否 | 查询和回调保留用户备注；缺失或为空时使用“批次备注或自动批次 ID + 行号” |
 
-`stop_on_error` 必须为布尔值。不会在行内接受 `account`、`bridge_id` 或拼错的下单字段。参数错误、空批次、非有限价格、非整数数量，以及批次内重复的“代码 + 备注”都会在发送任何订单前抛出 `ValueError`。账号、品种和业务权限由现有 QMT 路径继续校验。
+`stop_on_error` 必须为布尔值。不会在行内接受 `account`、`bridge_id` 或拼错的下单字段。参数错误、空批次、非有限价格、非整数数量会在发送任何订单前抛出 `ValueError`。账号、品种和业务权限由现有 QMT 路径继续校验。
+
+每笔委托发送给大 QMT 的备注自动追加 `__cfq_` 和 UUID，例如 `buy__cfq_...`。相同账号、股票和用户备注可以连续或批量下单，内部通过各自的唯一标识关联查询、回调及异步 `seq`。对外的 `order_remark` 保留原备注，`cfquant_order_remark` 保存内部标识；QMT 原始 `m_strRemark` 等字段保留原生值。内部标识由系统生成，调用方无需填写或复用。无法确定归属的回调不会按备注强行绑定到新订单。
 
 批量撤单的 `order_ids` 可以是委托号列表，例如 `["1001", "1002"]`；也可以是字典列表，例如 `dict(order_id="1001", stock_code="600000.SH")` 或 `dict(order_id="1002", market="SZ")`。未启用独立市场路由时只需要 `order_id`；启用同账号 SH/SZ 独立交易端时，建议每笔带 `stock_code` 或 `market`，这样 Web 路由能把撤单请求发到正确的 QMT。
 

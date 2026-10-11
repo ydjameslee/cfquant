@@ -50,3 +50,13 @@ def test_health_wait_stops_when_launched_process_exits(tmp_path):
     assert result.returncode == 1, result.stdout
     assert b'Web service exited before readiness' in result.stdout
     assert not pid_file.exists()
+
+
+def test_startup_script_uses_component_log_directories():
+    source = (ROOT / 'start_cfquant.bat').read_text(encoding='ascii')
+    assert 'set "STARTUP_LOG_DIR=%LOG_DIR%\\startup"' in source
+    assert 'set "WEB_LOG_DIR=%LOG_DIR%\\web"' in source
+    assert 'set "START_LOG=%STARTUP_LOG_DIR%\\cfquant_startup.log"' in source
+    assert 'set "WEB_STDOUT=%WEB_LOG_DIR%\\cfquant_web_server.' in source
+    restart = (ROOT / 'restart_cfquant.bat').read_text(encoding='ascii')
+    assert 'set "START_LOG=%STARTUP_LOG_DIR%\\cfquant_startup.log"' in restart

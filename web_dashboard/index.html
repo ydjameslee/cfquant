@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>cfquant 控制台</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/styles.css?v=web_20261008_01">
+  <link rel="stylesheet" href="/styles.css?v=web_20261011_02">
 </head>
 <body>
   <div id="webAuthOverlay" class="auth-overlay hidden" aria-live="polite">
@@ -1286,8 +1286,8 @@
                       <div>
                         <span>更新保护</span>
                         <strong>先备份，再更新</strong>
-                        <small>每次更新前自动创建完整回退点。更新期间网页新委托会暂时锁定；请先停止 QMT 入口脚本，并在非交易时段操作。</small>
-                        <label class="update-auto-close-option"><input id="updateAutoCloseQmt" type="checkbox"> 更新前自动关闭已运行的 QMT（默认关闭，建议手动退出）</label>
+                        <small>每次更新前自动创建完整回退点。更新期间网页新委托会暂时锁定；系统会先关闭已绑定且正在运行的 QMT，再覆盖入口文件，请在非交易时段操作。</small>
+                        <label class="update-auto-close-option"><input id="updateAutoCloseQmt" type="checkbox" checked> 更新前自动关闭已绑定且正在运行的 QMT</label>
                       </div>
                       <span id="projectUpdateBackupSummary" class="metric-note" aria-live="polite">暂无可回退版本</span>
                     </div>
@@ -3223,6 +3223,6 @@ else:
   <script src="/api-tester.js?v=20260916_apikey_01"></script>
   <script src="/python-api.js?v=20260925_trading_dates_01"></script>
   <script src="/docs.js?v=20260925_data_docs_01"></script>
-  <script src="/app.js?v=web_20261008_01"></script>
+  <script src="/app.js?v=web_20261011_02"></script>
 </body>
 </html>

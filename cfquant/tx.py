@@ -196,8 +196,11 @@ class txl:
             return os.path.abspath(tx_log_dir)
         log_dir = os.environ.get("CFQUANT_LOG_DIR")
         if log_dir:
-            return os.path.abspath(os.path.join(log_dir, "tx_log"))
-        return os.path.abspath(os.path.join(os.getcwd(), "log", "tx_log"))
+            return os.path.abspath(os.path.join(log_dir, "lttx"))
+        home = os.environ.get("CFQUANT_HOME")
+        if home:
+            return os.path.abspath(os.path.join(home, "log", "lttx"))
+        return os.path.abspath(os.path.join(os.getcwd(), "log", "lttx"))
 
     def delete_file(self,file_name):
         msg = '删除tx运行日志%s'%(file_name)

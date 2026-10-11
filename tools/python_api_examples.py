@@ -8,7 +8,7 @@ PARAMETERS = {
     "stockcode": "证券代码字符串；此拼写与 stock_code 不同，按当前签名传参。",
     "stock_list": "证券代码列表，例如 ['600000.SH', '000001.SZ']。",
     "stock_codes": "批量计算使用的证券代码列表。",
-    "code_list": "证券代码或市场列表；全推接口可使用 SH、SZ。",
+    "code_list": "证券代码或市场列表；全推接口默认使用 SH、SZ、BJ，也支持传入具体证券代码。",
     "period": "数据周期，例如 tick、1m、5m、1d；其他周期需终端及数据权限支持。",
     "start_time": "起始日期或时间，常用 YYYYMMDD、YYYYMMDDHHMMSS；空串使用接口默认范围。",
     "end_time": "结束日期或时间，格式与 start_time 对应。",
@@ -187,6 +187,8 @@ def example_for(entry):
         return {"example": "", "originalExample": "", "usage": "尚未支持。当前不提供可用的 cfquant 替代调用；条件入口也不视为已完成适配。"}
     code, usage = "", "示例运行前需完成 Web 账号绑定，并在大 QMT 中启动对应桥策略。"
     if module == "xtdata":
+        if name == "get_trading_dates":
+            usage = "无需完成 Web 账号绑定，也无需启动大 QMT 桥策略；外部 Python 环境需要安装 pandas-market-calendars。"
         if name in ("subscribe_quote", "subscribe_whole_quote", "unsubscribe_quote", "run"):
             call = 'xtdata.subscribe_whole_quote(["600000.SH", "000001.SZ"], callback=on_quote)' if name == "subscribe_whole_quote" else 'xtdata.subscribe_quote("600000.SH", period="tick", callback=on_quote)'
             body = 'def on_quote(data):\n    print(data)\n\nseq = ' + call + '\nif seq is None or int(seq) <= 0:\n    raise RuntimeError("Quote subscription failed")\ntry:\n    xtdata.run()\nexcept KeyboardInterrupt:\n    pass\nfinally:\n    xtdata.unsubscribe_quote(seq)'
@@ -250,7 +252,7 @@ def example_for(entry):
         "get_cb_info": "有数据时返回字典，可能仅含 stockCode、bondConvPrice 及来源/部分资料标记。没有数据时保留 None 或空字典。",
         "get_sector_list": "扁平且去重的板块名称列表。终端目录范围可能与 MiniQMT 不同。",
         "get_stock_list_in_sector": "证券代码列表。指定历史时点而旧终端不接受参数时会报错，不会退回当前成分。",
-        "get_trading_dates": "通过大 QMT get_trading_calendar 查询市场日历，按 count 截取最近的交易日，返回北京时间零点的毫秒时间戳列表。需要终端提供 get_trading_calendar；不返回未来交易日。",
+        "get_trading_dates": "通过外部 Python 的 pandas_market_calendars 查询 SH/SZ/BJ/HK 市场日历，按 count 截取最近的交易日，返回北京时间零点的毫秒时间戳列表；不依赖大 QMT get_trading_calendar，也不返回未来交易日。",
         "get_financial_data": "返回底层财务查询结果。cfquant 的字段级查询不等同于原版返回整张财务表，先检查实际结构再提取字段。",
         "reset_sector": "保留底层布尔结果。空列表意味着清空成分，应先确认目标是可修改的自定义板块。",
         "remove_stock_from_sector": "全部删除成功才返回 True。异常或失败可能发生在部分修改之后，需重新查询成分核实。",

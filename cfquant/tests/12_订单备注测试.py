@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import cfquant_web_server as web
 from cfquant import order_meta
 from cfquant import xtconstant
+from cfquant.order_identity import original_order_remark
 from cfquant.pipe_bridge import PipeNormalQmtBridge, PipeTradeBridge
 from cfquant.qmt_bridge import CfquantQmtBridge
 from cfquant.normal_bridge import NormalQmtBridge
@@ -20,6 +21,11 @@ from cfquant.xttype import XtTrade
 
 class DummyContext(object):
     pass
+
+
+def _wire_remark(text):
+    # Stable native echo for these single-submission fixtures.
+    return text + "__cfq_0123456789abcdef0123456789abcdef"
 
 
 def _base_order_params(**overrides):
@@ -32,6 +38,9 @@ def _base_order_params(**overrides):
         "price": 10.0,
     }
     params.update(overrides)
+    original = next((params[name] for name in ("order_remark", "remark", "strategy_name") if params.get(name)), "")
+    if original:
+        params["cfquant_order_remark"] = _wire_remark(original)
     return params
 
 
@@ -47,7 +56,8 @@ def _token_echoing_query(native_calls, rows_or_callable):
     def query(*args):
         rows = rows_or_callable(*args) if callable(rows_or_callable) else rows_or_callable
         token = native_calls[-1][7]
-        return [dict(row, m_strStrategyName=token) for row in rows]
+        remark = native_calls[-1][9]
+        return [dict(row, m_strStrategyName=token, m_strRemark=remark) for row in rows]
 
     return query
 
@@ -93,8 +103,8 @@ def test_qmt_bridge_uses_strategy_name_as_default_remark():
     result = bridge._order_stock(_base_order_params(strategy_name="strategy-a"))
 
     assert result["order_remark"] == "strategy-a"
-    assert calls[0][7] == "strategy-a"
-    assert calls[0][9] == "strategy-a"
+    assert calls[0][7].split("&&&", 1)[0] == "strategy-a"
+    assert original_order_remark(calls[0][9]) == "strategy-a"
 
 
 def test_qmt_bridge_remark_alias_precedes_strategy_name():
@@ -108,7 +118,7 @@ def test_qmt_bridge_remark_alias_precedes_strategy_name():
     result = bridge._order_stock(_base_order_params(remark="remark-a", strategy_name="strategy-a"))
 
     assert result["order_remark"] == "remark-a"
-    assert calls[0][9] == "remark-a"
+    assert original_order_remark(calls[0][9]) == "remark-a"
 
 
 def test_qmt_bridge_query_trade_restores_strategy_name_from_submitted_remark():
@@ -117,7 +127,7 @@ def test_qmt_bridge_query_trade_restores_strategy_name_from_submitted_remark():
         "m_nRef": 700002,
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
-        "m_strRemark": "remark-a",
+        "m_strRemark": _wire_remark('remark-a'),
         "m_strStrategyName": "",
         "m_dPrice": 10.0,
         "m_nVolume": 100,
@@ -158,8 +168,8 @@ def test_tx_trade_bridge_order_remark_precedes_strategy_name():
     )
 
     assert result["order_remark"] == "remark-a"
-    assert calls[0][7].startswith("strategy-a&&&_cfq_")
-    assert calls[0][9] == "remark-a"
+    assert calls[0][7].split("&&&", 1)[0] == "strategy-a"
+    assert original_order_remark(calls[0][9]) == "remark-a"
 
 
 def test_tx_trade_bridge_resolves_zero_passorder_result_from_matching_detail():
@@ -204,7 +214,7 @@ def test_qmt_bridge_resolves_zero_passorder_result_from_matching_detail():
             "passorder": lambda *args: 0,
             "get_last_order_id": lambda *args: "900001",
             "get_trade_detail_data": lambda *args: [{
-                "m_nRef": 800002, "m_strOrderSysID": "900002", "m_strRemark": "remark",
+                "m_nRef": 800002, "m_strOrderSysID": "900002", "m_strRemark": _wire_remark('remark'),
                 "m_strInstrumentID": "000001", "m_strExchangeID": "SZ",
             }],
         },
@@ -221,7 +231,7 @@ def test_qmt_bridge_resolves_zero_passorder_result_from_matching_detail():
 def test_qmt_bridge_waits_for_delayed_internal_id_instead_of_returning_sysid():
     last_ids = iter(("898", "899"))
     snapshots = iter(([], [{
-        "m_nRef": 1082130604, "m_strOrderSysID": "899", "m_strRemark": "remark",
+        "m_nRef": 1082130604, "m_strOrderSysID": "899", "m_strRemark": _wire_remark('remark'),
         "m_strInstrumentID": "000001", "m_strExchangeID": "SZ",
     }]))
     bridge = CfquantQmtBridge(
@@ -290,10 +300,9 @@ def test_tx_trade_bridge_async_zero_is_accepted_without_sync_order_lookup():
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
         "m_nRef": 700002,
-        "m_strTradingDay": "20260926",
         "m_nAccountType": 2,
         "m_strTradingDay": "20260926",
-        "m_strRemark": "other-remark",
+        "m_strRemark": _wire_remark('other-remark'),
         "m_strStrategyName": "wrong-token",
     }) is False
     assert bridge._handle_async_order_callback({
@@ -303,7 +312,7 @@ def test_tx_trade_bridge_async_zero_is_accepted_without_sync_order_lookup():
         "m_nRef": 700002,
         "m_nAccountType": 2,
         "m_strTradingDay": "20260926",
-        "m_strRemark": "remark",
+        "m_strRemark": _wire_remark('remark'),
         "m_strStrategyName": request_token,
     }) is True
     assert events == [("client-1", "on_order_stock_async_response", {
@@ -313,6 +322,7 @@ def test_tx_trade_bridge_async_zero_is_accepted_without_sync_order_lookup():
         "strategy_name": "hxy",
         "order_remark": "remark",
         "seq": 21,
+        "cfquant_order_remark": _wire_remark("remark"),
     })]
     assert bridge.pending_async_orders == []
 
@@ -340,7 +350,7 @@ def test_qmt_bridge_async_zero_waits_for_matching_order_callback():
         "account_id": "A123",
         "stock_code": "000001.SZ",
         "order_id": 800002,
-        "order_remark": "remark",
+        "order_remark": _wire_remark('remark'),
     }) is True
     assert events[0][2] == {
         "account_type": "STOCK",
@@ -349,6 +359,7 @@ def test_qmt_bridge_async_zero_waits_for_matching_order_callback():
         "strategy_name": "hxy",
         "order_remark": "remark",
         "seq": 22,
+        "cfquant_order_remark": _wire_remark("remark"),
     }
 
 
@@ -377,7 +388,7 @@ def test_qmt_bridge_async_positive_request_result_waits_for_real_order_callback(
         "stock_code": "000001.SZ",
         "m_nRef": 700025,
         "m_strOrderSysID": "635082606",
-        "order_remark": "remark",
+        "order_remark": _wire_remark('remark'),
     }) is True
     assert events[0][2]["order_id"] == 700025
 
@@ -399,7 +410,7 @@ def test_tx_trade_bridge_async_positive_request_result_waits_for_real_order_call
         {"id": "request-6", "client_id": "client-6"},
     )
 
-    record = bridge.order_meta_cache.by_user[("default", "STOCK", "A123", "remark")]
+    record = bridge.order_meta_cache.by_user[("default", "STOCK", "A123", _wire_remark("remark"))]
     assert result == {"seq": 26, "accepted": True, "request_result": 635082606}
     assert order_meta.canonical_order_id_from_record(record) is None
     assert events == []
@@ -413,7 +424,7 @@ def test_tx_trade_bridge_async_positive_request_result_waits_for_real_order_call
         "m_nAccountType": 2,
         "m_strTradingDay": "20260926",
         "m_strOrderSysID": "635082606",
-        "m_strRemark": "remark",
+        "m_strRemark": _wire_remark('remark'),
         "m_strStrategyName": request_token,
     }) is True
     assert events[0][2]["order_id"] == 700026
@@ -462,7 +473,7 @@ def test_normal_bridge_turns_real_order_callback_into_xtorderresponse():
         "m_strOrderRef": "700002",
         "m_strOrderSysID": "SYS-2",
         "m_strTradingDay": "20260926",
-        "m_strRemark": "",
+        "m_strRemark": _wire_remark("remark"),
         "m_strStrategyName": request_token,
     })
 
@@ -474,6 +485,7 @@ def test_normal_bridge_turns_real_order_callback_into_xtorderresponse():
         "strategy_name": "hxy",
         "order_remark": "remark",
         "seq": 24,
+        "cfquant_order_remark": _wire_remark("remark"),
     })]
     callback_pushes = [item for item in bridge.tx.pushes if item[0] == "event"]
     callback_payload = json.loads(callback_pushes[0][1])
@@ -537,7 +549,7 @@ def test_tx_trade_bridge_pushes_order_meta_before_passorder_and_persists_account
     assert result["order_id"] == 700010
     assert calls[0][1][0][0] == order_meta.ORDER_META_PUSH_KEY
     assert calls[0][1][0][2] == expected_channel
-    assert order_meta.store_user_key("user-001") in calls[0][2][store_key]
+    assert order_meta.store_user_key(result["cfquant_order_remark"]) in calls[0][2][store_key]
     assert order_meta.store_order_ref_key("700010", ref_kind="full") in bridge.tx.store[store_key]
 
 
@@ -1001,7 +1013,7 @@ def test_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id():
             "m_strOrderSysID": "900001",
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "remark",
+            "m_strRemark": _wire_remark('remark'),
         },
         {
             # The metadata reconciler can leave a previous canonical id in
@@ -1012,7 +1024,7 @@ def test_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id():
             "m_strOrderSysID": "900002",
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "remark",
+            "m_strRemark": _wire_remark('remark'),
         },
     ]
     bridge = TxTradeBridge(
@@ -1040,7 +1052,7 @@ def test_qmt_sync_lookup_uses_raw_reference_when_metadata_contains_previous_id()
         "m_strOrderSysID": "900002",
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
-        "m_strRemark": "remark",
+        "m_strRemark": _wire_remark('remark'),
     }]
     bridge = CfquantQmtBridge(
         DummyContext(),
@@ -1096,7 +1108,7 @@ def test_qmt_order_does_not_trust_stale_passorder_result():
                 "m_strOrderSysID": "900002",
                 "m_strInstrumentID": "000001",
                 "m_strExchangeID": "SZ",
-                "m_strRemark": "remark",
+                "m_strRemark": _wire_remark('remark'),
             }],
         },
     )
@@ -1121,13 +1133,13 @@ def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
             "m_strOrderSysID": "900002",
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "remark",
+            "m_strRemark": _wire_remark('remark'),
         }, {
             "m_nRef": 700000,
             "m_strOrderSysID": "900000",
             "m_strInstrumentID": "000001",
             "m_strExchangeID": "SZ",
-            "m_strRemark": "remark",
+            "m_strRemark": _wire_remark('remark'),
         }]
 
     bridge = NormalQmtBridge(
@@ -1166,7 +1178,7 @@ def test_normal_bridge_callback_wakes_pending_sync_order_lookup():
         "m_strExchangeID": "SZ",
         "m_nRef": 700002,
         "m_strOrderSysID": "900002",
-        "m_strRemark": "remark",
+        "m_strRemark": _wire_remark('remark'),
         "m_strStrategyName": request_token,
     })
     worker.join(2)
@@ -1182,7 +1194,7 @@ def test_query_order_restores_strategy_name_from_exact_submitted_token():
         "m_nRef": 700004,
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
-        "m_strRemark": "remark",
+        "m_strRemark": _wire_remark('remark'),
         "m_strStrategyName": "",
     }
     def passorder(*args):
@@ -1217,7 +1229,7 @@ def test_query_trade_restores_strategy_name_from_submitted_remark():
         "m_nRef": 700005,
         "m_strInstrumentID": "000001",
         "m_strExchangeID": "SZ",
-        "m_strRemark": "remark",
+        "m_strRemark": _wire_remark('remark'),
         "m_strStrategyName": "",
         "m_dPrice": 10.0,
         "m_nVolume": 100,
@@ -1428,8 +1440,8 @@ def test_tx_trade_bridge_batch_keeps_row_strategy_name_as_remark():
     )
 
     assert result["submitted"] == 1
-    assert calls[0][7].startswith("strategy-a&&&_cfq_")
-    assert calls[0][9] == "strategy-a"
+    assert calls[0][7].split("&&&", 1)[0] == "strategy-a"
+    assert original_order_remark(calls[0][9]) == "strategy-a"
 
 
 def test_qmt_bridge_maps_credit_stock_buy_to_big_qmt_collateral_buy():

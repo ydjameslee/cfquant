@@ -91,7 +91,7 @@
 | --- | --- | --- | --- |
 | `get_instrument_detail` | 查询合约的市场、名称、上市日期等基础字段 | ✅ 部分适配 | 依次尝试新版名称、旧版 `get_instrumentdetail`、基础字段合成。旧版结果标记 `cfquant_detail_partial` 和来源；合成结果还标记 `cfquant_detail_fallback`。真实业务错误不会触发旧名称回退。 |
 | `get_instrument_type` | 判断合约所属证券类型 | ❌ 未适配 | `is_stock`、`is_fund` 等扩展入口不等于官网接口及其返回结构。 |
-| `get_trading_dates` | 查询某市场在日期区间内的交易日列表 | ✅ 部分适配 | 参数对齐 market/start_time/end_time/count；通过大 QMT get_trading_calendar 转换为市场交易日毫秒时间戳，按 count 截取，排除未来日期。依赖终端日历能力和数据，实机待验证。 |
+| `get_trading_dates` | 查询某市场在日期区间内的交易日列表 | ✅ 已适配 | 参数对齐 market/start_time/end_time/count；由外部 Python 的 pandas_market_calendars 生成 SH/SZ/BJ/HK 交易日，按 count 截取并返回北京时间零点毫秒时间戳，不依赖大 QMT get_trading_calendar；不支持的期货市场代码会明确报错。 |
 | `get_sector_list` | 列出可查询的板块名称 | ✅ 部分适配 | 已按大 QMT 节点名称遍历板块树，输出去重后的扁平板块列表，防止循环目录；同名目录及终端分类覆盖仍待实测。 |
 | `get_stock_list_in_sector` | 查询某个板块包含的证券代码 | ✅ 已适配 | 已增加 `real_timetag=-1` 参数；指定历史毫秒时间戳时传给大 QMT 的 `realtime`，旧终端不接受该参数时直接报错，不退回当前成分。 |
 | `download_sector_data` | 更新板块分类和成分信息 | ❌ 条件待验证 | 仅尝试终端对应下载函数。 |

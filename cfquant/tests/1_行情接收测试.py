@@ -21,7 +21,7 @@ from cfquant import xtdata
 TRANSPORT = "auto"       # auto 自动发现；也可填写 ctypes、web_lttx 或 lttx
 BRIDGE_ID = "default"
 REQUEST_TIMEOUT = 15.0    # 请求超时，单位秒
-MARKETS = "SH,SZ"         # 市场或证券代码用逗号分隔，例如 SH,SZ,BJ 或 rb2610.SF
+MARKETS = "SH,SZ,BJ"      # 市场或证券代码用逗号分隔，例如 SH,SZ,BJ 或 rb2610.SF
 STOCK_CODE = "000001.SZ"  # 仅 INCLUDE_SINGLE_QUOTE/INCLUDE_SINGLE_QUOTE2 为 True 时使用
 SINGLE_PERIOD = "1d"
 DIVIDEND_TYPE = "none"
@@ -105,7 +105,7 @@ def main():
     )
     configure_cfquant(config)
 
-    markets = parse_csv(config.markets, default=["SH", "SZ"])
+    markets = parse_csv(config.markets, default=["SH", "SZ", "BJ"])
     stock_code = str(config.stock_code or "").strip().upper()
     stop_event = threading.Event()
     stats_lock = threading.Lock()

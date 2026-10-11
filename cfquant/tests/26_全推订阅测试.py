@@ -289,7 +289,7 @@ def test_web_forwards_arbitrary_markets_codes_and_empty_lists(store, value, expe
 
 
 def test_web_defaults_only_when_argument_is_omitted(store):
-    assert store.quotes.subscribe_whole({})["markets"] == ["SH", "SZ"]
+    assert store.quotes.subscribe_whole({})["markets"] == ["SH", "SZ", "BJ"]
 
 
 def test_web_code_list_alias_and_chinese_comma(store):

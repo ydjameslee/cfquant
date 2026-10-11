@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = 'web_20261008_01';
+const FRONTEND_VERSION = 'web_20261011_02';
 
 const state = {
   accountId: '',
@@ -729,7 +729,7 @@ function testRuntimeConfigForSource(item = {}) {
     dataProviderEnabled: !!provider,
     mode: normalizeTransportMode(runtimeConfig.mode || tradeConfig.mode || state.transportMode || 'ctypes'),
     stockCode: defaultTestStockCodeForSource(item),
-    markets: 'SH,SZ',
+    markets: 'SH,SZ,BJ',
     host: hostInfo.host,
     port: hostInfo.port,
     tradeMarketRoutes: marketRouteText(tradeConfig),
@@ -966,7 +966,7 @@ function configuredTestCommand(item, runtime) {
   if (testSourceHasOption(source, '--port') && runtime.port) args.push(['--port', String(runtime.port)]);
   if (testSourceHasOption(source, '--account-id') && runtime.accountId) args.push(['--account-id', runtime.accountId]);
   if (testSourceHasOption(source, '--account-type') && runtime.accountType) args.push(['--account-type', runtime.accountType]);
-  if (testSourceHasOption(source, '--markets')) args.push(['--markets', runtime.markets || 'SH,SZ']);
+  if (testSourceHasOption(source, '--markets')) args.push(['--markets', runtime.markets || 'SH,SZ,BJ']);
   if (testSourceHasOption(source, '--stock-code') && runtime.kind === 'quote' && !name.startsWith('1_')) args.push(['--stock-code', runtime.stockCode || '000001.SZ']);
   if (testSourceHasOption(source, '--period') && name.startsWith('21_')) args.push(['--period', 'tick']);
   if (testSourceHasOption(source, '--seconds') && (name.startsWith('1_') || name.startsWith('21_'))) args.push(['--seconds', '10']);
@@ -1533,7 +1533,7 @@ const API_ENDPOINTS = [
     method: 'POST',
     path: '/api/quotes/whole/subscribe',
     desc: '按市场或证券代码列表订阅全推行情，支持 WebSocket 行情回调；通用模式由 ctypes 单桥转发，高级模式由普通 QMT 桥接转发。',
-    defaults: { channel: 'normal', markets: 'SH,SZ', timeout: String(API_DEBUG_QMT_TIMEOUT_SECONDS) },
+    defaults: { channel: 'normal', markets: 'SH,SZ,BJ', timeout: String(API_DEBUG_QMT_TIMEOUT_SECONDS) },
     fields: ['bridge_id', 'whole_quote_channel', 'markets', 'timeout'],
   },
   {
@@ -6588,11 +6588,11 @@ async function runProjectGithubUpdateFromUi(options = {}) {
   }
   const versionInfo = state.versionInfo || {};
   const remoteInfo = versionInfo.remote || {};
-  let confirmText = '确认更新到官网最新版本？更新前会先创建完整回退点，更新期间网页新委托会暂时锁定；请先停止 QMT 入口脚本，并确认当前不在交易时段。本次会同时更新控制台、本地服务和已绑定 QMT 核心，完成后需要完全退出并重启 QMT。';
+  let confirmText = '确认更新到官网最新版本？更新前会先创建完整回退点，更新期间网页新委托会暂时锁定；系统会先关闭已绑定且正在运行的 QMT，并确认当前不在交易时段。本次会同时更新控制台、本地服务和已绑定 QMT 核心，完成后需要完全退出并重启 QMT。';
   if (versionInfo.comparison === 'older') {
-    confirmText = '当前版本显示比官网版本更新，继续会先创建完整回退点，再用官网当前版本覆盖完整项目和已绑定 QMT 核心。更新期间网页新委托会暂时锁定；请先停止 QMT 入口脚本。确认继续？';
+    confirmText = '当前版本显示比官网版本更新，继续会先创建完整回退点，再用官网当前版本覆盖完整项目和已绑定 QMT 核心。更新期间网页新委托会暂时锁定；系统会先关闭已绑定且正在运行的 QMT。确认继续？';
   } else if (remoteInfo.error) {
-    confirmText = `当前版本探测失败：${remoteInfo.error}\n仍要尝试从官网优先源更新完整版本吗？更新前会先创建完整回退点，更新期间网页新委托会暂时锁定；请先停止 QMT 入口脚本。`;
+    confirmText = `当前版本探测失败：${remoteInfo.error}\n仍要尝试从官网优先源更新完整版本吗？更新前会先创建完整回退点，更新期间网页新委托会暂时锁定；系统会先关闭已绑定且正在运行的 QMT。`;
   }
   const confirmed = await showUpdateConfirm(confirmText, '确认完整版本更新', '开始更新');
   if (!confirmed) return;
@@ -6647,7 +6647,7 @@ async function uploadProjectZipUpdateFromUi() {
     log('未选择完整版本 zip 文件，无法更新');
     return;
   }
-  const confirmed = await showUpdateConfirm('确认使用该 zip 更新完整版本？更新前会先创建完整回退点，更新期间网页新委托会暂时锁定；请先停止 QMT 入口脚本，并在非交易时段操作。完成后会重启 Web 和 LTtx。', '确认完整版本更新', '上传并更新');
+  const confirmed = await showUpdateConfirm('确认使用该 zip 更新完整版本？更新前会先创建完整回退点，更新期间网页新委托会暂时锁定；系统会先关闭已绑定且正在运行的 QMT，并在非交易时段操作。完成后会重启 Web 和 LTtx。', '确认完整版本更新', '上传并更新');
   if (!confirmed) return;
   if (!await ensureUpdateQmtStopped()) return;
   const formData = new FormData();
@@ -7162,7 +7162,7 @@ function setApiDefaults(endpoint, form = $('apiForm')) {
     price_type: '11',
     since: '0',
     limit: '50',
-    markets: 'SH,SZ',
+    markets: 'SH,SZ,BJ',
     quote_subscribe_id: state.quoteSubscribeId || '',
     ...(endpoint.defaults || {}),
   };
@@ -7229,7 +7229,7 @@ function currentApiRequest(endpoint = apiEndpointById(state.apiEndpointId), form
   delete params.credit_order_action;
   if (endpoint.id === 'quote_subscribe_whole') {
     params.channel = 'normal';
-    params.markets = String(params.markets ?? 'SH,SZ')
+    params.markets = String(params.markets ?? 'SH,SZ,BJ')
       .split(/[,，]/)
       .map((item) => item.trim())
       .filter(Boolean);

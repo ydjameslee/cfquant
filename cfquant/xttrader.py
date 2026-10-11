@@ -13,6 +13,7 @@ from .config import get_config
 from .channels import channels_for_bridge, normalize_bridge_id
 from .protocol import new_id
 from .order_meta import positive_order_id, order_dates, normalize_order_ref
+from .order_identity import order_remark_key, prepare_order_remark
 from . import xtconstant
 from .stock_connect import CONNECT_MARKETS, connect_account_type, normalize_connect_order, stock_connect_code
 from .xttype import (
@@ -981,6 +982,7 @@ class XtQuantTrader(object):
         return True
 
     def _register_pending_async_order(self, request):
+        internal_remark = prepare_order_remark(request)
         account = request.get("account") or {}
         record = {
             "seq": request.get("seq"),
@@ -990,6 +992,7 @@ class XtQuantTrader(object):
             "stock_code": str(request.get("stock_code") or "").strip().upper(),
             "strategy_name": str(request.get("strategy_name") or ""),
             "order_remark": str(request.get("order_remark") or ""),
+            "cfquant_order_remark": internal_remark,
             # Synthetic async responses are safe only when both sides carry
             # QMT's complete order identity. Do not derive a day from this PC.
             "trading_day": order_dates(request)["trading_day"],
@@ -1073,6 +1076,7 @@ class XtQuantTrader(object):
             "order_id": order_id,
             "strategy_name": matched.get("strategy_name", ""),
             "order_remark": matched.get("order_remark", ""),
+            "cfquant_order_remark": matched.get("cfquant_order_remark", ""),
             "seq": matched.get("seq"),
         })
 

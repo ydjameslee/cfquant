@@ -11,6 +11,7 @@ not use local files.
 import json
 import re
 import threading
+from .order_identity import is_unique_order_remark, order_remark_key, restore_order_remark
 from .stock_connect import connect_account_type
 import time
 from datetime import date
@@ -80,6 +81,7 @@ def normalize_account_type(value):
         return DEFAULT_ACCOUNT_TYPE
     text = connect_account_type(value)
     aliases = {
+        "1": "FUTURE",
         "2": "STOCK",
         "STOCK": "STOCK",
         "SECURITY": "STOCK",
@@ -96,8 +98,20 @@ def normalize_account_type(value):
         "0": "FUTURE",
         "FUTURE": "FUTURE",
         "FUTURES": "FUTURE",
+        "FUTURE_ACCOUNT": "FUTURE",
+        "3": "CREDIT",
         "CREDIT": "CREDIT",
+        "CREDIT_ACCOUNT": "CREDIT",
         "MARGIN": "CREDIT",
+        "5": "FUTURE_OPTION",
+        "FUTURE_OPTION": "FUTURE_OPTION",
+        "FUTURE_OPTION_ACCOUNT": "FUTURE_OPTION",
+        "FUTUREOPTION": "FUTURE_OPTION",
+        "6": "STOCK_OPTION",
+        "STOCK_OPTION": "STOCK_OPTION",
+        "STOCK_OPTION_ACCOUNT": "STOCK_OPTION",
+        "STOCKOPTION": "STOCK_OPTION",
+        "OPTION": "STOCK_OPTION",
     }
     return aliases.get(text, text)
 
@@ -320,6 +334,9 @@ def split_push_message(raw):
 
 
 def user_order_id_from_data(data):
+    unique_remark = order_remark_key(data) if isinstance(data, dict) else ""
+    if is_unique_order_remark(unique_remark):
+        return normalize_text(unique_remark)
     return normalize_text(
         first_value(
             data,
@@ -333,6 +350,22 @@ def user_order_id_from_data(data):
             ),
         )
     )
+
+
+def _unique_order_remark_identity(data):
+    if not isinstance(data, dict):
+        return "", False
+    values = set()
+    for name in (
+        "cfquant_order_remark", "user_order_id", "client_order_id",
+        "order_remark", "m_strRemark", "m_strOrderRemark", "remark",
+    ):
+        value = normalize_text(data.get(name))
+        if is_unique_order_remark(value):
+            values.add(value)
+    if len(values) != 1:
+        return "", len(values) > 1
+    return next(iter(values)), False
 
 
 def order_ref_from_data(data):
@@ -535,7 +568,7 @@ def apply_record_to_callback(data, record, match_info=None):
     data["cfquant_order_meta_status"] = normalize_text(record.get("status"))
     if match_info and match_info.get("match_confidence"):
         data["cfquant_order_meta_match"] = match_info.get("match_confidence")
-    return data
+    return restore_order_remark(data)
 
 
 def store_entries_for_record(record):
@@ -561,6 +594,7 @@ class OrderMetaCache(object):
         self.by_user = {}
         self.by_ref = {}
         self.pending = []
+        self.ambiguous_user_keys = set()
 
     def _ctx(self, record):
         return (
@@ -637,6 +671,9 @@ class OrderMetaCache(object):
         user_key = self._user_key(record)
         ref_keys = self._ref_keys(record)
         if user_key:
+            prior = self.by_user.get(user_key)
+            if prior is not None and prior is not record and self._user_records_conflict(prior, record):
+                self.ambiguous_user_keys.add(user_key)
             self.by_user[user_key] = record
         for ref_key in ref_keys:
             existing = self.by_ref.get(ref_key, [])
@@ -671,6 +708,7 @@ class OrderMetaCache(object):
             self.by_user = {key: value for key, value in self.by_user.items() if key[:3] != ctx}
             self.by_ref = {key: value for key, value in self.by_ref.items() if key[:3] != ctx}
             self.pending = [record for record in self.pending if self._ctx(record) != ctx]
+            self.ambiguous_user_keys = {key for key in self.ambiguous_user_keys if key[:3] != ctx}
 
     def _remove_locked(self, record):
         user_key = self._user_key(record)
@@ -729,11 +767,22 @@ class OrderMetaCache(object):
         return {"loaded": loaded, "stale": stale}
 
     def resolve_callback(self, data, bridge_id=None, account_type=None, account_id=None, allow_pending=True):
+        callback_uuid, callback_uuid_conflict = _unique_order_remark_identity(data)
+        has_callback_uuid = bool(callback_uuid) or callback_uuid_conflict
+        uuid_scope = self._authoritative_uuid_scope(
+            data, bridge_id=bridge_id, account_type=account_type, account_id=account_id,
+        ) if callback_uuid else None
+        callback_day = order_dates(data).get("trading_day") if callback_uuid else ""
+        callback_ref = self._authoritative_qmt_ref(data) if callback_uuid else ""
+        valid_uuid_identity = bool(callback_uuid and uuid_scope and callback_day and callback_ref)
+        normalized_bridge = uuid_scope[0] if uuid_scope else (bridge_id or self.bridge_id)
+        normalized_account_type = uuid_scope[1] if uuid_scope else (account_type or data.get("account_type"))
+        normalized_account_id = uuid_scope[2] if uuid_scope else (account_id or data.get("account_id"))
         callback_record = normalize_record(
             data,
-            bridge_id=bridge_id or self.bridge_id,
-            account_type=account_type or data.get("account_type"),
-            account_id=account_id or data.get("account_id"),
+            bridge_id=normalized_bridge,
+            account_type=normalized_account_type,
+            account_id=normalized_account_id,
         )
         with self.lock:
             record = None
@@ -754,8 +803,46 @@ class OrderMetaCache(object):
                             seen.add(ident)
                             candidates.append(candidate)
                 if len(candidates) == 1:
-                    record = candidates[0]
-                    confidence = "order_ref"
+                    candidate = candidates[0]
+                    if not has_callback_uuid:
+                        record = candidate
+                        confidence = "order_ref"
+                    else:
+                        user_key = uuid_scope + (callback_uuid,) if uuid_scope else None
+                        candidate_uuid, candidate_uuid_conflict = _unique_order_remark_identity(candidate)
+                        if (
+                            valid_uuid_identity
+                            and user_key
+                            and user_key not in self.ambiguous_user_keys
+                            and not candidate_uuid_conflict
+                            and is_unique_order_remark(candidate_uuid)
+                            and candidate_uuid == callback_uuid
+                            and self._user_key(candidate) == user_key
+                        ):
+                            record = candidate
+                            confidence = "order_ref"
+
+            if record is None and valid_uuid_identity and ref_keys and allow_pending:
+                user_key = uuid_scope + (callback_uuid,)
+                candidate = self.by_user.get(user_key)
+                candidate_day = normalize_date(candidate.get("trading_day")) if candidate else ""
+                candidate_refs = typed_order_ref_candidates_from_data(candidate) if candidate else []
+                if (
+                    candidate is not None
+                    and user_key not in self.ambiguous_user_keys
+                    and callback_day
+                    and callback_ref
+                    and not candidates
+                    and not candidate_refs
+                    and (not candidate_day or candidate_day == callback_day)
+                    and not self._callback_bound(candidate)
+                    and normalize_text(candidate.get("status")).lower() == "pending"
+                ):
+                    record = candidate
+                    confidence = "unique_order_remark"
+                    record["trading_day"] = callback_day
+                    record["m_strTradingDay"] = callback_day
+                    record["m_nRef"] = data.get("m_nRef")
 
             bound_order_ref = ""
             bound_order_refs = []
@@ -769,7 +856,7 @@ class OrderMetaCache(object):
                     record["m_strOrderRef"] = order_refs[0]
                 elif is_empty(record.get("m_strOrderRef")):
                     record["m_strOrderRef"] = normalize_order_ref(record.get("order_ref"))
-                if confidence in ("pending_fifo", "order_ref", "user_order_id"):
+                if confidence in ("pending_fifo", "order_ref", "user_order_id", "unique_order_remark"):
                     record["status"] = "callback_bound"
                     record["callback_bound_at"] = time.time()
                 record["updated_at"] = time.time()
@@ -781,6 +868,80 @@ class OrderMetaCache(object):
                 "bound_order_refs": bound_order_refs,
                 "match_confidence": confidence,
             }
+
+    @staticmethod
+    def _trusted_scope_value(data, names, explicit, normalizer):
+        values = []
+        if isinstance(data, dict):
+            values.extend(data.get(name) for name in names if not is_empty(data.get(name)))
+        if not is_empty(explicit):
+            values.append(explicit)
+        if not values:
+            return ""
+        normalized = [normalizer(value) for value in values]
+        if not all(normalized) or len(set(normalized)) != 1:
+            return ""
+        return normalized[0]
+
+    def _authoritative_uuid_scope(self, data, bridge_id=None, account_type=None, account_id=None):
+        bridge = self._trusted_scope_value(data, ("bridge_id",), bridge_id, normalize_bridge_id)
+        acc_type = self._trusted_scope_value(
+            data,
+            ("account_type", "m_nAccountType", "accountType", "m_nBrokerType", "broker_type", "m_strAccountType"),
+            account_type,
+            normalize_account_type,
+        )
+        acc_id = self._trusted_scope_value(
+            data, ("account_id", "m_strAccountID", "accountID"), account_id, normalize_text,
+        )
+        if not bridge or not acc_type or not acc_id:
+            return None
+        return bridge, acc_type, acc_id
+
+    @staticmethod
+    def _authoritative_qmt_ref(data):
+        qmt_ref = qmt_ref_from_data(data)
+        if not qmt_ref:
+            return ""
+        internal_refs = {
+            value for kind, value in typed_order_ref_candidates_from_data(data)
+            if kind == "internal"
+        }
+        if internal_refs != {qmt_ref}:
+            return ""
+        return qmt_ref
+
+    @staticmethod
+    def _user_records_conflict(left, right):
+        left_day = normalize_date(left.get("trading_day"))
+        right_day = normalize_date(right.get("trading_day"))
+        if left_day and right_day and left_day != right_day:
+            return True
+
+        left_refs = {}
+        right_refs = {}
+        for kind, value in typed_order_ref_candidates_from_data(left):
+            left_refs.setdefault(kind, set()).add(value)
+        for kind, value in typed_order_ref_candidates_from_data(right):
+            right_refs.setdefault(kind, set()).add(value)
+        for kind in set(left_refs).intersection(right_refs):
+            if left_refs[kind].isdisjoint(right_refs[kind]):
+                return True
+
+        fields = ("request_id", "stock_code", "order_type", "order_volume", "price")
+        for name in fields:
+            left_value = left.get(name)
+            right_value = right.get(name)
+            if not is_empty(left_value) and not is_empty(right_value):
+                if name == "stock_code":
+                    if stock_code_base(left_value) != stock_code_base(right_value):
+                        return True
+                elif normalize_text(left_value) != normalize_text(right_value):
+                    return True
+
+        left_order_id = canonical_order_id_from_record(left)
+        right_order_id = canonical_order_id_from_record(right)
+        return bool(left_order_id and right_order_id and left_order_id != right_order_id)
 
     def _unique_records_locked(self):
         records = []

@@ -23,7 +23,10 @@ MODE_ALIASES = {
     "ctypes": "ctypes", "pipe": "ctypes", "named_pipe": "ctypes",
     "lite": "lite", "extreme": "lite", "extreme_lite": "lite",
     "lite_extreme": "lite", "ultimate": "lite",
+    "lite_extreme_pipe": "lite", "extreme_pipe": "lite", "cfquant_lite": "lite",
+    "named-pipe": "ctypes", "universal": "ctypes", "universal_ctypes": "ctypes",
     "lttx": "lttx", "socket": "lttx", "normal": "lttx",
+    "default": "lttx",
 }
 LEGACY_NAMES = {Path(name).stem for name in SCRIPTS.values()} | {"CFQUANT_TRADE_LOWLAT"}
 LEGACY_NAMES |= {name + "_" + market for name in tuple(LEGACY_NAMES) for market in ("SH", "SZ")}
@@ -76,6 +79,39 @@ def normalize_strategy_mode(value):
 def _canonical_account_type(value):
     value = str(value or "STOCK").strip().upper()
     return ACCOUNT_TYPE_ALIASES.get(value, value)
+
+
+def entry_script_for_mode(mode, role="normal", market=""):
+    """One mapping for raw copies and the packages QMT actually imports."""
+    mode = normalize_strategy_mode(mode)
+    market = str(market or "").strip().upper()
+    if market and market not in ("SH", "SZ"):
+        raise ValueError("unknown QMT entry market: %s" % market)
+    filename = SCRIPTS[mode]
+    if mode == "lttx" and (role != "normal" or market):
+        filename = "CFQUANT_TRADE_LOWLAT.py"
+    if market:
+        return "同账号独立市场/%s_%s.py" % (Path(filename).stem, market)
+    return filename
+
+
+def read_entry_source(path):
+    """Reject a generic entry accidentally saved under a Lite filename."""
+    path = Path(path)
+    with tokenize.open(str(path)) as stream:
+        source = stream.read()
+    if path.stem.startswith("CFQUANT_LITE"):
+        tree = ast.parse(source)
+        constants = {target.id for node in tree.body if isinstance(node, ast.Assign)
+                     for target in node.targets if isinstance(target, ast.Name)}
+        imports_core = any(
+            (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "cfquant")
+            or (isinstance(node, ast.Import) and any(alias.name.split(".")[0] == "cfquant"
+                                                    for alias in node.names))
+            for node in ast.walk(tree))
+        if "LITE_ENTRY_VERSION" not in constants or imports_core:
+            raise ValueError("极致模式入口内容不匹配，拒绝部署通用模式代码: %s" % path)
+    return source
 
 
 def qmt_root(directory, validate=False):
@@ -291,8 +327,7 @@ def _resolve_account_binding(root, document, account_id, account_type, supplied=
 
 
 def managed_source(source_path, identity_path, identity, descriptor):
-    with tokenize.open(str(source_path)) as stream:
-        source = stream.read()
+    source = read_entry_source(source_path)
     lines = source.splitlines(keepends=True)
     tree = ast.parse(source)
     replacements = []
@@ -470,12 +505,13 @@ class QmtStrategyManager:
                 result.update(error=self.load_error, message=self.load_error)
             return result
 
-    def configure(self, row, identities, force=False):
+    def configure(self, row, identities, force=False, scripts_dir=None):
         if self.load_error:
             raise ValueError(self.load_error)
         settings = normalize_strategy_settings(row.get("qmt_strategy"))
         mode = normalize_strategy_mode(row.get("mode"))
         enabled = row.get("enabled", True) and settings["enabled"]
+        scripts_dir = Path(scripts_dir) if scripts_dir is not None else self.scripts_dir
         with self.lock:
             wanted = set()
             grouped = {}
@@ -493,14 +529,11 @@ class QmtStrategyManager:
                                         "account_key": row["account_key"]}])
                     market = info.get("market") or identity.get("market") or ""
                     role = market or info.get("qmt_role") or "normal"
-                    filename = SCRIPTS[mode]
-                    if mode == "lttx" and role != "normal":
-                        filename = "CFQUANT_TRADE_LOWLAT.py"
-                    source_path = self.scripts_dir / filename
-                    if market:
-                        source_path = self.scripts_dir / "同账号独立市场" / (Path(filename).stem + "_" + market + ".py")
+                    filename = entry_script_for_mode(mode, role, market)
+                    source_path = scripts_dir / filename
                     if not source_path.is_file():
                         raise ValueError("QMT 内置脚本不存在: %s" % source_path)
+                    read_entry_source(source_path)
                     for key in ("updated_at", "updated_at_text"):
                         identity.pop(key, None)
                     group_key = _digest([os.path.normcase(str(root)), row["account_id"],
@@ -513,7 +546,7 @@ class QmtStrategyManager:
                         # control/lease identity when adding another account type.
                         group_key = legacy_key
                     grouped.setdefault(group_key, {"root": str(root), "roles": []})["roles"].append({
-                        "role": role, "source": str(source_path), "identity": identity,
+                        "role": role, "source": str(source_path), "entry_script": filename, "identity": identity,
                         "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
                         "account_key": settings["account_keys"].get(role, "")})
                 if not grouped:

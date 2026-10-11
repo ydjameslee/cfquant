@@ -169,6 +169,7 @@ def _lite_normalize_account_type(value):
         return "STOCK"
     text = connect_account_type(value)
     aliases = {
+        "1": "FUTURE",
         "2": "STOCK",
         "STOCK": "STOCK",
         "SECURITY": "STOCK",
@@ -185,11 +186,79 @@ def _lite_normalize_account_type(value):
         "0": "FUTURE",
         "FUTURE": "FUTURE",
         "FUTURES": "FUTURE",
+        "FUTURE_ACCOUNT": "FUTURE",
+        "3": "CREDIT",
         "CREDIT": "CREDIT",
+        "CREDIT_ACCOUNT": "CREDIT",
         "MARGIN": "CREDIT",
+        "5": "FUTURE_OPTION",
+        "FUTURE_OPTION": "FUTURE_OPTION",
+        "FUTURE_OPTION_ACCOUNT": "FUTURE_OPTION",
+        "FUTUREOPTION": "FUTURE_OPTION",
+        "6": "STOCK_OPTION",
+        "STOCK_OPTION": "STOCK_OPTION",
+        "STOCK_OPTION_ACCOUNT": "STOCK_OPTION",
+        "STOCKOPTION": "STOCK_OPTION",
+        "OPTION": "STOCK_OPTION",
     }
     return aliases.get(text, text)
 
+
+"""Per-submission QMT remarks, compatible with embedded Python 3.6.
+
+The public remark is user data, never a unique order key. Keep a UUID in the
+native remark so independent QMT processes and restarts can recover both.
+"""
+
+import re
+import uuid
+
+
+_ORDER_REMARK_SUFFIX = re.compile(r"__cfq_([0-9a-f]{32})$")
+
+
+def original_order_remark(value):
+    text = str(value or "")
+    match = _ORDER_REMARK_SUFFIX.search(text)
+    return text[:match.start()] if match else text
+
+
+def is_unique_order_remark(value):
+    return bool(_ORDER_REMARK_SUFFIX.search(str(value or "")))
+
+
+def prepare_order_remark(params, fallback=""):
+    original = next((params[name] for name in ("order_remark", "remark", "strategy_name")
+                     if params.get(name) not in (None, "")), "")
+    original = str(original or "")
+    internal = params.get("cfquant_order_remark")
+    if not (is_unique_order_remark(internal) and
+            original_order_remark(internal) in (original, original or str(fallback or ""))):
+        original = original or str(fallback or "")
+        internal = original + "__cfq_" + uuid.uuid4().hex
+    params["cfquant_order_remark"] = internal
+    return internal
+
+
+def order_remark_key(data):
+    getter = data.get if isinstance(data, dict) else lambda name: getattr(data, name, None)
+    values = [getter(name) for name in (
+        "cfquant_order_remark", "user_order_id", "client_order_id",
+        "order_remark", "m_strRemark", "m_strOrderRemark", "remark",
+    )]
+    for value in values:
+        if is_unique_order_remark(value):
+            return str(value)
+    return next((str(value) for value in values if value not in (None, "")), "")
+
+
+def restore_order_remark(data):
+    if isinstance(data, dict):
+        internal = order_remark_key(data)
+        if is_unique_order_remark(internal):
+            data["cfquant_order_remark"] = internal
+            data["order_remark"] = original_order_remark(internal)
+    return data
 
 """Batch wire contract and QMT execution, compatible with embedded Python 3.6."""
 
@@ -207,7 +276,7 @@ CFTRADER_BATCH_CANCEL_ACTIONS = frozenset((
 ))
 CFTRADER_BATCH_ACTIONS = frozenset(tuple(CFTRADER_BATCH_ORDER_ACTIONS) + tuple(CFTRADER_BATCH_CANCEL_ACTIONS))
 _BATCH_ORDER_FIELDS = {"stock_code", "order_type", "order_volume", "price_type", "price",
-                       "strategy_name", "order_remark"}
+                       "strategy_name", "order_remark", "cfquant_order_remark"}
 _BATCH_REQUIRED_FIELDS = {"stock_code", "order_type", "order_volume", "price_type", "price"}
 _BATCH_CANCEL_FIELDS = {"order_id", "stock_code", "market", "order_remark"}
 
@@ -265,10 +334,12 @@ def prepare_batch_orders(orders, batch_id, strategy_name="", order_remark="", st
             if not isinstance(row[name], str):
                 raise ValueError("%s.%s must be a string" % (label, name))
         row["order_remark"] = row["order_remark"] or "%s_%s" % (order_remark or batch_id, index + 1)
-        # QMT callbacks can omit the exchange suffix from instrument codes.
-        correlation = (row["stock_code"].upper().split(".", 1)[0], row["order_remark"])
+        # Preserve a distinct wire identity for every row, even with repeated
+        # user remarks. Reject an explicitly reused internal identity.
+        internal = prepare_order_remark(row)
+        correlation = (row["stock_code"].upper().split(".", 1)[0], internal)
         if correlation in correlations:
-            raise ValueError("%s repeats stock_code and order_remark; use distinct remarks" % label)
+            raise ValueError("%s repeats an internal order identity" % label)
         correlations.add(correlation)
         rows.append(row)
     return rows
@@ -501,6 +572,7 @@ def execute_qmt_batch(bridge, params, msg, asynchronous):
                 capture_previous_id=False,
                 trust_request_order_id=not asynchronous,
             )
+            row["cfquant_order_remark"] = order_remark_key(native) or order_remark_key(request)
             if bridge._is_failed_order_result(native.get("request_result")):
                 row.update(status="failed", ok=False, error="QMT rejected the order request")
             elif asynchronous:
@@ -578,10 +650,10 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
             if not batch_positive_id(order_id) or order_id in before_ids:
                 continue
             code = str(bridge._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper().split(".", 1)[0]
-            remark = str(bridge._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+            remark = order_remark_key(order)
             matches.setdefault((code, remark), set()).add(order_id)
         for row in list(pending):
-            ids = matches.get((row["stock_code"].upper().split(".", 1)[0], row["order_remark"]), set())
+            ids = matches.get((row["stock_code"].upper().split(".", 1)[0], order_remark_key(row)), set())
             if len(ids) == 1:
                 row.update(status="submitted", ok=True, order_id=next(iter(ids)), error="")
                 pending.remove(row)
@@ -591,7 +663,7 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.45"
+CORE_VERSION = "0.2.48"
 LITE_ENTRY_VERSION = "lite_20260828_01"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
@@ -2675,11 +2747,7 @@ class TxTradeBridge(object):
         if not account_id:
             raise ValueError("account_id is required")
         price_type = params.get("price_type", 11)
-        order_remark = self._first_param(
-            params,
-            ("order_remark", "remark", "strategy_name"),
-            msg.get("id", "tx_order"),
-        )
+        order_remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy_name = params.get("strategy_name", "")
         previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) if capture_previous_id else None
         pending_sync_order = None
@@ -2756,7 +2824,8 @@ class TxTradeBridge(object):
         return {
             "request_result": result,
             "order_id": order_id if order_id is not None else -1,
-            "order_remark": order_remark,
+            "order_remark": original_order_remark(order_remark),
+            "cfquant_order_remark": order_remark,
             "order_type": order_type,
             "account_type": str(account_type or "").upper(),
             "previous_order_id": previous_order_id,
@@ -2805,7 +2874,7 @@ class TxTradeBridge(object):
         if not isinstance(order, dict):
             return False
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+        order_remark = order_remark_key(order)
         strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_base = stock_code.split(".", 1)[0]
@@ -2947,7 +3016,7 @@ class TxTradeBridge(object):
                     if pending_sync_order is not None else None
                 )
                 for order in orders or []:
-                    if str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "") != str(order_remark or ""):
+                    if order_remark_key(order) != str(order_remark or ""):
                         continue
                     stock_code = str(params.get("stock_code", params.get("code", "")) or "").upper()
                     candidate_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
@@ -3055,7 +3124,7 @@ class TxTradeBridge(object):
             ).upper(),
             "stock_code": str(params.get("stock_code", params.get("code", "")) or "").upper(),
             "strategy_name": params.get("strategy_name", ""),
-            "order_remark": result.get("order_remark", params.get("order_remark", "")),
+            "order_remark": order_remark_key(result) or order_remark_key(params),
             "previous_order_id": result.get("previous_order_id"),
             "created_at": time.time(),
         }
@@ -3089,7 +3158,7 @@ class TxTradeBridge(object):
         key = (
             str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip(),
             str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
-            str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or ""),
+            order_remark_key(order),
         )
         with self.order_request_metadata_lock:
             metadata = self.order_request_metadata.get(key)
@@ -3110,6 +3179,8 @@ class TxTradeBridge(object):
                     matches = []
                     for candidate_key, candidate in self.order_request_metadata.items():
                         if candidate_key[0] != key[0]:
+                            continue
+                        if key[2] and is_unique_order_remark(candidate_key[2]) and candidate_key[2] != key[2]:
                             continue
                         if key[1] and candidate_key[1] and key[1] != candidate_key[1]:
                             continue
@@ -3143,7 +3214,8 @@ class TxTradeBridge(object):
             for name in ("m_strRemark", "m_strOrderRemark"):
                 if not order.get(name):
                     order[name] = order_remark
-        if order_id is not None:
+        if order_id is not None and (is_unique_order_remark(key[2]) or
+                                    order_id == self._order_id_from_detail(order)):
             current_order_id = self._normalize_order_id(order.get("order_id"))
             if current_order_id is not None and current_order_id != order_id:
                 order["cfquant_callback_order_id"] = order.get("order_id")
@@ -3155,7 +3227,7 @@ class TxTradeBridge(object):
             for name in ("m_strOrderRef", "m_strOrderID"):
                 if order.get(name) is None or str(order.get(name)).strip() in ("", "0", "-1"):
                     order[name] = str(order_id)
-        return order
+        return restore_order_remark(order)
     def _prune_pending_async_orders_locked(self):
         wait_seconds = os.environ.get("CFQUANT_ASYNC_ORDER_RESPONSE_WAIT_SECONDS", 60.0)
         try:
@@ -3173,7 +3245,7 @@ class TxTradeBridge(object):
         if order_id is None:
             return None
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+        order_remark = order_remark_key(order)
         strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_code_base = stock_code.split(".", 1)[0]
@@ -3186,6 +3258,8 @@ class TxTradeBridge(object):
                     continue
                 expected_remark = str(item.get("order_remark") or "")
                 expected_strategy = str(item.get("strategy_name") or "")
+                if is_unique_order_remark(expected_remark) and order_remark != expected_remark:
+                    continue
                 if order_remark and expected_remark and order_remark != expected_remark:
                     continue
                 if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
@@ -3221,6 +3295,7 @@ class TxTradeBridge(object):
             order_id=order_id,
         )
         self._send_async_order_response(record, order_id)
+        restore_order_remark(order)
         return True
 
     def _send_async_order_response(self, record, order_id):
@@ -3232,7 +3307,7 @@ class TxTradeBridge(object):
             "order_remark": record.get("order_remark", ""),
             "seq": record.get("seq"),
         }
-        self._send_trader_event(record.get("client_id"), "on_order_stock_async_response", data)
+        self._send_trader_event(record.get("client_id"), "on_order_stock_async_response", restore_order_remark(data))
 
     def _order_stock_batch(self, params, msg):
         orders = params.get("orders") or []
@@ -4667,8 +4742,8 @@ class TxTradeBridge(object):
         base_dir = os.getcwd()
         log_dir = (
             os.environ.get("CFQUANT_QMT_LOG_DIR")
-            or os.environ.get("CFQUANT_LOG_DIR")
-            or os.path.join(base_dir, "log")
+            or (os.path.join(os.environ.get("CFQUANT_LOG_DIR"), "qmt_bridge") if os.environ.get("CFQUANT_LOG_DIR") else "")
+            or os.path.join(base_dir, "log", "qmt_bridge")
         )
         log_dir = os.path.abspath(log_dir)
         try:
@@ -5047,7 +5122,7 @@ class NormalQmtBridge(TxTradeBridge):
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        remark = self._first_param(params, ("order_remark", "remark", "strategy_name"), msg.get("id", "tx_order"))
+        remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy = params.get("strategy_name", "")
         try:
             wait = max(0.0, float(params.get("find_order_wait", os.environ.get("CFQUANT_ORDER_ID_WAIT_SECONDS", 2.0)) or 0))
@@ -6543,7 +6618,7 @@ def _runtime_log_path():
     try:
         base_dir = _entry_base_dir()
         parent_dir = os.path.dirname(base_dir)
-        configured = os.environ.get("CFQUANT_QMT_LOG_DIR") or os.environ.get("CFQUANT_LOG_DIR")
+        configured = os.environ.get("CFQUANT_QMT_LOG_DIR") or (os.path.join(os.environ.get("CFQUANT_LOG_DIR"), "qmt_bridge") if os.environ.get("CFQUANT_LOG_DIR") else "")
         if configured:
             candidates = [configured]
         elif os.path.basename(base_dir).lower() == "python":

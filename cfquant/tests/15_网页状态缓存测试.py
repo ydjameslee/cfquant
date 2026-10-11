@@ -369,6 +369,72 @@ def test_auto_deploy_local_core_skips_when_target_matches(tmp_path):
     assert not (tmp_path / "QMT" / "bin.x64" / ".cfquant_updates").exists()
 
 
+def test_local_entry_sync_overwrites_bound_qmt_python_script(tmp_path):
+    source = tmp_path / "source"
+    (source / "qmt_scripts").mkdir(parents=True)
+    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(b'LITE_ENTRY_VERSION = "test"\n')
+    qmt_root = tmp_path / "QMT"
+    (qmt_root / "bin.x64").mkdir(parents=True)
+    (qmt_root / "python").mkdir()
+    entry = qmt_root / "python" / "CFQUANT_LITE.py"
+    entry.write_bytes(b"old-entry\n")
+
+    updater = web.CfquantUpdater(None)
+    result = updater.install_local_entry_script_to_qmt_dir(
+        str(qmt_root),
+        "CFQUANT_LITE.py",
+        bridge_id="demo",
+        qmt_role="normal",
+        source_dir=str(source),
+    )
+
+    assert result["updated"] is True
+    assert entry.read_bytes() == b'LITE_ENTRY_VERSION = "test"\n'
+    assert result["entry_file"] == str(entry)
+    assert result["backup"]
+    assert (qmt_root / "bin.x64" / ".cfquant_updates" / "entry_backups").is_dir()
+
+
+def test_auto_deploy_project_update_copies_bound_mode_entry(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source_core = source / "cfquant"
+    source_core.mkdir(parents=True)
+    for name in ("__init__.py", "client.py", "protocol.py"):
+        (source_core / name).write_text("# source\n", encoding="utf-8")
+    (source / "qmt_scripts").mkdir()
+    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(b'LITE_ENTRY_VERSION = "latest"\n')
+
+    qmt_root = tmp_path / "QMT"
+    target_core = qmt_root / "bin.x64" / "cfquant"
+    target_core.mkdir(parents=True)
+    for name in ("__init__.py", "client.py", "protocol.py"):
+        (target_core / name).write_text("# old\n", encoding="utf-8")
+    (qmt_root / "python").mkdir()
+    (qmt_root / "python" / "CFQUANT_LITE.py").write_bytes(b"old-lite\n")
+
+    row = {"account_key": "demo", "enabled": True, "mode": "lite", "qmt_dir": str(qmt_root)}
+    monkeypatch.setattr(web, "WEB_CONFIG", type("Config", (), {"account_configs": lambda self: {"demo": row}})())
+    monkeypatch.setattr(web, "UPDATER", web.CfquantUpdater(None))
+    monkeypatch.setattr(web, "sync_qmt_bridge_identities", lambda: [])
+
+    result = web.auto_deploy_qmt_core_for_all_accounts(
+        source_dir=str(source), sync_entry_scripts=True,
+    )
+
+    assert result["summary"]["ok"] is True
+    assert result["summary"]["entry_updated_count"] == 1
+    assert (qmt_root / "python" / "CFQUANT_LITE.py").read_bytes() == b'LITE_ENTRY_VERSION = "latest"\n'
+    assert result["results"][0]["entry_script"] == "CFQUANT_LITE.py"
+
+
+def test_qmt_entry_script_mapping_follows_binding_mode_and_market():
+    assert web.qmt_entry_script_name_for_target("lite") == "CFQUANT_LITE.py"
+    assert web.qmt_entry_script_name_for_target("lttx", "trade") == "CFQUANT_TRADE_LOWLAT.py"
+    assert web.qmt_entry_script_name_for_target("lite", "market_SH", "SH").endswith(
+        "CFQUANT_LITE_SH.py"
+    )
+
+
 def test_powershell_process_detail_timeout_is_nonfatal(monkeypatch):
     monkeypatch.setattr(web.os, "name", "nt")
     monkeypatch.setattr(web, "psutil", None)

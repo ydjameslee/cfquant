@@ -87,6 +87,8 @@ def _path(value):
 
 
 def _apply_web_environment(args):
+    if getattr(args, "auto_start_qmt", None) is not None:
+        os.environ["CFQUANT_QMT_AUTO_START"] = str(int(args.auto_start_qmt))
     mappings = (
         ("home", "CFQUANT_HOME"),
         ("runtime_dir", "CFQUANT_RUNTIME_DIR"),
@@ -143,6 +145,12 @@ def _serve_parser(prog="cfquant"):
     parser.add_argument("--lttx-port", type=_port, help="LTtx 端口。默认 2049。")
     parser.add_argument("--account-id", help="Web 初始化完成前使用的默认资金账号。")
     parser.add_argument("--open-browser", action="store_true", help="服务就绪后自动打开浏览器。")
+    qmt_start = parser.add_mutually_exclusive_group()
+    qmt_start.add_argument("--auto-start-qmt", dest="auto_start_qmt", action="store_true",
+                           help="自动启动已启用绑定的 QMT。")
+    qmt_start.add_argument("--no-auto-start-qmt", dest="auto_start_qmt", action="store_false",
+                           help="禁止自动启动和定时重启 QMT，由用户手动启动。")
+    parser.set_defaults(auto_start_qmt=None)
     parser.add_argument("--dry-run", action="store_true", help="只打印启动参数，不启动服务。")
     parser.add_argument("--version", action="version", version=_version_text())
     return parser

@@ -211,10 +211,11 @@ class _ConnectContext:
 
 
 def test_connect_sync_order_id_resolves_when_qmt_omits_strategy_token():
+    native = []
     bridge = TxTradeBridge(_ConnectContext(), show=False, globals_dict={
-        "passorder": lambda *args: None,
+        "passorder": lambda *args: native.append(args),
         "get_instrument_detail": lambda code: {"VolumeMultiple": 200, "PriceTick": 0.001},
-        "get_trade_detail_data": lambda *args: [_connect_order_row()],
+        "get_trade_detail_data": lambda *args: [_connect_order_row(m_strRemark=native[-1][9])],
     })
     bridge._log = lambda msg: None
     try:

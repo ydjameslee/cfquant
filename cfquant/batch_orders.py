@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping
 from numbers import Integral, Real
 from .stock_connect import normalize_connect_code, validate_connect_market
+from .order_identity import prepare_order_remark, order_remark_key
 
 
 CFTRADER_BATCH_ORDER_ACTIONS = frozenset(("cftrader.order_stock_batch", "cftrader.order_stock_batch_async"))
@@ -15,7 +16,7 @@ CFTRADER_BATCH_CANCEL_ACTIONS = frozenset((
 ))
 CFTRADER_BATCH_ACTIONS = frozenset(tuple(CFTRADER_BATCH_ORDER_ACTIONS) + tuple(CFTRADER_BATCH_CANCEL_ACTIONS))
 _BATCH_ORDER_FIELDS = {"stock_code", "order_type", "order_volume", "price_type", "price",
-                       "strategy_name", "order_remark"}
+                       "strategy_name", "order_remark", "cfquant_order_remark"}
 _BATCH_REQUIRED_FIELDS = {"stock_code", "order_type", "order_volume", "price_type", "price"}
 _BATCH_CANCEL_FIELDS = {"order_id", "stock_code", "market", "order_remark"}
 
@@ -73,10 +74,12 @@ def prepare_batch_orders(orders, batch_id, strategy_name="", order_remark="", st
             if not isinstance(row[name], str):
                 raise ValueError("%s.%s must be a string" % (label, name))
         row["order_remark"] = row["order_remark"] or "%s_%s" % (order_remark or batch_id, index + 1)
-        # QMT callbacks can omit the exchange suffix from instrument codes.
-        correlation = (row["stock_code"].upper().split(".", 1)[0], row["order_remark"])
+        # Preserve a distinct wire identity for every row, even with repeated
+        # user remarks. Reject an explicitly reused internal identity.
+        internal = prepare_order_remark(row)
+        correlation = (row["stock_code"].upper().split(".", 1)[0], internal)
         if correlation in correlations:
-            raise ValueError("%s repeats stock_code and order_remark; use distinct remarks" % label)
+            raise ValueError("%s repeats an internal order identity" % label)
         correlations.add(correlation)
         rows.append(row)
     return rows
@@ -309,6 +312,7 @@ def execute_qmt_batch(bridge, params, msg, asynchronous):
                 capture_previous_id=False,
                 trust_request_order_id=not asynchronous,
             )
+            row["cfquant_order_remark"] = order_remark_key(native) or order_remark_key(request)
             if bridge._is_failed_order_result(native.get("request_result")):
                 row.update(status="failed", ok=False, error="QMT rejected the order request")
             elif asynchronous:
@@ -386,10 +390,10 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
             if not batch_positive_id(order_id) or order_id in before_ids:
                 continue
             code = str(bridge._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper().split(".", 1)[0]
-            remark = str(bridge._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+            remark = order_remark_key(order)
             matches.setdefault((code, remark), set()).add(order_id)
         for row in list(pending):
-            ids = matches.get((row["stock_code"].upper().split(".", 1)[0], row["order_remark"]), set())
+            ids = matches.get((row["stock_code"].upper().split(".", 1)[0], order_remark_key(row)), set())
             if len(ids) == 1:
                 row.update(status="submitted", ok=True, order_id=next(iter(ids)), error="")
                 pending.remove(row)
