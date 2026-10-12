@@ -437,6 +437,22 @@ class QmtStrategyManager:
                 changed = True
         return changed
 
+    def _deployment_error(self, job, error):
+        retry_count = int(job.get("deploy_retry_count") or 0) + 1
+        job["deploy_retry_count"] = retry_count
+        job["deploy_retry_after"] = time.time() + min(10.0, 2.0 * retry_count)
+        detail = str(error).strip()
+        if not detail:
+            trace = traceback.format_exc().strip().splitlines()
+            frames = [line.strip() for line in trace if line.strip().startswith("File ")]
+            location = frames[-1] if frames else ""
+            detail = "%s (%s)" % (type(error).__name__, location or repr(error))
+        if retry_count < 5:
+            detail = "部署写入暂时失败（第 %d/5 次），系统将自动重试：%s" % (retry_count, detail)
+        else:
+            detail = "部署连续失败 5 次，请关闭 QMT 并检查目录权限后重新保存：%s" % detail
+        self._state(job, "error", detail)
+
     def _prepare_generation_transition(self, job, previous=None):
         """Keep old same-name containers valid until the replacement starts."""
         if not job.get("enabled"):
@@ -679,11 +695,16 @@ class QmtStrategyManager:
                     job["enabled"] = False
                     self._clear_generation_transition(job)
                     self._state(job, "waiting_exit")
-                    self._control(job)
                     changed = True
                 elif job.get("enabled") and self._prepare_generation_transition(job):
                     changed = True
-                self._control(job)
+                try:
+                    self._control(job)
+                except OSError as error:
+                    # Reconcile runs before the worker starts. A single locked
+                    # control file must not prevent Web startup and recovery.
+                    self._deployment_error(job, error)
+                    changed = True
             for key in list(self.errors):
                 if key not in accounts:
                     self.errors.pop(key)
@@ -719,20 +740,7 @@ class QmtStrategyManager:
                         self._control(job)
                     self._advance(job)
                 except Exception as error:
-                    retry_count = int(job.get("deploy_retry_count") or 0) + 1
-                    job["deploy_retry_count"] = retry_count
-                    job["deploy_retry_after"] = time.time() + min(10.0, 2.0 * retry_count)
-                    detail = str(error).strip()
-                    if not detail:
-                        trace = traceback.format_exc().strip().splitlines()
-                        frames = [line.strip() for line in trace if line.strip().startswith("File ")]
-                        location = frames[-1] if frames else ""
-                        detail = "%s (%s)" % (type(error).__name__, location or repr(error))
-                    if retry_count < 5:
-                        detail = "部署写入暂时失败（第 %d/5 次），系统将自动重试：%s" % (retry_count, detail)
-                    else:
-                        detail = "部署连续失败 5 次，请关闭 QMT 并检查目录权限后重新保存：%s" % detail
-                    self._state(job, "error", detail)
+                    self._deployment_error(job, error)
                 changed = changed or before != job
             if changed:
                 self._save()

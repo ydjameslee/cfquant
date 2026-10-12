@@ -380,6 +380,43 @@ def test_reconcile_recovers_stale_same_name_generation(deployment):
     assert role["reimport_required"] is True
 
 
+def test_startup_reconcile_control_failure_is_retried_by_worker(deployment, monkeypatch):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    finish_import(manager, root)
+    manager.process_once()
+    job = next(iter(manager.jobs.values()))
+    _write_json(job["control_path"], {"enabled": True, "mode": job["mode"],
+        "generation": "old", "accepted_generations": [job["generation"]]})
+    running[0] = True
+    _write_json(job["roles"][0]["runtime_status_path"], {
+        "state": "running", "generation": job["generation"], "updated_at": time.time(),
+    })
+    replace = os.replace
+    failures = []
+
+    def fail_control_once(source, target):
+        if str(target) == job["control_path"] and not failures:
+            failures.append(target)
+            raise PermissionError(13, "QMT is reading during Web startup")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", fail_control_once)
+    manager.reconcile({row["account_key"]: row})
+    assert failures
+    assert job["state"] == "error"
+    assert job["deploy_retry_count"] == 1
+    restored = QmtStrategyManager(manager.path, SCRIPTS, lambda root: running[0])
+    restored_job = next(iter(restored.jobs.values()))
+    restored_job["deploy_retry_after"] = 0
+    restored.process_once()
+    assert restored_job["state"] == "running"
+    assert restored_job["generation"] == job["generation"]
+    control = json.loads(Path(job["control_path"]).read_text(encoding="utf-8"))
+    assert control["generation"] == job["generation"]
+    assert "accepted_generations" not in control
+
+
 def test_switch_and_delete_revoke_old_generation_and_disable_its_model(deployment):
     manager, row, infos, running, root = deployment
     row["qmt_strategy"].update(autorun=True)
