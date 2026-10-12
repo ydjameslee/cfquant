@@ -705,13 +705,18 @@ class QmtStrategyManager:
                     # launches the old container again.
                     self._control(job)
                 if job.get("state") == "error":
-                    if not job.get("control_generation") and not _generation_values(
-                            job.get("accepted_generations")):
-                        continue
                     retry_count = int(job.get("deploy_retry_count") or 0)
+                    if not job.get("control_generation") and not _generation_values(
+                            job.get("accepted_generations")) and not retry_count:
+                        continue
                     if retry_count >= 5 or time.time() < float(job.get("deploy_retry_after") or 0):
                         continue
                 try:
+                    # Older versions could persist a write error after already
+                    # clearing transition metadata. Republish the desired state
+                    # before trusting a fresh runtime report to clear the error.
+                    if job.get("state") == "error" and job.get("deploy_retry_count"):
+                        self._control(job)
                     self._advance(job)
                 except Exception as error:
                     retry_count = int(job.get("deploy_retry_count") or 0) + 1
@@ -910,8 +915,12 @@ class QmtStrategyManager:
                 and all(valid and generation == str(job["generation"])
                         and state in ("loaded", "running")
                         for valid, generation, state in reports)):
+            # Publish first: a transient Windows file-sharing error must not
+            # discard the transition needed to retry this finalization.
+            finalized = copy.deepcopy(job)
+            self._clear_generation_transition(finalized)
+            self._control(finalized)
             self._clear_generation_transition(job)
-            self._control(job)
         state = "running" if states and all(item == "running" for item in states) else (
             "waiting_start" if job["settings"]["autorun"] else "waiting_manual_start")
         self._state(job, state)

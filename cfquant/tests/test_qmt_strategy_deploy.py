@@ -265,6 +265,98 @@ def test_same_mode_reimport_accepts_old_container_until_new_container_starts(dep
     assert role["name"] == name
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_control_finalize_write_failure_retries_without_reimport(deployment, monkeypatch, restart):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    finish_import(manager, root)
+    manager.process_once()
+    manager.configure(row, infos, force=True)
+    job = next(iter(manager.jobs.values()))
+    role = job["roles"][0]
+    old_control = Path(job["control_path"]).read_bytes()
+    generation = job["generation"]
+    package = Path(role["package_path"]).read_bytes()
+    running[0] = True
+    _write_json(role["runtime_status_path"], {
+        "state": "running", "generation": generation, "updated_at": time.time(),
+    })
+    replace = os.replace
+    failures = []
+
+    def fail_control_once(source, target):
+        if str(target) == job["control_path"] and not failures:
+            failures.append(target)
+            raise PermissionError(13, "control file temporarily held by QMT")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", fail_control_once)
+    manager.process_once()
+    assert failures
+    assert job["state"] == "error"
+    assert Path(job["control_path"]).read_bytes() == old_control
+    assert job.get("control_generation"), "Failed publication must retain transition state"
+    if restart:
+        manager = QmtStrategyManager(manager.path, SCRIPTS, lambda root: running[0])
+        job = next(iter(manager.jobs.values()))
+    job["deploy_retry_after"] = 0
+    manager.process_once()
+    assert job["state"] == "running"
+    assert not job.get("deploy_retry_count")
+    assert not job.get("control_generation")
+    control = json.loads(Path(job["control_path"]).read_text(encoding="utf-8"))
+    assert control["generation"] == generation
+    assert "accepted_generations" not in control
+    assert Path(role["package_path"]).read_bytes() == package
+    assert job["generation"] == generation
+
+
+@pytest.mark.parametrize("failures", [0, 5])
+def test_persisted_write_error_without_transition_has_bounded_recovery(deployment, monkeypatch, failures):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    finish_import(manager, root)
+    manager.process_once()
+    job = next(iter(manager.jobs.values()))
+    role = job["roles"][0]
+    generation = job["generation"]
+    _write_json(job["control_path"], {"enabled": True, "mode": job["mode"],
+        "generation": "old", "accepted_generations": [generation]})
+    job.update(state="error", error="previous control write failed", deploy_retry_count=1,
+               deploy_retry_after=0)
+    manager._save()
+    running[0] = True
+    _write_json(role["runtime_status_path"], {
+        "state": "running", "generation": generation, "updated_at": time.time(),
+    })
+    manager = QmtStrategyManager(manager.path, SCRIPTS, lambda root: running[0])
+    job = next(iter(manager.jobs.values()))
+    replace = os.replace
+    attempts = []
+
+    def replace_control(source, target):
+        if str(target) == job["control_path"]:
+            attempts.append(target)
+            if len(attempts) <= failures:
+                raise PermissionError(13, "control file still held")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", replace_control)
+    for _ in range(6):
+        job["deploy_retry_after"] = 0
+        manager.process_once()
+    if failures:
+        assert len(attempts) == 4
+        assert job["state"] == "error"
+        assert job["deploy_retry_count"] == 5
+    else:
+        assert attempts
+        assert job["state"] == "running"
+        control = json.loads(Path(job["control_path"]).read_text(encoding="utf-8"))
+        assert control == {"enabled": True, "mode": job["mode"], "generation": generation}
+    assert job["generation"] == generation
+
+
 def test_reconcile_recovers_stale_same_name_generation(deployment):
     manager, row, infos, running, root = deployment
     manager.configure(row, infos)
