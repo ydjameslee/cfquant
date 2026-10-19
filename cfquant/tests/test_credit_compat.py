@@ -366,21 +366,26 @@ SMT_CASES = [
 ]
 
 
+# Far above the process-wide SDK seq counter, which a full run can push
+# into the hundreds; a small value collides depending on test order.
+BROKER_SEQ = 987654321
+
+
 @pytest.mark.parametrize("method,args", SMT_CASES)
 def test_smt_business_result_is_correlated_once_via_event(method, args):
     calls = []
-    raw = {"success": True, "msg": "accepted", "apply_id": "APPLY-1", "seq": 987}
+    raw = {"success": True, "msg": "accepted", "apply_id": "APPLY-1", "seq": BROKER_SEQ}
     _, trader = wire({method: lambda *values: calls.append(values) or raw})
     received = []
     trader.callback = SimpleNamespace(on_smt_appointment_async_response=received.append)
     seq = getattr(trader, method + "_async")(ACCOUNT, *args)
-    assert seq > 0 and seq != 987
+    assert seq > 0 and seq != BROKER_SEQ
     assert calls == [("C123",) + args]
     assert len(received) == 1
     assert isinstance(received[0], XtSmtAppointmentResponse)
     assert received[0].seq == seq and received[0].apply_id == "APPLY-1"
     assert received[0].success is True
-    assert raw["seq"] == 987
+    assert raw["seq"] == BROKER_SEQ
 
 
 @pytest.mark.parametrize("raw", [False, -1])

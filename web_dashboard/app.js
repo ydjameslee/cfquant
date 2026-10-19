@@ -10157,11 +10157,6 @@ async function submitBindingForm(event) {
   const enabled = !(form.enabled && !form.enabled.checked);
   const qmtAutoLoginSettings = readBindingQmtAutoLoginSettings(form);
   const qmtAutoLogin = qmtAutoLoginSettings.enabled;
-  const qmtLoginError = qmtLoginValidationError('binding', qmtAutoLoginSettings, qmtDir);
-  if (qmtLoginError) {
-    setBindingNotice(qmtLoginError, 'error', { autoHide: false });
-    return;
-  }
   if (enabled && normalizeTransportMode(mode) === 'lttx') {
     if (!qmtDir || !qmtTradeDir) {
       setBindingNotice('高级模式必须填写普通端和极速交易端两个 QMT 核心目录。', 'error', { autoHide: false });
@@ -10201,6 +10196,12 @@ async function submitBindingForm(event) {
       if (input) input.focus();
       return;
     }
+  }
+  // Basic fields first; credentials are still checked before QMT is stopped.
+  const qmtLoginError = qmtLoginValidationError('binding', qmtAutoLoginSettings, qmtDir);
+  if (qmtLoginError) {
+    setBindingNotice(qmtLoginError, 'error', { autoHide: false });
+    return;
   }
   const processTargets = [
     { label: 'QMT', path: qmtDir },
@@ -12611,10 +12612,10 @@ function normalizeStockCode(value, accountType = selectedAccountType()) {
     const parts = prefixed.split('.');
     const code = parts[0] || '';
     const market = parts[1] || '';
-    if (!/^\d{5}$/.test(code) || (market && market !== 'HK' && market !== 'HGT' && market !== 'SGT')) return raw;
-    if (market === 'HGT' && type !== 'HUGANGTONG') return raw;
-    if (market === 'SGT' && type !== 'SHENGANGTONG') return raw;
-    return `${code}.HK`;
+    if (!/^\d{1,5}$/.test(code) || Number(code) <= 0 || (market && market !== 'HK' && market !== 'HGT' && market !== 'SGT')) return raw;
+    // Pad short HK codes; keep an explicit .HGT/.SGT so the server can
+    // reject a channel that does not match this account.
+    return `${code.padStart(5, '0')}.${market === 'HGT' || market === 'SGT' ? market : 'HK'}`;
   }
   const parts = raw.split('.');
   let code = parts[0] || '';

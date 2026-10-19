@@ -48,11 +48,12 @@ def complete_connect_async_order(env, kind, stock_code, order_id, native_index=0
             'order_id': order_id, 'm_nRef': order_id,
             'm_strTradingDay': '20260928', 'm_strStrategyName': native[7],
         }), True
-    # test_cftrader's generated-LITE fixture intentionally overrides only a
-    # subset of the standalone class.  Until those files gain the request-token
-    # implementation, its old pending records meet the inherited strict
-    # callback matcher and must fail closed.
+    # The generated-LITE fixture runs Lite's own correlation path, which has
+    # no request token: it matches only the exact internal UUID remark.
     assert env.bridge.__class__.__module__ == 'builtins'
+    foreign = dict(order_id=order_id, order_remark='connect__cfq_' + 'f' * 32,
+                   account_id='TEST_ONLY', stock_code=stock_code, strategy_name=native[7])
+    assert not env.bridge._handle_async_order_callback(foreign)
     return env.bridge._handle_async_order_callback({
         'account_id': 'TEST_ONLY', 'stock_code': stock_code,
         'order_id': order_id, 'order_remark': native[9],
@@ -97,18 +98,14 @@ def test_sdk_to_qmt_order_and_cancel(connected, kind, market, number, batch, asy
                     else env.requests[0][1]['stock_code'])
     assert request_code == '00700.HK'
     if asynchronous:
-        matched, tokenized = complete_connect_async_order(env, kind, code, 2001)
-        assert matched is tokenized
+        matched, _ = complete_connect_async_order(env, kind, code, 2001)
+        assert matched
         if batch:
-            batch_matched, batch_tokenized = complete_connect_async_order(
+            batch_matched, _ = complete_connect_async_order(
                 env, kind, '00941.HK', 2002, native_index=1)
-            assert batch_matched is batch_tokenized
-            assert batch_tokenized is tokenized
-        if tokenized:
-            assert env.responses[0].account_type == number
-            assert env.responses[0].order_id == 2001
-        else:
-            assert not env.responses
+            assert batch_matched
+        assert env.responses[0].account_type == number
+        assert env.responses[0].order_id == 2001
     if asynchronous:
         assert env.trader.cancel_order_stock_async(env.account, 'SYS-2001') > 0
         assert env.cancel_responses[-1].account_type == number
@@ -301,6 +298,9 @@ def test_standalone_async_callback_keeps_premerge_contract(path):
     }
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in method_names]
     namespace = {'BaseTradeBridge': lite_bridge(path), 'os': os, 'time': time}
+    # The methods use Lite's module-level identity helpers (order_remark_key...).
+    shared = source.split('# BEGIN GENERATED CFTRADER BATCH\n', 1)[1].split('# END GENERATED CFTRADER BATCH', 1)[0]
+    exec(compile(shared, str(path), 'exec'), namespace)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
                  str(path), 'exec'), namespace)
     bridge = namespace['TxTradeBridge'](None, show=False, globals_dict={})

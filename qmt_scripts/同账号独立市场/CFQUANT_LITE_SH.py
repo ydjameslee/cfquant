@@ -3823,7 +3823,10 @@ class TxTradeBridge(object):
         if not order_id:
             raise ValueError("order_id is required")
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        validate_connect_market(account_type, params.get("stock_code"), self._market_suffix(params.get("market")))
+        # Validate before _market_suffix folds HGT/SGT into HK.
+        market = str(params.get("market") or "").strip().upper()
+        validate_connect_market(account_type, params.get("stock_code"),
+                                market if market in ("HGT", "SGT") else self._market_suffix(market))
         result = cancel_func(order_id, account_id, account_type, self.context)
         return {"cancel_result": 0 if result else -1, "request_result": result, "order_id": order_id}
 

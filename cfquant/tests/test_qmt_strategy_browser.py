@@ -49,7 +49,7 @@ def test_project_update_notice_handles_editable_install(page, frontend_url):
             notice: document.querySelector('#projectUpdateNoticeBox').innerText,
         };
     }""")
-    assert result["title"] == "更新完成，请重启 QMT"
+    assert result["title"] == "更新完成，请登录 QMT"
     assert result["editableVersion"] == "9.9.9-test"
     assert "源码安装" in result["notice"]
     assert errors == []
@@ -122,6 +122,9 @@ def test_binding_sends_strategy_flags_and_displays_pending_deployment(page, fron
                 'state': 'waiting_exit', 'strategies': ['CFQ_LITE_TEST'],
                 'message': 'Waiting for QMT exit', 'error': ''}]}}})
     page.route('**/api/account-config', respond)
+    # Auto start is on by default and needs login credentials; this test
+    # covers strategy flags, so save without it.
+    page.locator('#bindingQmtAutoLogin').uncheck()
     page.locator('#bindingForm button[type="submit"]').click()
     expect(page.locator('#bindingDialogOverlay')).not_to_be_visible()
     assert len(saved) == 1
@@ -130,9 +133,10 @@ def test_binding_sends_strategy_flags_and_displays_pending_deployment(page, fron
         'stock': 'SH000300', 'account_keys': {'normal': '2____101____201____49____1000000001____',
                                             'trade': '', 'SH': '', 'SZ': ''}}
     expect(page.locator('#bindingQmtGuideOverlay')).to_be_visible()
-    expect(page.locator('#bindingQmtGuideInstruction')).to_contain_text('请正常退出')
+    expect(page.locator('#bindingQmtGuideInstruction')).to_contain_text('请完全退出对应 QMT')
     expect(page.locator('#bindingQmtGuideOverlay [data-qmt-script-copy]')).to_have_count(0)
-    assert page.locator('body').inner_text().find('Waiting for QMT exit') >= 0
+    # Known deploy states show their localized guidance instead of the raw message.
+    assert page.locator('body').inner_text().find('CFQ_LITE_TEST：QMT 仍在运行') >= 0
     page.route('**/api/status*', lambda route: route.fulfill(json={
         'ok': True,
         'data': {
@@ -150,7 +154,8 @@ def test_binding_sends_strategy_flags_and_displays_pending_deployment(page, fron
     page.locator('#backBindingQmtGuideBtn').click()
     expect(page.locator('#bindingDialogOverlay')).to_be_visible()
     expect(page.locator('#bindingQmtDir')).to_have_value('D:\\QMT-FAKE\\bin.x64')
-    expect(page.locator('#bindingQmtAutoLogin')).to_be_checked()
+    # Returning keeps the saved choice: auto start was unchecked above.
+    expect(page.locator('#bindingQmtAutoLogin')).not_to_be_checked()
     expect(page.locator('#bindingStrategyAutorun')).to_be_checked()
     page.locator('#cancelBindingDialogBtn').click()
     expect(page.locator('#bindingQmtGuideOverlay')).not_to_be_visible()
@@ -272,7 +277,7 @@ def test_binding_dialog_help_tooltips_stay_in_viewport(page, frontend_url):
     auto_start_trigger = page.locator('#bindingQmtAutoLoginSettings .help-tooltip-trigger')
     auto_start_trigger.scroll_into_view_if_needed()
     auto_start_trigger.click()
-    expect(page.locator('#helpTooltipLayer')).to_contain_text('QMT 登录前提仍需在客户端内完成')
+    expect(page.locator('#helpTooltipLayer')).to_contain_text('重新启动并自动登录')
     assert_help_tooltip_in_viewport(page)
     assert page.locator('#bindingDialogOverlay .binding-dialog').evaluate('(node) => node.scrollWidth <= node.clientWidth')
     assert errors == []
@@ -281,7 +286,9 @@ def test_binding_dialog_help_tooltips_stay_in_viewport(page, frontend_url):
 def test_startup_reminders_distinguish_pending_failure_disabled_and_manual_run(page, frontend_url):
     _, errors = open_app(page, frontend_url)
     cases = [
-        ({}, '请重启对应 QMT 并登录'),
+        # New bindings enable QMT auto start by default.
+        ({}, '项目将自动完成登录'),
+        ({'qmt_auto_login': {'enabled': False}}, '请重启对应 QMT 并登录'),
         ({'enabled': False}, '账号绑定已停用'),
         ({'qmt_strategy': {'enabled': False}}, '自动导入并管理 QMT 策略未启用'),
         ({'qmt_strategy': {'enabled': True, 'autorun': False}}, '运行已导入的托管策略'),
@@ -292,7 +299,7 @@ def test_startup_reminders_distinguish_pending_failure_disabled_and_manual_run(p
         ({'qmt_auto_login': {'enabled': True},
           'qmt_strategy_deploy': {'targets': [{'state': 'waiting_exit'}]}}, '等待绑定列表显示模型配置完成'),
         ({'qmt_auto_login': {'enabled': True},
-          'qmt_strategy_deploy': {'targets': [{'state': 'waiting_import_save'}]}}, '请正常退出'),
+          'qmt_strategy_deploy': {'targets': [{'state': 'waiting_import_save'}]}}, '请退出 QMT'),
         ({'mode': 'lttx', 'qmt_dir': 'D:/QMT', 'qmt_trade_dir': 'D:/TRADE',
           'qmt_auto_login': {'enabled': True}}, '其他目录的 QMT 请分别启动并登录'),
     ]

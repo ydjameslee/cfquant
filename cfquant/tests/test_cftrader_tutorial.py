@@ -144,6 +144,9 @@ def test_web_api_catalog_shows_sdk_and_preserves_http_batch(page, frontend_url, 
     page.keyboard.press('Escape')
     page.locator('.nav-item[data-view="api"]').click()
     expect(page.locator('[data-api-group="cftrader"]')).to_be_visible()
+    # API groups start collapsed; open the cftrader group like a user would.
+    if page.locator('[data-api-group="cftrader"]').get_attribute('aria-expanded') != 'true':
+        page.locator('[data-api-group="cftrader"]').click()
     expect(page.locator('#apiEndpointList [data-endpoint-id^="cftrader."]')).to_have_count(6)
     for method in ('order_stock_batch', 'order_stock_batch_async', 'cancel_order_stock_batch',
                    'cancel_order_stock_batch_async', 'order_stock', 'order_stock_async'):
@@ -164,7 +167,10 @@ def test_web_api_catalog_shows_sdk_and_preserves_http_batch(page, frontend_url, 
     page.locator('[data-api-sdk-tutorial]').click()
     expect(page.locator('.python-document-head h2')).to_have_text('order_stock_batch_async')
     page.locator('.nav-item[data-view="api"]').click()
-    page.locator('[data-endpoint-id="batch_order"]').click()
+    batch_order = page.locator('[data-endpoint-id="batch_order"]')
+    if not batch_order.is_visible():
+        page.locator('.api-group', has=batch_order).locator('.api-group-head').click()
+    batch_order.click()
     expect(page.locator('#apiRoute')).to_have_text('POST /api/orders/batch')
     expect(page.locator('#apiForm button[type="submit"]')).to_be_visible()
     expect(page.locator('#apiHttpPreview')).to_be_visible()

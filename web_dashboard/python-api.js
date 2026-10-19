@@ -90,13 +90,16 @@
 
   function renderNav() {
     const visible = entries.filter(matches);
+    // Search results and the current entry must be reachable without first
+    // expanding a collapsed group; the plain directory stays compact.
+    const searching = Boolean(query.trim() || filter);
     const groups = new Map();
     for (const entry of visible) {
       const key = modules[entry.module] + ' / ' + entry.group;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(entry);
     }
-    nav.innerHTML = `<button type="button" class="python-nav-entry ${current === 'guide' ? 'active' : ''}" data-python-entry="guide" ${current === 'guide' ? 'aria-current="page"' : ''}><strong>接入与迁移</strong><span>安装、查询、交易及多账号示例</span></button><p class="python-nav-count" role="status">${visible.length} 个条目</p>` + (visible.length ? [...groups].map(([name, list]) => `<details class="python-nav-group"${groupsExpanded ? ' open' : ''}><summary>${esc(name)} <span>${list.length}</span></summary>${list.map(entry => `<button type="button" class="python-nav-entry ${current === entry.id ? 'active' : ''}" data-python-entry="${esc(entry.id)}" ${current === entry.id ? 'aria-current="page"' : ''}><strong><i class="python-status-dot ${entry.status}" aria-label="${labels[entry.status]}"></i>${esc(entry.name)}</strong><span>${esc(entry.title || entry.description)}</span></button>`).join('')}</details>`).join('') : '<p class="python-empty">没有匹配的接口</p><button type="button" data-python-reset>清除筛选</button>');
+    nav.innerHTML = `<button type="button" class="python-nav-entry ${current === 'guide' ? 'active' : ''}" data-python-entry="guide" ${current === 'guide' ? 'aria-current="page"' : ''}><strong>接入与迁移</strong><span>安装、查询、交易及多账号示例</span></button><p class="python-nav-count" role="status">${visible.length} 个条目</p>` + (visible.length ? [...groups].map(([name, list]) => `<details class="python-nav-group"${groupsExpanded || searching || list.some(entry => entry.id === current) ? ' open' : ''}><summary>${esc(name)} <span>${list.length}</span></summary>${list.map(entry => `<button type="button" class="python-nav-entry ${current === entry.id ? 'active' : ''}" data-python-entry="${esc(entry.id)}" ${current === entry.id ? 'aria-current="page"' : ''}><strong><i class="python-status-dot ${entry.status}" aria-label="${labels[entry.status]}"></i>${esc(entry.name)}</strong><span>${esc(entry.title || entry.description)}</span></button>`).join('')}</details>`).join('') : '<p class="python-empty">没有匹配的接口</p><button type="button" data-python-reset>清除筛选</button>');
     syncGroupToggle();
   }
 

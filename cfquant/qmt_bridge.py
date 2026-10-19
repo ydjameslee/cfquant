@@ -1045,7 +1045,10 @@ class CfquantQmtBridge(object):
         if not account_id:
             raise ValueError("account_id is required")
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        validate_connect_market(account_type, params.get("stock_code"), self._market_suffix(params.get("market")))
+        # Validate before _market_suffix folds HGT/SGT into HK.
+        market = str(params.get("market") or "").strip().upper()
+        validate_connect_market(account_type, params.get("stock_code"),
+                                market if market in ("HGT", "SGT") else self._market_suffix(market))
         internal_ref = params.get("internal_ref", params.get("m_nRef"))
         order_id_kind = str(params.get("order_id_kind") or "auto").strip().lower()
         if order_id_kind not in ("auto", "internal", "native", "sysid"):
