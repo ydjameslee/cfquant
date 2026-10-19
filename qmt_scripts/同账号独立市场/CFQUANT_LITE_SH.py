@@ -5,51 +5,11 @@
 import os as _cfquant_market_os
 
 _CFQUANT_MARKET = "SH"
-_CFQUANT_CONFIG_FILENAME = "cfquant_bridge_config_SH.json"
-
-
-def _cfquant_market_base_dir():
-    path = globals().get("__file__") or ""
-    if path and not str(path).startswith("<"):
-        try:
-            return _cfquant_market_os.path.dirname(_cfquant_market_os.path.abspath(path))
-        except Exception:
-            return ""
-    try:
-        return _cfquant_market_os.path.abspath(_cfquant_market_os.getcwd())
-    except Exception:
-        return ""
-
-
-def _cfquant_market_config_path():
-    base = _cfquant_market_base_dir()
-    parent = _cfquant_market_os.path.dirname(base) if base else ""
-    if base and _cfquant_market_os.path.basename(base).lower() == "python" and parent:
-        return _cfquant_market_os.path.join(parent, "bin.x64", _CFQUANT_CONFIG_FILENAME)
-    if base:
-        return _cfquant_market_os.path.join(base, _CFQUANT_CONFIG_FILENAME)
-    return _CFQUANT_CONFIG_FILENAME
 
 
 _cfquant_market_os.environ["CFQUANT_MARKET"] = _CFQUANT_MARKET
 _cfquant_market_os.environ["CFQUANT_MARKET_SOURCE"] = "cfquant_market_entry"
 
-
-def _cfquant_market_should_set_config_path():
-    current = str(_cfquant_market_os.environ.get("CFQUANT_BRIDGE_CONFIG_FILE") or "").strip()
-    if not current:
-        return True
-    source = str(_cfquant_market_os.environ.get("CFQUANT_BRIDGE_CONFIG_FILE_SOURCE") or "").strip()
-    if source in ("cfquant_market_entry", "cfquant_entry"):
-        return True
-    current_name = _cfquant_market_os.path.basename(current).lower()
-    market_names = ("cfquant_bridge_config_sh.json", "cfquant_bridge_config_sz.json")
-    return current_name in market_names and current_name != _CFQUANT_CONFIG_FILENAME.lower()
-
-
-if _cfquant_market_should_set_config_path():
-    _cfquant_market_os.environ["CFQUANT_BRIDGE_CONFIG_FILE"] = _cfquant_market_config_path()
-    _cfquant_market_os.environ["CFQUANT_BRIDGE_CONFIG_FILE_SOURCE"] = "cfquant_market_entry"
 
 # Embedded market entry: CFQUANT_LITE_SH.py
 #coding:gbk
@@ -60,7 +20,7 @@ if _cfquant_market_should_set_config_path():
 
 import base64
 import datetime as dt
-import io
+import inspect
 import json
 import math
 import os
@@ -68,7 +28,10 @@ import queue
 import re
 import struct
 import sys
+sys.dont_write_bytecode = True
+os.environ["CFQUANT_QMT_NO_FILE_IO"] = "1"
 import threading
+from collections import deque
 import time
 import traceback
 import uuid
@@ -265,10 +228,30 @@ native remark so independent QMT processes and restarts can recover both.
 """
 
 import re
+import threading
+import time
 import uuid
+from collections import OrderedDict
 
 
 _ORDER_REMARK_SUFFIX = re.compile(r"__cfq_([0-9a-f]{32})$")
+_STRATEGY_NAME_SUFFIX = re.compile(r"(?:&&&_cfq_|^cfq_)[0-9a-f]{12}\Z")
+
+
+def restore_strategy_name(data):
+    """Remove our request token only at the public callback/object boundary.
+
+    Keep the full strategy until error-context matching has finished. Match
+    the generated suffix precisely so user underscores and delimiters survive.
+    """
+    if isinstance(data, dict):
+        for name in ("strategy_name", "m_strStrategyName", "mstrStrategyName", "strategyName"):
+            value = data.get(name)
+            if isinstance(value, str):
+                match = _STRATEGY_NAME_SUFFIX.search(value)
+                if match:
+                    data[name] = value[:match.start()]
+    return data
 
 
 def original_order_remark(value):
@@ -313,6 +296,121 @@ def restore_order_remark(data):
             data["cfquant_order_remark"] = internal
             data["order_remark"] = original_order_remark(internal)
     return data
+
+
+def order_remark_matches_reference(expected, actual):
+    """Compare remarks only AFTER an order reference has matched.
+
+    Some DEAL reports echo the public remark without our UUID. A different
+    UUID still identifies a different submission, even with the same text.
+    """
+    return (not actual or expected == actual or
+            (is_unique_order_remark(expected) and
+             not is_unique_order_remark(actual) and
+             original_order_remark(expected) == actual))
+
+
+class OrderCallbackCache(object):
+    """Bounded, daily order metadata indexed by separate local/broker IDs."""
+
+    def __init__(self, max_orders=4096):
+        self.max_orders = max_orders
+        self.lock = threading.RLock()
+        self.day = ""
+        self.records = OrderedDict()
+        self.by_ref = {}
+
+    def _identity(self, data, account_type):
+        day = time.strftime("%Y%m%d")
+        if day != self.day:
+            self.records.clear()
+            self.by_ref.clear()
+            self.day = day
+        # Historical query rows must not seed today's broker-ID mapping.
+        for name in ("order_date", "trade_date", "m_strInsertDate", "m_strTradeDate", "m_strTradingDay"):
+            value = str(data.get(name) or "").replace("-", "").replace("/", "")
+            if len(value) == 8 and value.isdigit() and value != day:
+                return None, set()
+        account = str(data.get("account_id") or data.get("m_strAccountID") or "").strip()
+        stock = str(data.get("stock_code") or data.get("m_strInstrumentID") or "").strip().upper()
+        market = str(data.get("market") or data.get("m_strExchangeID") or "").strip().upper()
+        if "." in stock:
+            stock, market = stock.rsplit(".", 1)
+        if not account or not stock:
+            return None, set()
+        scope = (account_type, account, stock, market)
+        refs = set()
+        for name in ("order_id", "m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID"):
+            value = str(data.get(name) or "").strip()
+            if value.isdigit() and int(value) > 0:
+                refs.add(("local", str(int(value))))
+        for name in ("order_sysid", "m_strOrderSysID"):
+            value = str(data.get(name) or "").strip()
+            if value and value not in ("0", "-1"):
+                refs.add(("broker", value))
+        return scope, refs
+
+    def _matches(self, scope, refs, data):
+        groups = [self.by_ref[(scope, ref)] for ref in refs if (scope, ref) in self.by_ref]
+        candidates = set.intersection(*groups) if groups else set()
+        matches = []
+        for key in candidates:
+            record = self.records[key]
+            expected, actual = order_remark_key(record["data"]), order_remark_key(data)
+            if expected and not order_remark_matches_reference(expected, actual):
+                continue
+            local = {ref for ref in refs if ref[0] == "local"}
+            known = {ref for ref in record["refs"] if ref[0] == "local"}
+            if local and known and not local.intersection(known):
+                continue
+            matches.append(key)
+        return matches
+
+    def remember(self, data, account_type):
+        if not (data.get("strategy_name") or data.get("m_strStrategyName") or order_remark_key(data)):
+            return
+        with self.lock:
+            scope, refs = self._identity(data, account_type)
+            if scope is None or not refs:
+                return
+            matches = self._matches(scope, refs, data)
+            remark = order_remark_key(data)
+            local = sorted(ref for ref in refs if ref[0] == "local")
+            identity = ("remark", remark) if is_unique_order_remark(remark) else (local or sorted(refs))[0]
+            key = (scope, identity)
+            if len(matches) == 1:
+                key = matches[0]
+            record = self.records.get(key, {"data": {}, "refs": set()})
+            record["data"].update({name: value for name, value in data.items() if value not in (None, "")})
+            record["refs"].update(refs)
+            self.records[key] = record
+            self.records.move_to_end(key)
+            for ref in refs:
+                self.by_ref.setdefault((scope, ref), set()).add(key)
+            while len(self.records) > self.max_orders:
+                old_key, old = self.records.popitem(last=False)
+                for ref in old["refs"]:
+                    index = (old_key[0], ref)
+                    self.by_ref[index].discard(old_key)
+                    if not self.by_ref[index]:
+                        del self.by_ref[index]
+
+    def enrich(self, data, account_type):
+        with self.lock:
+            scope, refs = self._identity(data, account_type)
+            matches = self._matches(scope, refs, data) if scope is not None else []
+            if len(matches) != 1:
+                return data
+            saved = self.records[matches[0]]["data"]
+            strategy = saved.get("strategy_name") or saved.get("m_strStrategyName")
+            remark = order_remark_key(saved)
+            for name, value in (("strategy_name", strategy), ("m_strStrategyName", strategy),
+                                ("order_remark", remark), ("m_strRemark", remark), ("m_strOrderRemark", remark)):
+                if value and not data.get(name):
+                    data[name] = value
+            if is_unique_order_remark(remark):
+                data["cfquant_order_remark"] = remark
+        return restore_order_remark(data)
 
 """Batch wire contract and QMT execution, compatible with embedded Python 3.6."""
 
@@ -717,8 +815,8 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.49"
-LITE_ENTRY_VERSION = "lite_20260828_01"
+CORE_VERSION = "0.2.54"
+LITE_ENTRY_VERSION = "lite_20261014_03"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
 _ORDER_STATUS_FIELD_NAMES = (
@@ -1222,6 +1320,146 @@ def normalize_json_value(value, path="message", _active=None):
         active.remove(identity)
 
 
+def dataframe_numeric_rows(value):
+    """Bulk rows for plain numeric frames; None keeps pandas' other semantics."""
+    columns = getattr(value, "columns", None)
+    dtypes = getattr(value, "dtypes", None)
+    if columns is None or not len(columns) or dtypes is None or not getattr(columns, "is_unique", False):
+        return None
+    # Nullable, object and date-like columns need pandas' scalar boxing rules.
+    # Restrict this fast path so callers keep their existing null/date behavior.
+    for dtype in dtypes:
+        if (type(dtype).__module__.split(".", 1)[0] != "numpy"
+                or dtype.kind not in ("b", "i", "u", "f") or dtype.itemsize > 8):
+            return None
+    # Combining mixed numeric blocks before this cast can round large IDs.
+    return value.astype(object, copy=False).values.tolist()
+
+
+def encode_response_result(result):
+    """Freeze one response body for reuse; include all serialization work."""
+    started = time.perf_counter()
+    encoded = encode_value(result)
+    converted = time.perf_counter()
+    normalized = normalize_json_value(encoded, "result")
+    normalized_at = time.perf_counter()
+    body = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    finished = time.perf_counter()
+    return body, {"encode_value_ms": round((converted - started) * 1000, 3),
+                  "normalize_ms": round((normalized_at - converted) * 1000, 3),
+                  "json_encode_ms": round((finished - normalized_at) * 1000, 3),
+                  "encode_ms": round((finished - started) * 1000, 3)}
+
+
+def is_readonly_request(action):
+    # Only known query families. Downloads, subscriptions and all writes retain
+    # their existing execution semantics, including on an ambiguous timeout.
+    return (str(action).startswith(("xtdata.get_", "xttrader.query_"))
+            or action in ("cfquant.ping", "cfquant.status", "cfquant.query_info"))
+
+
+def request_expired(msg, now=None):
+    if not is_readonly_request(msg.get("action")):
+        return False
+    received = msg.get("_received_monotonic")
+    timeout = msg.get("timeout")
+    if received is None or timeout is None:
+        return False
+    return (time.perf_counter() if now is None else now) - received >= max(0.0, float(timeout))
+
+
+class OrderedSender(object):
+    """One FIFO writer per connection; overflow/failure closes that connection.
+
+    Capacity includes the in-flight frame. Accepted frames are never coalesced,
+    silently evicted, or replayed on a different connection.
+    """
+    def __init__(self, send, on_error, max_items=1024, max_bytes=128 * 1024 * 1024):
+        self.send = send
+        self.on_error = on_error
+        self.max_items = max(1, int(max_items))
+        self.max_bytes = max(1, int(max_bytes))
+        self._condition = threading.Condition()
+        self._queue = deque()
+        self._bytes = 0
+        self._inflight = None
+        self._closed = False
+        self._thread = None
+        self._sent = 0
+        self._last_queue_ms = 0.0
+        self._last_send_ms = 0.0
+        self._error = ""
+
+    def submit(self, payload, size=None):
+        size = len(payload) if size is None else int(size)
+        error = None
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("sender is closed: %s" % self._error)
+            count = len(self._queue) + (self._inflight is not None)
+            if count >= self.max_items or self._bytes + size > self.max_bytes:
+                error = BufferError("send backlog exceeded limits (%s frames, %s bytes)" % (count, self._bytes))
+            else:
+                self._queue.append((payload, size, time.monotonic()))
+                self._bytes += size
+                if self._thread is None:
+                    self._thread = threading.Thread(target=self._run, name="cfquant-ordered-send")
+                    self._thread.daemon = True
+                    self._thread.start()
+                self._condition.notify()
+        if error is not None:
+            self._fail(error)
+            raise error
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._queue.clear()
+            self._bytes = self._inflight[1] if self._inflight is not None else 0
+            self._condition.notify_all()
+
+    def _fail(self, error):
+        with self._condition:
+            if self._closed:
+                return
+            self._error = str(error)
+            self.close()
+        self.on_error(error)
+
+    def _run(self):
+        while True:
+            with self._condition:
+                while not self._closed and not self._queue:
+                    self._condition.wait()
+                if self._closed:
+                    return
+                item = self._queue.popleft()
+                self._inflight = item
+            started = time.monotonic()
+            try:
+                self.send(item[0])
+            except Exception as error:
+                self._fail(error)
+                return
+            finally:
+                with self._condition:
+                    self._last_queue_ms = (started - item[2]) * 1000
+                    self._last_send_ms = (time.monotonic() - started) * 1000
+                    self._bytes -= item[1]
+                    self._inflight = None
+            with self._condition:
+                self._sent += 1
+
+    def status(self):
+        with self._condition:
+            oldest = self._inflight or (self._queue[0] if self._queue else None)
+            return {"queued_frames": len(self._queue), "buffered_bytes": self._bytes,
+                    "sending": self._inflight is not None, "sent_frames": self._sent,
+                    "oldest_age_ms": round((time.monotonic() - oldest[2]) * 1000, 3) if oldest else 0,
+                    "last_queue_ms": round(self._last_queue_ms, 3),
+                    "last_send_ms": round(self._last_send_ms, 3), "error": self._error}
+
+
 def dumps_message(payload):
     data = dict(payload)
     data.setdefault("protocol", "cfquant")
@@ -1235,6 +1473,8 @@ def loads_message(raw):
         raw = raw.decode("utf-8", errors="replace")
     if not isinstance(raw, str):
         return None
+    # LTtx may prepend "key|"; named pipes deliver the protocol frame directly.
+    # A pipe inside a broker error/remark belongs to JSON, not the envelope.
     if not raw.startswith(MESSAGE_PREFIX) and "|" in raw:
         _, raw = raw.split("|", 1)
     if not raw.startswith(MESSAGE_PREFIX):
@@ -1262,15 +1502,21 @@ def pack_request(action, params=None, reply_channel=None, client_id=None, reques
     return dumps_message(payload)
 
 
-def pack_response(request_id, ok=True, result=None, error=None, meta=None):
-    return dumps_message({
+def pack_response(request_id, ok=True, result=None, error=None, meta=None, encoded_result=None):
+    body, encoding_timing = encode_response_result(result) if encoded_result is None else encoded_result
+    meta = dict(meta or {})
+    timing = meta.get("timing")
+    if isinstance(timing, dict) and isinstance(timing.get("qmt"), dict):
+        timing = dict(timing, qmt=dict(timing["qmt"], **encoding_timing))
+        meta["timing"] = timing
+    header = dumps_message({
         "type": "response",
         "id": request_id,
         "ok": bool(ok),
-        "result": encode_value(result),
         "error": encode_error(error),
-        "meta": meta or {},
+        "meta": meta,
     })
+    return header[:-1] + ',"result":' + body + '}'
 
 
 def pack_event(event, data=None, client_id=None, subscription_id=None, meta=None):
@@ -1367,15 +1613,34 @@ def _clean_cell(value):
 
 def _encode_dataframe(value):
     try:
-        raw_rows = list(value.itertuples(index=False, name=None))
+        # itertuples builds a Series per column, which is expensive for QMT's
+        # stock-by-date history frames. Cast BEFORE combining the blocks: using
+        # values directly can round int64/uint64 IDs in mixed float/int frames.
+        # astype also works with QMT's pandas 0.22 (which has no to_numpy).
+        raw_rows = value.astype(object, copy=False).values.tolist() if len(value.columns) else []
     except Exception:
         try:
-            raw_rows = value.values.tolist()
+            raw_rows = list(value.itertuples(index=False, name=None))
         except Exception:
-            raw_rows = []
+            try:
+                raw_rows = value.values.tolist()
+            except Exception:
+                raw_rows = []
     rows = []
     for row in raw_rows:
         rows.append([_clean_cell(v) for v in row])
+    # Thousands of date columns usually share one dtype. Formatting its name
+    # repeatedly can cost more than extracting the actual values.
+    dtype_flags = {}
+    object_columns = []
+    for name, dtype in getattr(value, "dtypes", {}).items():
+        is_object = dtype_flags.get(dtype)
+        if is_object is None:
+            dtype_name = str(dtype)
+            is_object = dtype_name == "object" or dtype_name.startswith(("Int", "UInt"))
+            dtype_flags[dtype] = is_object
+        if is_object:
+            object_columns.append(_encode_label(name))
     index_name = getattr(getattr(value, "index", None), "name", None)
     return {
         "__cf_type__": "dataframe",
@@ -1383,8 +1648,7 @@ def _encode_dataframe(value):
         "index": [_encode_label(i) for i in getattr(value, "index", [])],
         "data": rows,
         "index_name": _encode_label(index_name) if index_name is not None else None,
-        "object_columns": [_encode_label(name) for name, dtype in getattr(value, "dtypes", {}).items()
-                           if str(dtype) == "object" or str(dtype).startswith(("Int", "UInt"))],
+        "object_columns": object_columns,
     }
 
 
@@ -1434,9 +1698,65 @@ def decode_value(value):
     value_type = value.get("__cf_type__")
     if value_type == "bytes":
         return base64.b64decode(value.get("data", ""))
-    if value_type in ("dataframe", "series"):
-        return value
-
+    if value_type == "tuple":
+        return tuple(decode_value(item) for item in value.get("data", []))
+    if value_type == "dataframe":
+        import pandas as pd
+        columns = [decode_value(item) for item in value.get("columns", [])]
+        rows = [[decode_value(cell) for cell in row] for row in value.get("data", [])]
+        object_columns = [decode_value(item) for item in value.get("object_columns", [])]
+        if object_columns and columns:
+            # Construct columns independently, preserving duplicate field labels too.
+            df = pd.concat([pd.Series([row[i] for row in rows], dtype=object if name in object_columns else None)
+                            for i, name in enumerate(columns)], axis=1)
+            df.columns = columns
+        else:
+            df = pd.DataFrame(rows, columns=columns)
+        index = [decode_value(item) for item in value.get("index", [])]
+        if len(index) == len(df):
+            df.index = index
+        if value.get("index_name") is not None:
+            df.index.name = decode_value(value.get("index_name"))
+        return df
+    if value_type == "series":
+        import pandas as pd
+        return pd.Series(
+            [decode_value(v) for v in value.get("data", [])],
+            index=[decode_value(item) for item in value.get("index", [])],
+            name=decode_value(value.get("name")),
+        )
+    if value_type == "ndarray":
+        import numpy as np
+        data = decode_value(value.get("data"))
+        dtype = None
+        if value.get("dtype_descr"):
+            dtype_descr = []
+            for item in value.get("dtype_descr", []):
+                parts = list(item)
+                if len(parts) >= 3 and isinstance(parts[2], list):
+                    parts[2] = tuple(parts[2])
+                dtype_descr.append(tuple(parts))
+            dtype = np.dtype(dtype_descr)
+            # JSON turns each structured record tuple into a list. NumPy
+            # treats that list as another array dimension unless restored.
+            def record_tuples(items, dimensions):
+                if dimensions == 0:
+                    return tuple(items)
+                return [record_tuples(item, dimensions - 1) for item in items]
+            data = record_tuples(data, len(value.get("shape", [len(data)])))
+        elif value.get("dtype"):
+            try:
+                dtype = np.dtype(value.get("dtype"))
+            except Exception:
+                dtype = None
+        result = np.asarray(data, dtype=dtype)
+        shape = value.get("shape")
+        if shape is not None:
+            try:
+                result = result.reshape(tuple(shape))
+            except Exception:
+                pass
+        return result
     if value_type == "object":
         return SimpleObject(**decode_value(value.get("attrs", {})))
     return {k: decode_value(v) for k, v in value.items()}
@@ -1835,7 +2155,11 @@ def quote_plain(value):
 
 def quote_records(value):
     if hasattr(value, "columns") and hasattr(value, "to_dict"):
-        # DataFrame.values can round large integer IDs in a mixed float/int table.
+        rows = dataframe_numeric_rows(value)
+        if rows is not None:
+            columns = list(value.columns)
+            return quote_plain([dict(zip(columns, row)) for row in rows])
+        # Keep pandas' scalar boxing for nullable, date-like and object fields.
         return quote_plain(value.to_dict("records"))
     names = getattr(getattr(value, "dtype", None), "names", None)
     if names:
@@ -1927,6 +2251,116 @@ def _is_zero_time_value(value):
     return bool(digits) and not set(digits) - {"0"}
 
 
+def market_data_result_needs_fallback(result):
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return not result or all(getattr(value, "empty", False) for value in result.values())
+    if getattr(result, "empty", False):
+        return True
+    return not hasattr(result, "columns") and not hasattr(result, "to_records")
+
+SMT_ASYNC_ARGUMENT_COUNTS = {
+    "smt_appointment_order": 4,
+    "smt_appointment_cancel": 1,
+    "smt_negotiate_order": 6,
+    "smt_compact_return": 4,
+    "smt_compact_renewal": 5,
+}
+
+XTTRADER_TRANSFER_RESULT_METHODS = {
+    "bank_transfer_in", "bank_transfer_out", "fund_transfer", "secu_transfer",
+    "ctp_transfer_future_to_option", "ctp_transfer_option_to_future",
+}
+
+
+_LITE_CREDIT_FIELD_ALIASES = {
+    "detail": {
+        "m_nStatus": (), "m_nUpdateTime": (), "m_nCalcConfig": (),
+        "m_dFrozenCash": (), "m_dBalance": (), "m_dAvailable": (),
+        "m_dPositionProfit": (), "m_dMarketValue": ("m_dInstrumentValue",),
+        "m_dFetchBalance": (), "m_dStockValue": (), "m_dFundValue": (),
+        "m_dTotalDebt": ("m_dTotalDebit",), "m_dEnableBailBalance": (),
+        "m_dPerAssurescaleValue": (), "m_dAssureAsset": (), "m_dFinDebt": (),
+        "m_dFinDealAvl": (), "m_dFinFee": (), "m_dSloDebt": (),
+        "m_dSloMarketValue": (), "m_dSloFee": (), "m_dOtherFare": (),
+        "m_dFinMaxQuota": (), "m_dFinEnableQuota": (), "m_dFinUsedQuota": (),
+        "m_dSloMaxQuota": (), "m_dSloEnableQuota": (), "m_dSloUsedQuota": (),
+        "m_dSloSellBalance": (), "m_dUsedSloSellBalance": (),
+        "m_dSurplusSloSellBalance": (),
+    },
+    "compact": {
+        "compact_type": ("m_eCompactType",), "cashgroup_prop": ("m_eCashgroupProp",),
+        "exchange_id": ("m_strExchangeID",), "open_date": ("m_nOpenDate",),
+        "business_vol": ("m_nBusinessVol",), "real_compact_vol": ("m_nRealCompactVol",),
+        "ret_end_date": ("m_nRetEndDate",), "business_balance": ("m_dBusinessBalance",),
+        "businessFare": ("m_dBusinessFare",), "real_compact_balance": ("m_dRealCompactBalance",),
+        "real_compact_fare": ("m_dRealCompactFare",), "repaid_fare": ("m_dRepaidFare",),
+        "repaid_balance": ("m_dRepaidBalance",), "instrument_id": ("m_strInstrumentID",),
+        "compact_id": ("m_strCompactId", "m_strCompactID"), "position_str": ("m_strPositionStr",),
+    },
+    "subjects": {
+        "exchange_id": ("m_strExchangeID",), "instrument_id": ("m_strInstrumentID",),
+        "slo_status": ("m_eSloStatus",), "fin_status": ("m_eFinStatus",),
+        "slo_ratio": ("m_dSloRatio",), "fin_ratio": ("m_dFinRatio",),
+    },
+    "assure": {
+        "exchange_id": ("m_strExchangeID",), "instrument_id": ("m_strInstrumentID",),
+        "assure_status": ("m_eAssureStatus",), "assure_ratio": ("m_dAssureRatio",),
+    },
+    "slo_code": {
+        "exchange_id": ("m_strExchangeID",), "instrument_id": ("m_strInstrumentID",),
+        "cashgroup_prop": ("m_eCashgroupProp", "m_eQuerySloType"),
+        "enable_amount": ("m_nEnableAmount",),
+    },
+}
+
+LITE_OBJECT_QUERY_METHODS = {
+    "query_account_info", "query_account_infos", "query_account_status",
+    "query_secu_account", "query_bank_info", "query_bank_amount",
+    "query_bank_transfer_stream",
+}
+
+def _quote_json_default(value):
+    """Box only uncommon quote scalars; ordinary dict/list traversal stays in JSON's C encoder."""
+    if type(value).__module__.startswith("pandas.") and type(value).__name__ in ("NAType", "NaTType"):
+        return None
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError("unsupported quote JSON type: %s" % type(value).__name__)
+
+def pack_quote_latency_event(event, data, client_id=None, subscription_id=None):
+    """Encode the complete diagnostic snapshot once, without recursive Python preprocessing.
+
+    Nonfinite or unusual payloads raise and use the bridge's existing compatibility
+    encoder. The wire format remains ordinary strict JSON, consumable by old receivers.
+    """
+    started = time.perf_counter()
+    quotes_json = json.dumps(data["quotes"], default=_quote_json_default,
+                             ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    metadata = {key: value for key, value in data.items() if key != "quotes"}
+    metadata["qmt_encode_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+    metadata["qmt_encoding"] = "direct_json"
+    header = dumps_message({"type": "event", "event": event, "client_id": client_id,
+                           "subscription_id": subscription_id, "meta": {"quote_json_plain": True}})
+    details = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return header[:-1] + ',"data":' + details[:-1] + ',"quotes":' + quotes_json + '}}'
+
+def pack_whole_quote_event(event, data, client_id=None, subscription_id=None):
+    """Serialize a whole-quote batch without recursive Python preprocessing.
+
+    Only the event metadata carries the encoding marker; callback data keeps
+    its stock-code dictionary shape. Unsupported values require the caller's
+    compatibility fallback, just as for diagnostic snapshots.
+    """
+    quotes_json = json.dumps(data, default=_quote_json_default,
+                             ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    header = dumps_message({"type": "event", "event": event, "client_id": client_id,
+                           "subscription_id": subscription_id, "meta": {"quote_json_plain": True}})
+    return header[:-1] + ',"data":' + quotes_json + '}'
+
 class TxTradeBridge(object):
     def __init__(
         self,
@@ -1964,6 +2398,7 @@ class TxTradeBridge(object):
         self.pending_sync_orders_lock = threading.RLock()
         self.order_request_metadata = {}
         self.order_request_metadata_lock = threading.RLock()
+        self.order_callback_cache = OrderCallbackCache()
 
     def set_context(self, context):
         self.context = context
@@ -2025,15 +2460,16 @@ class TxTradeBridge(object):
         msg = loads_message(raw)
         if not msg or msg.get("type") != "request":
             return
+        msg["_received_monotonic"] = time.perf_counter()
         request_id = msg.get("id")
         action = msg.get("action")
         client_id = msg.get("client_id") or msg.get("reply_channel")
         try:
             result = self._dispatch(action, msg.get("params") or {}, msg)
-            response = pack_response(request_id, ok=True, result=result)
+            response = pack_response(request_id, ok=True, result=result, meta=msg.get("_response_meta"))
             self._log("tx trade response_ready action=%s id=%s" % (action, request_id))
         except Exception as e:
-            response = pack_response(request_id, ok=False, error=e)
+            response = pack_response(request_id, ok=False, error=e, meta=msg.get("_response_meta"))
             self._log("tx trade request_error action=%s id=%s error=%s" % (action, request_id, e))
         if client_id:
             self.tx.push("response", response, client_id)
@@ -2043,6 +2479,8 @@ class TxTradeBridge(object):
             )
 
     def _dispatch(self, action, params, msg):
+        if action in ("xtdata.get_market_data", "xtdata.get_market_data_ex", "xtdata.get_full_tick"):
+            return self._dispatch_timed_market_data(action, params, msg)
         if action == "xttrader.get_hkt_exchange_rate":
             return query_connect_exchange_rate(self, params)
         if action in CFTRADER_BATCH_ORDER_ACTIONS:
@@ -2065,7 +2503,7 @@ class TxTradeBridge(object):
         if action == "cfquant.set_log_enabled":
             return self._set_log_enabled(params)
         if action == "cfquant.get_log_enabled":
-            return {"enabled": get_log_enabled()}
+            return {"enabled": self._get_log_enabled()}
         if action == "cfquant.cleanup_qmt_logs":
             return self._cleanup_qmt_userdata_logs(params)
         if action == "cfquant.query_info":
@@ -2096,12 +2534,6 @@ class TxTradeBridge(object):
             return self._cancel_order_stock_sysid(params)
         if action == "xttrader.cancel_order_stock_sysid_async":
             return self._cancel_order_stock_sysid_async(params, msg)
-        if action == "xtdata.get_market_data":
-            return self._get_market_data(params)
-        if action == "xtdata.get_market_data_ex":
-            return self._get_market_data_ex(params)
-        if action == "xtdata.get_full_tick":
-            return self.context.get_full_tick(params.get("code_list", []))
         if action == "xtdata.get_local_data":
             return self._get_local_data(params)
         if action == "xtdata.download_history_data":
@@ -2119,7 +2551,7 @@ class TxTradeBridge(object):
         if action == "xtdata.get_instrument_detail":
             return self._get_instrument_detail(params)
         if action == "xtdata.get_stock_list_in_sector":
-            return self.context.get_stock_list_in_sector(params.get("sector_name", ""))
+            return self._get_stock_list_in_sector(params)
         if action.startswith("xtdata."):
             return self._dispatch_xtdata_compat(action, params, msg)
         if action.startswith("xttrader."):
@@ -2149,7 +2581,7 @@ class TxTradeBridge(object):
             "runtime": runtime,
             "account_subscribers": self._account_subscriber_status(),
             "log_language": get_log_language(),
-            "log_enabled": get_log_enabled(),
+            "log_enabled": self._get_log_enabled(),
             "context_ready": self.context is not None,
             "tx_ready": self.tx is not None,
             "ts": time.time(),
@@ -2266,95 +2698,27 @@ class TxTradeBridge(object):
         self._log("QMT日志语言已切换为:%s" % ("中文" if lang == "zh" else "English"))
         return {"language": lang}
 
+    def _get_log_enabled(self):
+        getter = self.globals_dict.get("get_log_enabled")
+        if callable(getter):
+            return bool(getter())
+        return get_log_enabled()
+
     def _set_log_enabled(self, params):
         params = params or {}
         if "enabled" in params:
             value = params.get("enabled")
         else:
             value = params.get("show")
-        enabled = set_log_enabled(value)
+        setter = self.globals_dict.get("set_log_enabled") or set_log_enabled
+        enabled = setter(value)
         self.show = True
-        self._log("QMT log output enabled=%s" % ("1" if enabled else "0"), force=True)
+        self._log("QMT log output enabled=%s" % ("1" if enabled else "0"))
         return {"enabled": enabled}
 
     def _cleanup_qmt_userdata_logs(self, params):
-        params = params or {}
-        retention_days = self._retention_days(params.get("retention_days"), default=5)
-        dry_run = str(params.get("dry_run") or "").strip().lower() in ("1", "true", "yes", "on")
-        log_dir, candidate_dirs, python_dir, entry_file = self._qmt_userdata_log_dir()
-        result = {
-            "bridge_id": self.bridge_id,
-            "request_channel": self.request_channel,
-            "retention_days": retention_days,
-            "dry_run": dry_run,
-            "entry_file": entry_file,
-            "python_dir": python_dir,
-            "log_dir": log_dir,
-            "candidate_dirs": candidate_dirs,
-            "exists": bool(log_dir and os.path.isdir(log_dir)),
-            "scanned_files": 0,
-            "kept_files": 0,
-            "deleted_files": 0,
-            "would_delete_files": 0,
-            "failed_files": 0,
-            "deleted_bytes": 0,
-            "errors": [],
-            "ts": time.time(),
-        }
-        if not result["exists"]:
-            return result
+        raise NotImplementedError("QMT file IO is disabled; clean logs from the external Web process.")
 
-        cutoff = time.time() - retention_days * 86400
-        for current_root, dirs, files in os.walk(log_dir):
-            for name in files:
-                path = os.path.join(current_root, name)
-                result["scanned_files"] += 1
-                try:
-                    stat_result = os.stat(path)
-                    if stat_result.st_mtime >= cutoff:
-                        result["kept_files"] += 1
-                        continue
-                    if dry_run:
-                        result["would_delete_files"] += 1
-                        result["deleted_bytes"] += stat_result.st_size
-                    else:
-                        os.remove(path)
-                        result["deleted_files"] += 1
-                        result["deleted_bytes"] += stat_result.st_size
-                except Exception as e:
-                    result["failed_files"] += 1
-                    result["errors"].append("%s: %s" % (path, e))
-        self._log(
-            "qmt userdata log cleanup log_dir=%s retention_days=%s deleted=%s failed=%s dry_run=%s"
-            % (log_dir, retention_days, result["deleted_files"], result["failed_files"], dry_run)
-        )
-        return result
-
-    def _qmt_userdata_log_dir(self):
-        entry_file = self.globals_dict.get("__file__") or ""
-        if entry_file:
-            entry_file = os.path.abspath(entry_file)
-            python_dir = os.path.dirname(entry_file)
-        else:
-            python_dir = os.path.abspath(os.getcwd())
-        candidate_dirs = []
-        if os.path.basename(python_dir).lower() == "python":
-            candidate_dirs.append(os.path.join(os.path.dirname(python_dir), "userdata", "log"))
-        candidate_dirs.append(os.path.join(python_dir, "userdata", "log"))
-
-        normalized = []
-        seen = set()
-        for path in candidate_dirs:
-            path = os.path.abspath(path)
-            key = path.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(path)
-        for path in normalized:
-            if os.path.isdir(path):
-                return path, normalized, python_dir, entry_file
-        return normalized[0] if normalized else "", normalized, python_dir, entry_file
 
     def _retention_days(self, value, default=5):
         try:
@@ -2391,7 +2755,7 @@ class TxTradeBridge(object):
         )
         used_query_account_id = query_account_id
         try:
-            rows = func(query_account_id, account_type.lower(), detail_type.lower()) or []
+            rows = self._call_trade_detail_data(func, query_account_id, account_type.lower(), detail_type.lower()) or []
         except Exception as e:
             if query_account_id != account_id:
                 self._log(
@@ -2399,7 +2763,7 @@ class TxTradeBridge(object):
                     % (account_id, query_account_id, detail_type, e)
                 )
                 used_query_account_id = account_id
-                rows = func(account_id, account_type.lower(), detail_type.lower()) or []
+                rows = self._call_trade_detail_data(func, account_id, account_type.lower(), detail_type.lower()) or []
             else:
                 self._log(
                     "query_trade_detail call failed account=%s detail_type=%s error=%s"
@@ -2412,7 +2776,7 @@ class TxTradeBridge(object):
                 % (account_id, query_account_id, detail_type, account_id)
             )
             used_query_account_id = account_id
-            rows = func(account_id, account_type.lower(), detail_type.lower()) or []
+            rows = self._call_trade_detail_data(func, account_id, account_type.lower(), detail_type.lower()) or []
         result = []
         for index, row in enumerate(rows):
             try:
@@ -2430,6 +2794,8 @@ class TxTradeBridge(object):
                             formatted.setdefault("query_account_key", used_query_account_id)
                     if detail_type.lower() in ("order", "deal"):
                         self._enrich_order_request_fields(formatted)
+                        if detail_type.lower() == "order":
+                            self._remember_order_callback_fields(formatted)
                 result.append(formatted)
             except Exception as e:
                 self._log(
@@ -3054,6 +3420,10 @@ class TxTradeBridge(object):
         return bool(previous_key and previous_key in self._order_reference_values(order))
 
 
+    def _remember_order_callback_fields(self, order):
+        self.order_callback_cache.remember(order, self._account_type_name(order.get("account_type")))
+
+
     def _get_last_order_id(self, account_id, account_type, strategy_name=""):
         func = self._get_callable("get_last_order_id")
         if not func:
@@ -3272,7 +3642,7 @@ class TxTradeBridge(object):
                     for candidate_key, candidate in self.order_request_metadata.items():
                         if candidate_key[0] != key[0]:
                             continue
-                        if key[2] and is_unique_order_remark(candidate_key[2]) and candidate_key[2] != key[2]:
+                        if not order_remark_matches_reference(candidate_key[2], key[2]):
                             continue
                         if key[1] and candidate_key[1] and key[1] != candidate_key[1]:
                             continue
@@ -3319,6 +3689,7 @@ class TxTradeBridge(object):
             for name in ("m_strOrderRef", "m_strOrderID"):
                 if order.get(name) is None or str(order.get(name)).strip() in ("", "0", "-1"):
                     order[name] = str(order_id)
+        self.order_callback_cache.enrich(order, self._account_type_name(order.get("account_type")))
         return restore_order_remark(order)
     def _prune_pending_async_orders_locked(self):
         wait_seconds = os.environ.get("CFQUANT_ASYNC_ORDER_RESPONSE_WAIT_SECONDS", 60.0)
@@ -3492,8 +3863,689 @@ class TxTradeBridge(object):
         self._send_trader_event(msg.get("client_id"), "on_cancel_order_stock_async_response", data)
         return result
 
+    def _require_qmt_callable(self, *names):
+        func = self._get_callable(*names)
+        if not func:
+            raise NotImplementedError("requires QMT callable: %s" % ", ".join(names))
+        return func
+
+    def _get_cb_info(self, stockcode):
+        # The Python source supplies two fields, not the similarly named VBA API.
+        data = self._require_qmt_callable("get_convert_bond_info")(stockcode)
+        if data is None or data == {}:
+            return data
+        if not isinstance(data, dict):
+            raise ValueError("QMT get_convert_bond_info must return a dictionary")
+        result = {
+            "bondCode": stockcode,
+            "cfquant_partial": True,
+            "cfquant_source": "get_convert_bond_info",
+        }
+        for source, target in (("stockcode", "stockCode"), ("convert_price", "bondConvPrice")):
+            if source in data:
+                result[target] = data[source]
+        return result
+
+    def _get_divid_factors(self, stock_code):
+        return self._require_qmt_callable("get_divid_factors")(stock_code)
+
+    def _get_stock_list_in_sector(self, params):
+        func = self._require_qmt_callable("get_stock_list_in_sector")
+        sector = params.get("sector_name", "")
+        timetag = params.get("real_timetag", -1)
+        if timetag == -1:
+            return func(sector)
+        # Never retry without a requested historical timestamp.
+        return func(sector, timetag)
+
+    def _get_sector_list(self):
+        func = self._require_qmt_callable("get_sector_list")
+        pending, visited, sectors, seen = [""], set(), [], set()
+        while pending:
+            node = pending.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            if len(visited) > 10000:
+                raise ValueError("QMT sector tree exceeds 10000 nodes")
+            info = func(node)
+            if not isinstance(info, (list, tuple)) or len(info) != 2:
+                raise ValueError("QMT get_sector_list must return [sectors, folders]")
+            if any(not isinstance(items, (list, tuple)) for items in info):
+                raise ValueError("invalid QMT sector tree node")
+            if any(not isinstance(name, str) or not name for items in info for name in items):
+                raise ValueError("invalid QMT sector or folder name")
+            for sector in info[0]:
+                if sector not in seen:
+                    seen.add(sector)
+                    sectors.append(sector)
+            pending.extend(reversed(info[1]))
+        return sectors
+
+    def _create_sector_folder(self, parent_node, folder_name, overwrite=True):
+        return self._require_qmt_callable("create_sector_folder")(parent_node, folder_name, overwrite)
+
+    def _create_sector(self, parent_node, sector_name, overwrite=True):
+        return self._require_qmt_callable("create_sector")(parent_node, sector_name, overwrite)
+
+    def _validate_sector_stocks(self, sector_name, stock_list):
+        if not isinstance(sector_name, str) or not sector_name.strip():
+            raise ValueError("sector_name must be a non-empty string")
+        if not isinstance(stock_list, (list, tuple)) or any(
+            not isinstance(code, str) or not code.strip() for code in stock_list
+        ):
+            raise ValueError("stock_list must be a list of non-empty stock codes")
+
+    def _reset_sector(self, sector_name, stock_list):
+        self._validate_sector_stocks(sector_name, stock_list)
+        return self._require_qmt_callable("reset_sector_stock_list", "reset_sector")(sector_name, list(stock_list))
+
+    def _remove_stock_from_sector(self, sector_name, stock_list):
+        self._validate_sector_stocks(sector_name, stock_list)
+        func = self._require_qmt_callable("remove_stock_from_sector")
+        succeeded = True
+        for code in dict.fromkeys(stock_list):
+            # Evaluate every deletion; False must not short-circuit the remaining stocks.
+            if not func(sector_name, code):
+                succeeded = False
+        return succeeded
+
+    def _call_formula_batch(self, formula_names, stock_codes, period, start_time="", end_time="",
+                            count=-1, dividend_type="none", extend_params=None):
+        return self._require_qmt_callable("call_formula_batch")(
+            formula_names, stock_codes, period, start_time, end_time, count, dividend_type,
+            [] if extend_params is None else extend_params,
+        )
+
+    def _instrument_detail_callable_missing(self, error):
+        if isinstance(error, NotImplementedError):
+            return True
+        text = str(error or "").strip().lower().replace("_", " ")
+        if not text:
+            return False
+        missing_markers = ("not found", "not implemented", "unsupported", "no attribute")
+        is_detail = "get instrument detail" in text or "get instrumentdetail" in text
+        return is_detail and any(marker in text for marker in missing_markers)
+
+    def _fallback_instrument_detail(self, params, stock_code):
+        code_info = self._instrument_code_info(stock_code)
+        candidates = self._stock_code_candidates(code_info)
+        stock_name = self._optional_stock_callable("get_stock_name", candidates)
+        stock_type = self._optional_stock_callable("get_stock_type", candidates)
+        open_date = self._optional_stock_callable("get_open_date", candidates, prefer_nonzero=True)
+        expire_date = self._optional_stock_callable("get_contract_expire_date", candidates, prefer_nonzero=True)
+        multiplier = self._optional_stock_callable("get_contract_multiplier", candidates, prefer_nonzero=True)
+        is_stock = self._optional_stock_bool("is_stock", candidates)
+        is_fund = self._optional_stock_bool("is_fund", candidates)
+        is_future = self._optional_stock_bool("is_future", candidates)
+        product_id = self._fallback_product_id(code_info, is_stock, is_fund, is_future)
+        canonical_code = code_info.get("canonical") or code_info.get("raw") or ""
+
+        detail = {
+            "ExchangeID": code_info.get("exchange_id", ""),
+            "InstrumentID": code_info.get("instrument_id", ""),
+            "InstrumentName": stock_name if stock_name is not None else "",
+            "ProductID": product_id,
+            "ProductName": product_id,
+            "ExchangeCode": code_info.get("exchange_id", ""),
+            "RzrkCode": "",
+            "UniCode": canonical_code,
+            "CreateDate": "",
+            "OpenDate": open_date if open_date is not None else "",
+            "ExpireDate": expire_date if expire_date is not None else "",
+            "TradingDay": time.strftime("%Y%m%d"),
+            "PreClose": 0.0,
+            "SettlementPrice": 0.0,
+            "UpStopPrice": 0.0,
+            "DownStopPrice": 0.0,
+            "FloatVolumn": 0,
+            "TotalVolumn": 0,
+            "FloatVolume": 0,
+            "TotalVolume": 0,
+            "LongMarginRatio": 0.0,
+            "ShortMarginRatio": 0.0,
+            "PriceTick": 0.0,
+            "VolumeMultiple": multiplier if multiplier is not None else 0,
+            "MainContract": 0,
+            "LastVolume": 0,
+            "InstrumentStatus": 0,
+            "IsTrading": False,
+            "IsRecent": False,
+            "HSGTFlag": "",
+            "StockCode": canonical_code,
+            "stock_code": canonical_code,
+            "InputStockCode": code_info.get("raw", ""),
+            "cfquant_detail_fallback": True,
+            "cfquant_detail_partial": True,
+        }
+        if stock_type is not None:
+            detail["StockType"] = stock_type
+        if is_stock is not None:
+            detail["IsStock"] = is_stock
+        if is_fund is not None:
+            detail["IsFund"] = is_fund
+        if is_future is not None:
+            detail["IsFuture"] = is_future
+        return detail
+
+    def _instrument_code_info(self, stock_code):
+        raw = str(stock_code or "").strip().upper()
+        instrument_id = raw
+        exchange_id = ""
+        if "." in raw:
+            left, right = raw.rsplit(".", 1)
+            instrument_id = left.strip()
+            exchange_id = self._market_suffix(right.strip())
+        elif len(raw) > 2 and raw[:2] in ("SH", "SZ", "BJ") and raw[2:].isdigit():
+            exchange_id = self._market_suffix(raw[:2])
+            instrument_id = raw[2:]
+        elif len(raw) > 2 and raw[-2:] in ("SH", "SZ", "BJ") and raw[:-2].isdigit():
+            exchange_id = self._market_suffix(raw[-2:])
+            instrument_id = raw[:-2]
+        else:
+            exchange_id = self._infer_stock_exchange_id(raw)
+        canonical = "%s.%s" % (instrument_id, exchange_id) if instrument_id and exchange_id else raw
+        return {
+            "raw": raw,
+            "instrument_id": instrument_id,
+            "exchange_id": exchange_id,
+            "canonical": canonical,
+        }
+
+    def _infer_stock_exchange_id(self, instrument_id):
+        code = str(instrument_id or "").strip().upper()
+        if not code:
+            return ""
+        if code.startswith(("43", "83", "87", "88", "92")) and len(code) == 6:
+            return "BJ"
+        if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
+            return "SH"
+        if code.startswith(("510", "511", "512", "513", "515", "516", "517", "518", "519", "588", "589")):
+            return "SH"
+        if code.startswith(("000", "001", "002", "003", "159", "184", "200", "300", "301", "399")):
+            return "SZ"
+        return ""
+
+    def _stock_code_candidates(self, code_info):
+        raw = code_info.get("raw", "")
+        instrument_id = code_info.get("instrument_id", "")
+        exchange_id = code_info.get("exchange_id", "")
+        canonical = code_info.get("canonical", "")
+        prefixed = "%s%s" % (exchange_id, instrument_id) if exchange_id in ("SH", "SZ", "BJ") and instrument_id else ""
+        values = []
+        for value in (raw, canonical, prefixed, instrument_id):
+            if value and value not in values:
+                values.append(value)
+        return values
+
+    def _optional_stock_callable(self, method, candidates, prefer_nonzero=False):
+        func = self._get_callable(method)
+        if not func:
+            return None
+        fallback_value = None
+        for stock_code in candidates:
+            try:
+                value = self._plain_value(func(stock_code))
+            except Exception:
+                continue
+            if value is None or value == "":
+                continue
+            if prefer_nonzero and value in (0, "0", False):
+                fallback_value = value
+                continue
+            return value
+        return fallback_value
+
+    def _optional_stock_bool(self, method, candidates):
+        func = self._get_callable(method)
+        if not func:
+            return None
+        fallback_value = None
+        for stock_code in candidates:
+            try:
+                value = self._plain_value(func(stock_code))
+            except Exception:
+                continue
+            if value is None or value == "":
+                continue
+            bool_value = self._coerce_optional_bool(value)
+            if bool_value is True:
+                return True
+            if bool_value is False:
+                fallback_value = False
+        return fallback_value
+
+    def _coerce_optional_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "y", "on"):
+            return True
+        if text in ("0", "false", "no", "n", "off"):
+            return False
+        return bool(text)
+
+    def _fallback_product_id(self, code_info, is_stock, is_fund, is_future):
+        if is_fund:
+            return "FUND"
+        if is_future:
+            return "FUTURE"
+        if is_stock:
+            return "STOCK"
+        exchange_id = code_info.get("exchange_id", "")
+        instrument_id = code_info.get("instrument_id", "")
+        if exchange_id in ("IF", "SF", "DF", "ZF", "INE", "GF"):
+            return "FUTURE"
+        if instrument_id.startswith(("510", "511", "512", "513", "515", "516", "517", "518", "519", "588", "589", "159")):
+            return "FUND"
+        if exchange_id in ("SH", "SZ", "BJ"):
+            return "STOCK"
+        return ""
+
+    def _query_account_id(self, params):
+        account = params.get("account") or {}
+        account_id = account.get("account_id") or params.get("account_id") or self.account_id
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise ValueError("account_id must be a non-empty string")
+        return account_id
+
+
+    def _call_trade_detail_data(self, func, account_id, account_type, detail_type):
+        variants = [
+            ((account_id, account_type, detail_type), {}),
+            ((account_id, account_type, detail_type, ""), {}),
+        ]
+        last_error = None
+        for args, kwargs in variants:
+            try:
+                return func(*args, **kwargs)
+            except TypeError as error:
+                last_error = error
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no available trade detail call variant")
+
+
+    def _credit_account_id(self, params):
+        account_id = self._query_account_id(params)
+        account = params.get("account") or {}
+        account_type = self._account_type_name(
+            account.get("account_type") or params.get("account_type")
+        )
+        if account_type.upper() != "CREDIT":
+            raise ValueError("credit query requires a CREDIT account")
+        return account_id
+
+
+    def _credit_row_data(self, row, aliases):
+        if isinstance(row, dict):
+            return self._plain_value(row)
+        data = {}
+        names = {"account_id", "account_type", "m_strAccountID", "m_nAccountType", "m_strAccountType", "m_nBrokerType"}
+        names.update(aliases.keys())
+        for values in aliases.values():
+            names.update(values)
+        for name in names:
+            value = self._get_value(row, name)
+            if value is not None:
+                data[name] = value
+        if not data:
+            try:
+                for name in dir(row):
+                    if name.startswith("_"):
+                        continue
+                    value = getattr(row, name)
+                    if not callable(value):
+                        data[name] = self._plain_value(value)
+            except Exception:
+                pass
+        return data
+
+
+    def _credit_field_value(self, data, names):
+        for name in names:
+            if name in data and data.get(name) is not None:
+                return data.get(name)
+            if name.startswith("m_"):
+                compact = name[:1] + name[2:]
+                if compact in data and data.get(compact) is not None:
+                    return data.get(compact)
+        return None
+
+
+    def _format_credit_rows(self, rows, params, kind, source):
+        account_id = self._credit_account_id(params)
+        if rows is None:
+            return None
+        if isinstance(rows, (str, bytes, dict)):
+            raise ValueError("%s returned an invalid credit query result" % source)
+        aliases = _LITE_CREDIT_FIELD_ALIASES.get(kind, {})
+        result = []
+        for row in rows:
+            data = self._credit_row_data(row, aliases)
+            if not data:
+                raise ValueError("%s returned an invalid credit account row" % source)
+            for name in ("account_id", "m_strAccountID"):
+                value = data.get(name)
+                if value not in (None, "", account_id):
+                    raise ValueError("%s returned a different account" % source)
+            for name in ("account_type", "m_nAccountType", "m_strAccountType", "m_nBrokerType"):
+                value = data.get(name)
+                if value not in (None, "") and str(value).upper() not in ("3", "CREDIT"):
+                    raise ValueError("%s returned a non-CREDIT account" % source)
+            for target, names in aliases.items():
+                value = self._credit_field_value(data, (target,) + tuple(names))
+                if value is not None:
+                    data[target] = value
+            data["account_id"] = account_id
+            data["account_type"] = 3
+            if kind == "detail" and source == "get_trade_detail_data":
+                raw_quotas = {
+                    name: data.pop(name)
+                    for name in ("m_dFinUsedQuota", "m_dSloUsedQuota")
+                    if name in data
+                }
+                if raw_quotas:
+                    data["cfquant_qmt_fields"] = raw_quotas
+            data["cfquant_source"] = source
+            data["cfquant_missing_fields"] = [
+                target for target, names in aliases.items()
+                if self._credit_field_value(data, (target,) + tuple(names)) is None
+            ]
+            result.append(data)
+        return result
+
+
+    def _query_credit_detail(self, params):
+        account_id = self._credit_account_id(params)
+        func = self._get_callable("get_trade_detail_data")
+        if func:
+            rows = self._call_trade_detail_data(func, account_id, "credit", "account")
+            return self._format_credit_rows(rows, params, "detail", "get_trade_detail_data")
+        rows = self._generic_xttrader_call("query_credit_detail", params)
+        return self._format_credit_rows(rows, params, "detail", "query_credit_detail")
+
+
+    def _query_qmt_objects(self, params, kind, source):
+        account_id = self._credit_account_id(params)
+        func = self._get_callable(source)
+        if not func:
+            raise NotImplementedError("%s not found" % source)
+        rows = func(account_id)
+        return self._format_credit_rows(rows, params, kind, source)
+
+
+    def _query_stk_compacts(self, params):
+        account_id = self._credit_account_id(params)
+        func = self._get_callable("get_unclosed_compacts")
+        if func:
+            rows = func(account_id, "CREDIT")
+            source = "get_unclosed_compacts"
+        else:
+            func = self._get_callable("get_debt_contract")
+            if func:
+                rows = func(account_id)
+                source = "get_debt_contract"
+            else:
+                rows = self._generic_xttrader_call("query_stk_compacts", params)
+                source = "query_stk_compacts"
+        return self._format_credit_rows(rows, params, "compact", source)
+    def _smt_request(self, params, msg, method):
+        account_id = self._credit_account_id(params)
+        seq = params.get("seq")
+        client_id = msg.get("client_id") or msg.get("reply_channel")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0 or not client_id:
+            raise ValueError("SMT request requires a positive seq and client_id")
+        args = list(params.get("args") or [])
+        if len(args) != SMT_ASYNC_ARGUMENT_COUNTS[method] or params.get("kwargs"):
+            raise ValueError("invalid arguments for %s" % method)
+        func = self._get_callable(method)
+        if not func:
+            raise NotImplementedError(
+                "xttrader.%s_async is unavailable: this QMT does not expose %s with a final SMT business response"
+                % (method, method)
+            )
+        # A broker extension must return its final business response. Do not
+        # retry a mutating call with alternative signatures or treat an ACK as success.
+        raw = func(account_id, *args)
+        if raw is False or (isinstance(raw, int) and not isinstance(raw, bool) and raw == -1):
+            return {"seq": -1, "accepted": False}
+        data = self._smt_response_data(raw)
+        if not data:
+            raise RuntimeError("%s returned no final business response; outcome unknown, reconcile before retrying" % method)
+        for name in ("account_id", "m_strAccountID"):
+            if data.get(name) not in (None, "", account_id):
+                raise ValueError("%s returned a different account" % method)
+        for name in ("account_type", "m_nAccountType", "m_strAccountType", "m_nBrokerType"):
+            if data.get(name) not in (None, "") and str(data[name]).upper() not in ("3", "CREDIT"):
+                raise ValueError("%s returned a non-CREDIT account" % method)
+        apply_id = data.get("apply_id")
+        valid_apply_id = isinstance(apply_id, str) and bool(apply_id.strip())
+        if isinstance(apply_id, int) and not isinstance(apply_id, bool) and apply_id == -1:
+            valid_apply_id = data.get("success") is False
+        if (not isinstance(data.get("success"), bool)
+                or not valid_apply_id
+                or not isinstance(data.get("msg"), str)):
+            raise RuntimeError("%s returned an incomplete business response; outcome unknown, reconcile before retrying" % method)
+        if data["success"] and str(data["apply_id"]) == "-1":
+            raise RuntimeError("%s returned success without a valid apply_id" % method)
+        data.update(seq=seq, account_id=account_id, account_type=3)
+        self._send_trader_event(client_id, "on_smt_appointment_async_response", data)
+        return {"seq": seq, "accepted": True}
+    def _format_transfer_result(self, result, params):
+        seq = params.get("seq")
+        if isinstance(result, (list, tuple)) and len(result) >= 2:
+            return {"seq": seq, "success": self._plain_value(result[0]), "msg": self._plain_value(result[1])}
+        data = result if isinstance(result, dict) else self._credit_row_data(result, {})
+        if isinstance(data, dict):
+            return {
+                "seq": seq if seq is not None else self._first_present(data, ("seq", "m_nSeq", "request_id")),
+                "success": self._first_present(data, ("success", "m_bSuccess", "ok", "accepted")),
+                "msg": self._first_present(data, ("msg", "m_strMsg", "m_strError", "message", "error", "error_msg"), ""),
+            }
+        return data
+
+    def _format_compat_query_objects(self, rows, cls=None, force_list=False):
+        if rows is None:
+            return None
+        is_list = isinstance(rows, (list, tuple))
+        values = list(rows) if is_list else [rows]
+        result = [self._format_compat_query_object(row, cls) for row in values]
+        return result if force_list or is_list else result[0]
+
+    def _format_compat_query_object(self, row, cls=None):
+        data = self._plain_object(row, self._known_query_fields(cls))
+        if not isinstance(data, dict):
+            return data
+        if cls is None:
+            return data
+        obj = cls.from_any(data)
+        if hasattr(obj, "__dict__"):
+            return self._plain_value(vars(obj))
+        return self._plain_value(obj)
+
+    def _known_query_fields(self, cls):
+        if cls is None:
+            return None
+        if hasattr(cls, "known_field_names"):
+            return cls.known_field_names()
+        if cls is XtAccountStatus:
+            return set(_with_qmt_compact_aliases(
+                "account_id",
+                "account_type",
+                "m_strAccountID",
+                "m_nAccountType",
+                "m_strAccountType",
+                "m_nBrokerType",
+                "status",
+                "m_nStatus",
+                "m_nLoginStatus",
+                "login_status",
+            ))
+        return None
+
+    def _plain_object(self, value, known_fields=None):
+        if value is None or isinstance(value, (str, bool, int, float, bytes)):
+            return self._plain_value(value)
+        if isinstance(value, dict):
+            return self._plain_value(value)
+        if isinstance(value, (list, tuple)):
+            return [self._plain_object(item, known_fields) for item in value]
+        if hasattr(value, "__dict__"):
+            return self._plain_value(vars(value))
+        data = {}
+        for name in dir(value):
+            if name.startswith("_"):
+                continue
+            if known_fields is not None and name not in known_fields and not name.startswith("m_"):
+                continue
+            try:
+                field = getattr(value, name)
+            except Exception as e:
+                self._log(
+                    "query object getattr failed type=%s field=%s error=%s"
+                    % (type(value).__name__, name, e)
+                )
+                continue
+            if callable(field):
+                continue
+            data[name] = self._plain_value(field)
+        return data if data else self._plain_value(value)
+
+    def _first_present(self, data, names, default=None):
+        for name in names:
+            if name in data and data.get(name) is not None:
+                return data.get(name)
+        return default
+
+    def _smt_response_data(self, raw):
+        # Validate before SDK coercion: bool("false") and str([]) must never
+        # turn a malformed acknowledgement into a final business response.
+        data = self._plain_object(raw)
+        data = dict(data) if isinstance(data, dict) else {}
+        aliases = {
+            "success": ("m_bSuccess",),
+            "msg": ("m_strMsg", "m_strError", "error"),
+            "apply_id": ("m_strApplyID", "m_strApplyId", "applyId"),
+            "account_id": (), "m_strAccountID": (),
+            "account_type": (), "m_nAccountType": (),
+            "m_strAccountType": (), "m_nBrokerType": (),
+        }
+        for target, sources in aliases.items():
+            for name in (target,) + sources:
+                value = self._get_value(raw, name)
+                if value is not None:
+                    data[target] = value
+                    break
+        return data
+
+    def _dispatch_timed_market_data(self, action, params, msg):
+        started = time.perf_counter()
+        received = msg.get("_received_monotonic")
+        timing = {
+            "available": True,
+            "queue_ms": round(max(0.0, started - received) * 1000, 3) if received is not None else None,
+            "native_ms": 0.0, "convert_ms": 0.0,
+            "native_calls": [], "fallback_used": False,
+        }
+        msg["_response_meta"] = {"timing": {"qmt": timing}}
+        try:
+            if action == "xtdata.get_full_tick":
+                return self._timed_market_call(timing, "get_full_tick", self.context.get_full_tick,
+                                               params.get("code_list", []))
+            if action == "xtdata.get_market_data_ex":
+                return self._get_market_data_ex(params, timing=timing)
+            return self._get_market_data(params, timing=timing)
+        finally:
+            timing["execute_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            self._log(
+                "market_timing action=%s id=%s queue_ms=%s native_ms=%.3f convert_ms=%.3f execute_ms=%.3f fallback=%s"
+                % (action, msg.get("id"), timing["queue_ms"], timing["native_ms"],
+                   timing["convert_ms"], timing["execute_ms"], timing["fallback_used"])
+            )
+
+    def _timed_market_call(self, timing, name, func, *args):
+        if timing is None:
+            return func(*args)
+        started = time.perf_counter()
+        succeeded = False
+        try:
+            result = func(*args)
+            succeeded = True
+            return result
+        finally:
+            elapsed = (time.perf_counter() - started) * 1000
+            timing["native_ms"] = round(timing["native_ms"] + elapsed, 3)
+            timing["native_calls"].append({"method": name, "elapsed_ms": round(elapsed, 3), "ok": succeeded})
+
+    def _legacy_market_result(self, result, params, timing):
+        started = time.perf_counter()
+        try:
+            return market_data_legacy_shape(result, params.get("period", "1d"),
+                                            params.get("field_list", []), params.get("stock_list", []))
+        finally:
+            if timing is not None:
+                timing["convert_ms"] = round(timing["convert_ms"] + (time.perf_counter() - started) * 1000, 3)
+
     def _dispatch_xttrader_compat(self, action, params, msg):
         method = action.split(".", 1)[1]
+        if method in SMT_ASYNC_ARGUMENT_COUNTS:
+            return self._smt_request(params, msg, method)
+        if method in ("smt_query_quoter", "smt_query_compact", "smt_query_order"):
+            self._credit_account_id(params)
+            rows = self._generic_xttrader_call(method, params)
+            if rows is None:
+                return None
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("%s requires a list of SMT result dictionaries" % method)
+            return self._plain_value(rows)
+        if method in LITE_OBJECT_QUERY_METHODS:
+            rows = self._generic_xttrader_call(method, params)
+            return self._format_compat_query_objects(rows, force_list=True)
+        if method == "query_position_statistics":
+            account_id = self._query_account_id(params)
+            account = params.get("account") or {}
+            account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+            if account_type.upper() != "FUTURE":
+                raise ValueError("query_position_statistics requires a FUTURE account")
+            func = self._get_callable("get_trade_detail_data")
+            if func:
+                rows = self._call_trade_detail_data(func, account_id, "future", "position_statistics")
+            else:
+                rows = self._generic_xttrader_call(method, params)
+            return self._format_compat_query_objects(rows, force_list=True)
+        if method == "query_credit_detail":
+            return self._query_credit_detail(params)
+        if method == "query_stk_compacts":
+            return self._query_stk_compacts(params)
+        if method in ("query_credit_assure", "query_credit_subjects", "query_credit_slo_code"):
+            kind, native = {
+                "query_credit_assure": ("assure", "get_assure_contract"),
+                "query_credit_subjects": ("subjects", "get_assure_contract"),
+                "query_credit_slo_code": ("slo_code", "get_enable_short_contract"),
+            }[method]
+            self._credit_account_id(params)
+            if self._get_callable(native):
+                return self._query_qmt_objects(params, kind, native)
+            rows = self._generic_xttrader_call(method, params)
+            return self._format_credit_rows(rows, params, kind, method)
+        if method == "query_position_statistics" and self._get_callable("get_trade_detail_data"):
+            account_id = self._query_account_id(params)
+            account = params.get("account") or {}
+            account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+            if account_type.upper() != "FUTURE":
+                raise ValueError("query_position_statistics requires a FUTURE account")
+            return self._query_trade_detail(params, "position")
+        if method == "query_new_purchase_limit":
+            func = self._get_callable("get_new_purchase_limit")
+            if func:
+                return func(self._query_account_id(params))
+        if method == "query_ipo_data":
+            func = self._get_callable("get_ipo_data")
+            if func:
+                return func()
         if method == "query_com_fund":
             rows = self._query_trade_detail(params, "account")
             return rows[0] if rows else {}
@@ -3507,6 +4559,9 @@ class TxTradeBridge(object):
             return self._query_trade_detail(params, "deal")
         if method == "query_stock_positions_async":
             return self._query_trade_detail(params, "position")
+        if method in XTTRADER_TRANSFER_RESULT_METHODS:
+            result = self._generic_xttrader_call(method, params)
+            return self._format_transfer_result(result, params)
         return self._generic_xttrader_call(method, params)
 
     def _dispatch_xtdata_compat(self, action, params, msg):
@@ -3516,6 +4571,18 @@ class TxTradeBridge(object):
         if method == "get_l2thousand_queue":
             func = require_l2_callable(self._get_callable(method), method)
             return quote_plain(func(params.get("stock_code", ""), gear_num=params.get("gear_num"), price=thousand_price(params)))
+        adapters = {
+            "get_cb_info": self._get_cb_info,
+            "get_divid_factors": self._get_divid_factors,
+            "get_sector_list": self._get_sector_list,
+            "create_sector_folder": self._create_sector_folder,
+            "create_sector": self._create_sector,
+            "reset_sector": self._reset_sector,
+            "remove_stock_from_sector": self._remove_stock_from_sector,
+            "call_formula_batch": self._call_formula_batch,
+        }
+        if method in adapters:
+            return adapters[method](*(params.get("args") or []), **(params.get("kwargs") or {}))
         if method == "get_trading_dates":
             return self._get_trading_dates(params)
         if method in (
@@ -3648,25 +4715,18 @@ class TxTradeBridge(object):
         ])
         return self._call_variants(func, variants)
 
-    def _get_market_data(self, params):
+    def _get_market_data(self, params, timing=None):
         if params.get("period") in L2_PERIODS:
-            result = self._get_market_data_ex(params)
-            return market_data_legacy_shape(
-                result,
-                params.get("period", "1d"),
-                params.get("field_list", []),
-                params.get("stock_list", []),
-            )
+            result = self._get_market_data_ex(params, timing=timing)
+            return self._legacy_market_result(result, params, timing)
         func = self._get_callable("get_market_data")
         if not func:
-            result = self._get_market_data_ex(params)
-            return market_data_legacy_shape(
-                result,
-                params.get("period", "1d"),
-                params.get("field_list", []),
-                params.get("stock_list", []),
-            )
-        return func(
+            if timing is not None:
+                timing["fallback_used"] = True
+            result = self._get_market_data_ex(params, timing=timing)
+            return self._legacy_market_result(result, params, timing)
+        result = self._timed_market_call(
+            timing, "get_market_data", func,
             params.get("field_list", []),
             params.get("stock_list", []),
             params.get("start_time", ""),
@@ -3676,12 +4736,19 @@ class TxTradeBridge(object):
             params.get("dividend_type", "none"),
             params.get("count", -1),
         )
+        if market_data_result_needs_fallback(result):
+            if timing is not None:
+                timing["fallback_used"] = True
+            result = self._get_market_data_ex(params, timing=timing)
+            return self._legacy_market_result(result, params, timing)
+        return result
 
-    def _get_market_data_ex(self, params):
+    def _get_market_data_ex(self, params, timing=None):
         func = self._get_callable("get_market_data_ex")
         if not func:
             raise NotImplementedError("get_market_data_ex not found")
-        return func(
+        return self._timed_market_call(
+            timing, "get_market_data_ex", func,
             params.get("field_list", []),
             params.get("stock_list", []),
             params.get("period", "1d"),
@@ -3693,9 +4760,34 @@ class TxTradeBridge(object):
         )
 
     def _get_local_data(self, params):
+        modern = self._get_callable("get_market_data_ex")
+        if modern:
+            # The ninth QMT argument disables subscription and reads local data.
+            arguments = (
+                params.get("field_list", []),
+                params.get("stock_list") or params.get("code_list") or ([params["stock_code"]] if params.get("stock_code") else []),
+                params.get("period", "1d"),
+                params.get("start_time", ""),
+                params.get("end_time", ""),
+                params.get("count", -1),
+                params.get("dividend_type", "none"),
+                params.get("fill_data", True),
+                False,
+            )
+            try:
+                signature = inspect.signature(modern)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None:
+                try:
+                    signature.bind(*arguments)
+                except TypeError:
+                    modern = None
+            if modern is not None:
+                return modern(*arguments)
         func = self._get_callable("get_local_data")
         if not func:
-            return self._get_market_data_ex(params)
+            raise NotImplementedError("get_local_data requires local QMT data access")
         stock_code = self._first_param(params, ("stock_code", "stockcode", "stock", "code"), "")
         stock_list = self._list_param(params.get("stock_list", params.get("code_list", [])))
         if not stock_code and stock_list:
@@ -3703,26 +4795,28 @@ class TxTradeBridge(object):
         return self._call_local_data(func, stock_code, params)
 
     def _call_local_data(self, func, stock_code, params):
+        start_time = params.get("start_time") or params.get("start_date") or "19700101"
+        end_time = params.get("end_time") or params.get("end_date") or "22010101"
         return self._call_variants(func, [
             ((
                 stock_code,
-                params.get("start_time", params.get("start_date", "19700101")),
-                params.get("end_time", params.get("end_date", "22010101")),
+                start_time,
+                end_time,
                 params.get("period", "follow"),
                 params.get("divid_type", params.get("dividend_type", "none")),
                 params.get("count", -1),
             ), {}),
             ((
                 stock_code,
-                params.get("start_time", params.get("start_date", "19700101")),
-                params.get("end_time", params.get("end_date", "22010101")),
+                start_time,
+                end_time,
                 params.get("period", "follow"),
                 params.get("divid_type", params.get("dividend_type", "none")),
             ), {}),
             ((
                 stock_code,
-                params.get("start_time", params.get("start_date", "19700101")),
-                params.get("end_time", params.get("end_date", "22010101")),
+                start_time,
+                end_time,
             ), {}),
             ((stock_code,), {}),
         ])
@@ -3881,10 +4975,28 @@ class TxTradeBridge(object):
         return result
 
     def _get_instrument_detail(self, params):
-        func = self._get_callable("get_instrument_detail")
-        if not func:
-            raise NotImplementedError("get_instrument_detail not found")
-        return func(params.get("stock_code", ""))
+        params = params or {}
+        stock_code = self._first_param(params, ("stock_code", "stockcode", "stock", "code"), "")
+        iscomplete = params.get("iscomplete", params.get("is_complete", params.get("complete", False)))
+        for name in ("get_instrument_detail", "get_instrumentdetail"):
+            func = self._get_callable(name)
+            if not func:
+                continue
+            try:
+                if name == "get_instrumentdetail":
+                    result = func(stock_code)
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        result["cfquant_detail_partial"] = True
+                        result["cfquant_detail_source"] = name
+                    return result
+                return self._call_variants(func, [((stock_code, iscomplete), {}), ((stock_code,), {})])
+            except Exception as e:
+                if not self._instrument_detail_callable_missing(e):
+                    raise
+                self._log("%s unavailable: %s" % (name, e))
+        self._log("get_instrument_detail not found, using fallback")
+        return self._fallback_instrument_detail(params, stock_code)
 
     def _get_financial_data(self, params):
         func = self._get_callable("get_financial_data")
@@ -4831,31 +5943,11 @@ class TxTradeBridge(object):
         raise RuntimeError("LTtx transport is disabled in CFQUANT_LITE")
 
     def _default_log_file(self):
-        base_dir = os.getcwd()
-        log_dir = (
-            os.environ.get("CFQUANT_QMT_LOG_DIR")
-            or (os.path.join(os.environ.get("CFQUANT_LOG_DIR"), "qmt_bridge") if os.environ.get("CFQUANT_LOG_DIR") else "")
-            or os.path.join(base_dir, "log", "qmt_bridge")
-        )
-        log_dir = os.path.abspath(log_dir)
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-        except Exception:
-            log_dir = base_dir
-        return os.path.join(log_dir, "cfquant_qmt_bridge.log")
+        return ""
 
     def _log(self, msg, force=False):
-        if not force and not get_log_enabled():
-            return
-        msg = translate_log(msg)
-        line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-        try:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-        if self.show:
-            print(msg)
+        if self.show and (force or self._get_log_enabled()):
+            print(translate_log(msg))
 
 
 def start_tx_trade_bridge(
@@ -4912,7 +6004,8 @@ class NormalQmtBridge(TxTradeBridge):
         globals_dict=None,
         schedule_timer=True,
         pump_max_count=20,
-        pump_max_ms=0,
+        pump_max_ms=5,
+        dispatch_on_qmt_thread=False,
     ):
         super(NormalQmtBridge, self).__init__(
             context,
@@ -4933,6 +6026,7 @@ class NormalQmtBridge(TxTradeBridge):
         self.worker_source_lock = threading.Lock()
         self.pump_max_count = int(pump_max_count)
         self.pump_max_ms = float(pump_max_ms)
+        self.dispatch_on_qmt_thread = bool(dispatch_on_qmt_thread)
         self.coalesce_lock = threading.RLock()
         self.coalesced_requests = {}
         self.coalesce_join_count = 0
@@ -4968,10 +6062,20 @@ class NormalQmtBridge(TxTradeBridge):
 
     def set_context(self, context):
         self.context = context
-        self._start_worker_thread(context)
+        if self.account_id:
+            self._set_context_account(self.account_id, self.account_type)
+        self._enable_auto_trade_callback()
+        if self.dispatch_on_qmt_thread:
+            self._log("normal bridge QMT-thread dispatch enabled")
+        else:
+            self._start_worker_thread(context)
         if self.schedule_timer:
             self._schedule_timer()
-        self._log("normal bridge worker is released by quote/timer/handlebar callbacks")
+        if self.dispatch_on_qmt_thread:
+            dispatch_source = "QMT timer/handlebar callbacks" if self.schedule_timer else "QMT caller thread callbacks"
+            self._log("normal bridge requests are consumed by %s" % dispatch_source)
+        else:
+            self._log("normal bridge worker is released by quote/timer/handlebar callbacks")
         self._log("normal bridge context ready")
         self._publish_runtime_report("context_ready")
 
@@ -5002,12 +6106,19 @@ class NormalQmtBridge(TxTradeBridge):
         msg = loads_message(raw)
         if not msg or msg.get("type") != "request":
             return
+        msg["_received_monotonic"] = time.perf_counter()
         action = msg.get("action")
         if action == "cfquant.ping":
             self._send_response(msg, {"pong": True, "ts": time.time(), "request_channel": self.request_channel})
             return
         if action == "cfquant.status":
             self._send_response(msg, self._status())
+            return
+        if action == "cfquant.strategy.control":
+            try:
+                self._send_response(msg, self._dispatch(action, msg.get("params") or {}, msg))
+            except Exception as error:
+                self._send_error(msg, error)
             return
         if self._try_enqueue_coalesced_request(msg):
             return
@@ -5150,10 +6261,15 @@ class NormalQmtBridge(TxTradeBridge):
         return "%s|%s" % (action, params_key)
 
     def pump(self):
+        if self.dispatch_on_qmt_thread:
+            return self._drain_requests("pump")
         self._release_worker("pump")
         return self.request_queue.qsize()
 
     def on_timer(self, *args, **kwargs):
+        if self.dispatch_on_qmt_thread:
+            self._drain_requests("timer")
+            return
         self._release_worker("timer")
 
     def _release_worker(self, source):
@@ -5175,8 +6291,11 @@ class NormalQmtBridge(TxTradeBridge):
                 source = self.worker_source or "unknown"
             try:
                 self._drain_requests(source)
+                if not self.request_queue.empty():
+                    self.worker_event.set()
             except Exception as e:
                 self._log("normal bridge worker error source=%s error=%s" % (source, e))
+
 
     def _drain_requests(self, source):
         with self.dispatch_lock:
@@ -5223,6 +6342,7 @@ class NormalQmtBridge(TxTradeBridge):
         record = self._register_pending_sync_order(
             account_id, account_type, params.get("stock_code", params.get("code", "")), remark, strategy, None,
         )
+        params["_cfquant_sync_pending"] = record
         try:
             result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False)
             if self._is_failed_order_result(result.get("request_result")):
@@ -5275,7 +6395,11 @@ class NormalQmtBridge(TxTradeBridge):
 
     def _drain_single_request(self, source, msg, received_at):
         try:
-            if getattr(self, "dispatch_on_qmt_thread", False) and msg.get("action") == "xttrader.order_stock":
+            if request_expired(msg):
+                self._expired_requests = getattr(self, "_expired_requests", 0) + 1
+                self._send_error(msg, TimeoutError("read-only request expired before QMT execution"))
+                return
+            if self.dispatch_on_qmt_thread and msg.get("action") == "xttrader.order_stock":
                 self._defer_sync_order_response(msg)
                 return
             result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
@@ -5291,15 +6415,39 @@ class NormalQmtBridge(TxTradeBridge):
             )
             self._send_error(msg, e)
 
+
     def _drain_coalesced_request(self, source, msg, received_at, coalesce_key):
+        response_waiters = None
+        counted = False
         try:
+            with self.coalesce_lock:
+                entry = self.coalesced_requests.get(coalesce_key)
+                waiters = entry["waiters"] if entry else [(msg, received_at)]
+                expired, active = [], []
+                for item in waiters:
+                    (expired if request_expired(item[0]) else active).append(item)
+                if entry is not None:
+                    entry["waiters"] = active
+                    if not active:
+                        self.coalesced_requests.pop(coalesce_key, None)
+            for waiter, _ in expired:
+                self._expired_requests = getattr(self, "_expired_requests", 0) + 1
+                self._send_error(waiter, TimeoutError("read-only request expired before QMT execution"))
+            if not active:
+                return
+            msg = active[0][0]
             result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
             with self.coalesce_lock:
                 entry = self.coalesced_requests.pop(coalesce_key, None)
                 self.coalesce_dispatch_count += 1
+                counted = True
             waiters = entry.get("waiters", []) if entry else [(msg, received_at)]
-            for waiter_msg, _ in waiters:
-                self._send_response(waiter_msg, result)
+            response_waiters = list(waiters)
+            encoded_result = encode_response_result(result)
+            while response_waiters:
+                waiter_msg, _ = response_waiters[0]
+                self._send_response(waiter_msg, result, encoded_result=encoded_result)
+                response_waiters.pop(0)
             self._log(
                 "normal bridge worker coalesced_response source=%s action=%s id=%s waiters=%s total_ms=%.2f"
                 % (source, msg.get("action"), msg.get("id"), len(waiters), (time.time() - received_at) * 1000)
@@ -5307,14 +6455,16 @@ class NormalQmtBridge(TxTradeBridge):
         except Exception as e:
             with self.coalesce_lock:
                 entry = self.coalesced_requests.pop(coalesce_key, None)
-                self.coalesce_dispatch_count += 1
-            waiters = entry.get("waiters", []) if entry else [(msg, received_at)]
+                if not counted:
+                    self.coalesce_dispatch_count += 1
+            waiters = entry.get("waiters", []) if entry else (response_waiters if response_waiters is not None else [(msg, received_at)])
             self._log(
                 "normal bridge worker coalesced_error source=%s action=%s id=%s waiters=%s error=%s"
                 % (source, msg.get("action"), msg.get("id"), len(waiters), e)
             )
             for waiter_msg, _ in waiters:
                 self._send_error(waiter_msg, e)
+
 
     def _on_whole_quote(self, data):
         self._release_worker("whole_quote")
@@ -5326,7 +6476,7 @@ class NormalQmtBridge(TxTradeBridge):
         if self.context is None or self.whole_quote_sub_id:
             return
         try:
-            self.whole_quote_sub_id = self.context.subscribe_whole_quote(["SH", "SZ"], callback=self._on_whole_quote)
+            self.whole_quote_sub_id = self.context.subscribe_whole_quote(["SH", "SZ", "BJ"], callback=self._on_whole_quote)
             self._log("normal bridge internal whole quote subscribed id=%s" % self.whole_quote_sub_id)
         except Exception as e:
             self._log("normal bridge internal whole quote subscribe failed: %s" % e)
@@ -5347,12 +6497,13 @@ class NormalQmtBridge(TxTradeBridge):
         except Exception as e:
             self._log("normal bridge timer schedule failed: %s" % e)
 
-    def _send_response(self, msg, result):
+    def _send_response(self, msg, result, encoded_result=None):
         client_id = msg.get("client_id") or msg.get("reply_channel")
         if not client_id:
             return
-        response = pack_response(msg.get("id"), ok=True, result=result)
+        response = pack_response(msg.get("id"), ok=True, result=result, meta=msg.get("_response_meta"), encoded_result=encoded_result)
         self.tx.push("response", response, client_id)
+
 
     def _send_error(self, msg, error):
         client_id = msg.get("client_id") or msg.get("reply_channel")
@@ -5362,7 +6513,7 @@ class NormalQmtBridge(TxTradeBridge):
             "normal bridge send_error action=%s id=%s client_id=%s error=%s"
             % (msg.get("action"), msg.get("id"), client_id, error)
         )
-        response = pack_response(msg.get("id"), ok=False, error=error)
+        response = pack_response(msg.get("id"), ok=False, error=error, meta=msg.get("_response_meta"))
         self.tx.push("response", response, client_id)
 
     def publish_callback_event(self, event_name, obj):
@@ -5376,6 +6527,8 @@ class NormalQmtBridge(TxTradeBridge):
             data = self._callback_object_to_dict(obj)
         account_id = self._callback_account_id(obj, data)
         account_type = self._callback_account_type(obj, data)
+        if account_id:
+            data.setdefault("account_id", account_id)
         if account_type:
             data.setdefault("account_type", account_type)
         if event_name in ("trader:on_stock_order", "trader:on_stock_trade", "trader:on_order_error", "trader:on_cancel_error", "trader:on_order_stock_async_response", "trader:on_cancel_order_stock_async_response"):
@@ -5383,6 +6536,8 @@ class NormalQmtBridge(TxTradeBridge):
         if event_name == "trader:on_stock_order":
             self._resolve_pending_sync_order_callback(data)
             self._handle_async_order_callback(data)
+            self._remember_order_callback_fields(data)
+        restore_strategy_name(data)
         payload = {
             "type": "event",
             "event": event_name,
@@ -5668,6 +6823,8 @@ class NormalQmtBridge(TxTradeBridge):
             coalesced_group_count = len(self.coalesced_requests)
         return {
             "request_queue_size": self.request_queue.qsize(),
+            "expired_readonly_requests": getattr(self, "_expired_requests", 0),
+            "send_queue": self.tx.send_status() if hasattr(self.tx, "send_status") else None,
             "recv_thread_alive": self.recv_thread.is_alive() if self.recv_thread else False,
             "worker_thread_alive": self.worker_thread.is_alive() if self.worker_thread else False,
             "whole_quote_sub_id": self.whole_quote_sub_id,
@@ -5678,13 +6835,24 @@ class NormalQmtBridge(TxTradeBridge):
             "schedule_timer": self.schedule_timer,
             "pump_max_count": self.pump_max_count,
             "pump_max_ms": self.pump_max_ms,
+            "dispatch_on_qmt_thread": self.dispatch_on_qmt_thread,
+            "dispatch_thread": (
+                "qmt_timer_or_handlebar"
+                if self.dispatch_on_qmt_thread and self.schedule_timer
+                else "qmt_caller_thread"
+                if self.dispatch_on_qmt_thread
+                else "worker"
+            ),
             "coalesced_group_count": coalesced_group_count,
             "coalesced_waiter_count": coalesced_waiters,
             "coalesce_join_count": self.coalesce_join_count,
             "coalesce_dispatch_count": self.coalesce_dispatch_count,
         }
 
+
     def _dispatch(self, action, params, msg):
+        if action == "xtdata.subscribe_whole_quote_latency":
+            return self._subscribe_native_quote(dict(msg, params=params), "whole_quote_latency", "subscribe_whole_quote")
         if action in ("xtdata.subscribe_l2thousand", "xtdata.subscribe_l2thousand_queue"):
             return self._subscribe_native_quote(dict(msg, params=params), "thousand", action.split(".", 1)[1])
         if action in ("xtdata.subscribe_whole_quote", "xtdata.subscribe_quote", "xtdata.unsubscribe_quote"):
@@ -5730,19 +6898,46 @@ class NormalQmtBridge(TxTradeBridge):
         callback_lock = threading.RLock()
         initializing = [True]
 
+        def publish(payload, callback_at_ms):
+            client_id = sub.get("client_id")
+            if client_id:
+                if kind == "whole_quote_latency":
+                    payload = {
+                        "schema": "cfquant.quote_latency.v1",
+                        "qmt_callback_at_ms": callback_at_ms,
+                        "qmt_push_at_ms": time.time() * 1000.0,
+                        "quotes": payload,
+                    }
+                    try:
+                        event = pack_quote_latency_event(sub["callback_event"], payload, client_id, sub_id)
+                    except (TypeError, ValueError):
+                        # Preserve the existing contract for NaN/Inf and unusual objects.
+                        payload["quotes"] = quote_plain(payload["quotes"])
+                        payload["qmt_encoding"] = "compatible_json"
+                        event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+                elif kind == "whole_quote":
+                    try:
+                        event = pack_whole_quote_event(sub["callback_event"], payload, client_id, sub_id)
+                    except (TypeError, ValueError):
+                        event = pack_event(sub["callback_event"], data=quote_plain(payload),
+                                           client_id=client_id, subscription_id=sub_id)
+                else:
+                    event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+                if initializing[0]:
+                    # Freeze the snapshot before returning to native QMT, which may
+                    # reuse/mutate callback objects while subscription completes.
+                    pending.append(event)
+                else:
+                    self.tx.push("event", event, client_id)
+
         def callback(data):
+            callback_at_ms = time.time() * 1000.0 if kind == "whole_quote_latency" else None
             with callback_lock:
                 self._release_worker("quote")
                 if self.quote_subscriptions.get(sub_id) is not sub or self.tx is None:
                     return
-                payload = quote_plain(data) if kind == "whole_quote" else quote_callback_data(data)
-                if initializing[0]:
-                    pending.append(payload)
-                    return
-                client_id = sub.get("client_id")
-                if client_id:
-                    event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
-                    self.tx.push("event", event, client_id)
+                payload = data if kind in ("whole_quote", "whole_quote_latency") else quote_callback_data(data)
+                publish(payload, callback_at_ms)
 
         func = self._get_callable(method)
         if method in L2_THOUSAND_SUBSCRIPTIONS:
@@ -5751,7 +6946,7 @@ class NormalQmtBridge(TxTradeBridge):
             raise NotImplementedError("QMT %s not found" % method)
         self.quote_subscriptions[sub_id] = sub
         try:
-            if kind == "whole_quote":
+            if kind in ("whole_quote", "whole_quote_latency"):
                 internal_id = self._call_variants(func, [
                     ((sub["code_list"],), {"callback": callback}),
                     ((sub["code_list"], callback), {}),
@@ -5776,8 +6971,8 @@ class NormalQmtBridge(TxTradeBridge):
         with callback_lock:
             initializing[0] = False
             try:
-                for payload in pending:
-                    callback(payload)
+                for event in pending:
+                    self.tx.push("event", event, sub["client_id"])
             except Exception:
                 self._handle_quote_unsubscribe({"params": {"subscribe_id": sub_id}})
                 raise
@@ -5804,7 +6999,8 @@ def start_normal_bridge(
     show=True,
     schedule_timer=True,
     pump_max_count=20,
-    pump_max_ms=0,
+    pump_max_ms=5,
+    dispatch_on_qmt_thread=False,
 ):
     import sys
 
@@ -5826,6 +7022,7 @@ def start_normal_bridge(
         schedule_timer=schedule_timer,
         pump_max_count=pump_max_count,
         pump_max_ms=pump_max_ms,
+        dispatch_on_qmt_thread=dispatch_on_qmt_thread,
     ).start()
 
 DEFAULT_PIPE_NAME = os.environ.get("CFQUANT_PIPE_NAME", r"\\.\pipe\cfquant_pipe_hub")
@@ -6177,15 +7374,21 @@ class PipeTxClient(object):
         self.conn_lock = threading.RLock()
         self.thread = None
         self.heartbeat_thread = None
+        self._sender = None
+        self._sender_conn = None
+        self._stop_event = threading.Event()
+        self.send_max_bytes = int(os.environ.get("CFQUANT_PIPE_SEND_MAX_BYTES", 128 * 1024 * 1024))
+        self.send_timeout = float(os.environ.get("CFQUANT_PIPE_SEND_TIMEOUT", "15"))
 
     def start(self):
         if self.running:
             return self
         self.running = True
+        self._stop_event.clear()
         self.thread = threading.Thread(target=self._connect_loop)
         self.thread.daemon = True
         self.thread.start()
-        if self.heartbeat_interval > 0:
+        if self.heartbeat_interval > 0 or self.send_timeout > 0:
             self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
             self.heartbeat_thread.daemon = True
             self.heartbeat_thread.start()
@@ -6202,11 +7405,6 @@ class PipeTxClient(object):
     def push(self, key, payload, channel):
         if isinstance(payload, bytes):
             payload = payload.decode("utf-8", errors="replace")
-        envelope = dumps_pipe_message(self._pipe_envelope("publish", "qmt_tx", {
-            "key": key,
-            "channel": channel,
-            "payload": payload,
-        }))
         conn, generation = self._get_tx_state()
         if conn is None:
             rx_conn, rx_generation = self._get_rx_state()
@@ -6214,8 +7412,28 @@ class PipeTxClient(object):
                 self._drop_pair(rx_generation, reason="pipe tx connection missing", conns=(rx_conn,))
             return {"code": -1, "msg": "pipe not connected"}
         try:
-            conn.write_frame(envelope)
-            return {"code": 0, "msg": "ok"}
+            # Strings/bytes are already frozen by the bridge. Never enqueue a
+            # mutable native QMT callback object or replay after reconnecting.
+            if not isinstance(payload, str):
+                raise TypeError("pipe publish payload must be an encoded string")
+            with self.conn_lock:
+                if (self.tx_conn, self.connection_generation) != (conn, generation):
+                    raise RuntimeError("pipe connection changed before send")
+                if self._sender is None or self._sender_conn is not conn:
+                    def send(item):
+                        kind, body, target = item
+                        envelope = self._pipe_envelope("heartbeat", "qmt_tx") if kind == "__cfquant_heartbeat__" else self._pipe_envelope("publish", "qmt_tx", {
+                            "key": kind, "channel": target, "payload": body,
+                            "event_passthrough": kind == "event" and body.startswith("cfquant:"),
+                        })
+                        conn.write_frame(dumps_pipe_message(envelope))
+                    self._sender = OrderedSender(send, lambda error: self._drop_pair(
+                        generation, reason="pipe sender failed: %s" % error, conns=(conn,)),
+                        max_bytes=self.send_max_bytes)
+                    self._sender_conn = conn
+                sender = self._sender
+            sender.submit((key, payload, channel), size=sys.getsizeof(payload) + 1024)
+            return {"code": 0, "msg": "queued"}
         except Exception as e:
             message = "pipe push failed: %s" % e
             self._log(message)
@@ -6224,6 +7442,7 @@ class PipeTxClient(object):
 
     def close(self):
         self.running = False
+        self._stop_event.set()
         try:
             self.Q.put_nowait(None)
         except Exception:
@@ -6320,6 +7539,10 @@ class PipeTxClient(object):
         close_conns = []
         with self.conn_lock:
             if generation is None or self.connection_generation == generation:
+                if self._sender is not None:
+                    self._sender.close()
+                self._sender = None
+                self._sender_conn = None
                 for conn in (self.rx_conn, self.tx_conn):
                     if conn is not None and conn not in close_conns:
                         close_conns.append(conn)
@@ -6344,15 +7567,24 @@ class PipeTxClient(object):
                 pass
 
     def _heartbeat_loop(self):
+        next_heartbeat = time.monotonic() + self.heartbeat_interval
         while self.running:
-            time.sleep(max(0.1, self.heartbeat_interval))
+            self._stop_event.wait(0.5)
             if not self.running:
                 break
             conn, generation = self._get_tx_state()
             if conn is None:
                 continue
+            sender = self._sender
+            if sender is not None and self.send_timeout > 0 and sender.status()["oldest_age_ms"] > self.send_timeout * 1000:
+                self._drop_pair(generation, reason="pipe send backlog timed out", conns=(conn,))
+                continue
+            if self.heartbeat_interval <= 0 or time.monotonic() < next_heartbeat:
+                continue
+            next_heartbeat = time.monotonic() + self.heartbeat_interval
             try:
-                conn.write_frame(dumps_pipe_message(self._pipe_envelope("heartbeat", "qmt_tx")))
+                # Queue behind data; the watchdog must never block in WriteFile.
+                self.push("__cfquant_heartbeat__", "", "")
             except Exception as e:
                 message = "pipe heartbeat failed: %s" % e
                 self._log(message)
@@ -6374,6 +7606,10 @@ class PipeTxClient(object):
             data.update(extra)
         return data
 
+    def send_status(self):
+        sender = self._sender
+        return sender.status() if sender is not None else {"queued_frames": 0, "buffered_bytes": 0, "error": self.last_error}
+
     def _log(self, msg):
         if self.show and get_log_enabled():
             print("cfquant pipe tx %s" % translate_log(msg))
@@ -6385,6 +7621,7 @@ class PipeTxClient(object):
             if channel and channel not in result:
                 result.append(channel)
         return result or [self.request_channel]
+
 
 class PipeNormalQmtBridge(NormalQmtBridge):
     def __init__(
@@ -6400,7 +7637,8 @@ class PipeNormalQmtBridge(NormalQmtBridge):
         globals_dict=None,
         schedule_timer=True,
         pump_max_count=20,
-        pump_max_ms=0,
+        pump_max_ms=5,
+        dispatch_on_qmt_thread=False,
         connect_timeout_ms=3000,
     ):
         super(PipeNormalQmtBridge, self).__init__(
@@ -6417,15 +7655,21 @@ class PipeNormalQmtBridge(NormalQmtBridge):
             schedule_timer=schedule_timer,
             pump_max_count=pump_max_count,
             pump_max_ms=pump_max_ms,
+            dispatch_on_qmt_thread=dispatch_on_qmt_thread,
         )
         self.pipe_name = pipe_name or DEFAULT_PIPE_NAME
-        self.request_channels = request_channels or [request_channel]
+        self.request_channels = list(request_channels or [request_channel])
         self.connect_timeout_ms = int(connect_timeout_ms)
 
     def start(self):
+        runtime = self.globals_dict.get("_managed_runtime")
+        if runtime is not None:
+            runtime.attach_bridge(self)
         if self.running:
             return self
         self.running = True
+        if not self.started_at:
+            self.started_at = time.time()
         self.tx = PipeTxClient(
             pipe_name=self.pipe_name,
             request_channel=self.request_channel,
@@ -6434,7 +7678,9 @@ class PipeNormalQmtBridge(NormalQmtBridge):
             endpoint_name="normal",
             show=self.show,
             connect_timeout_ms=self.connect_timeout_ms,
-        ).start()
+        )
+        self.tx._log = self._log
+        self.tx.start()
         self.tx.start_txg(self.request_channel)
         self.recv_thread = threading.Thread(target=self._recv_loop)
         self.recv_thread.daemon = True
@@ -6443,6 +7689,7 @@ class PipeNormalQmtBridge(NormalQmtBridge):
             "pipe normal bridge started pipe=%s request_channel=%s"
             % (self.pipe_name, self.request_channel)
         )
+        self._publish_runtime_report("start")
         return self
 
     def close(self):
@@ -6503,9 +7750,14 @@ class PipeTradeBridge(TxTradeBridge):
         self.connect_timeout_ms = int(connect_timeout_ms)
 
     def start(self):
+        runtime = self.globals_dict.get("_managed_runtime")
+        if runtime is not None:
+            runtime.attach_bridge(self)
         if self.running:
             return self
         self.running = True
+        if not self.started_at:
+            self.started_at = time.time()
         self.tx = PipeTxClient(
             pipe_name=self.pipe_name,
             request_channel=self.request_channel,
@@ -6513,12 +7765,15 @@ class PipeTradeBridge(TxTradeBridge):
             endpoint_name="trade",
             show=self.show,
             connect_timeout_ms=self.connect_timeout_ms,
-        ).start()
+        )
+        self.tx._log = self._log
+        self.tx.start()
         self.tx.start_txg(self.request_channel)
         self._log(
             "pipe trade bridge started pipe=%s request_channel=%s"
             % (self.pipe_name, self.request_channel)
         )
+        self._publish_runtime_report("start")
         return self
 
     def close(self):
@@ -6569,7 +7824,8 @@ def start_pipe_normal_bridge(
     show=True,
     schedule_timer=True,
     pump_max_count=20,
-    pump_max_ms=0,
+    pump_max_ms=5,
+    dispatch_on_qmt_thread=False,
     connect_timeout_ms=3000,
 ):
     import sys
@@ -6591,6 +7847,7 @@ def start_pipe_normal_bridge(
         schedule_timer=schedule_timer,
         pump_max_count=pump_max_count,
         pump_max_ms=pump_max_ms,
+        dispatch_on_qmt_thread=dispatch_on_qmt_thread,
         connect_timeout_ms=connect_timeout_ms,
     ).start()
 
@@ -6641,24 +7898,24 @@ _runtime_report_pending_log_at = 0.0
 _runtime_report_count = 0
 _runtime_report_last_error = ""
 _runtime_report_retry_until = 0.0
-_runtime_marker_started_at = time.time()
 DEFAULT_ACCOUNT_ID = ""
 DEFAULT_ACCOUNT_TYPE = str(os.environ.get("CFQUANT_ACCOUNT_TYPE") or "STOCK").strip().upper()
 USER_BRIDGE_ID = "default"
 BRIDGE_ID = os.environ.get("CFQUANT_BRIDGE_ID", USER_BRIDGE_ID)
 PIPE_NAME = os.environ.get("CFQUANT_PIPE_NAME", r"\\.\pipe\cfquant_pipe_hub")
 RUNTIME_CONFIG_PATH = ""
+EMBEDDED_RUNTIME_CONFIG = {}
 RUNTIME_CONFIG = {}
 RUNTIME_CHANNELS = {}
 QMT_MARKET = os.environ.get("CFQUANT_MARKET", "").strip().upper()
 PIPE_CONNECT_TIMEOUT_MS = int(os.environ.get("CFQUANT_PIPE_CONNECT_TIMEOUT_MS", "3000"))
 TRADE_LOOP_IN_THREAD = os.environ.get("CFQUANT_CTYPE_TRADE_THREAD", "1").strip().lower() in ("1", "true", "yes", "on")
 NORMAL_PUMP_MAX_COUNT = int(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_COUNT", "100"))
-NORMAL_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_MS", "0"))
+NORMAL_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_MS", "5"))
 TRADE_SLEEP_SECONDS = float(os.environ.get("CFQUANT_CTYPE_TRADE_SLEEP_SECONDS", "0.001"))
 TRADE_PUMP_MAX_COUNT = int(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_COUNT", "100"))
-TRADE_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_MS", "0"))
-TRADE_TIMER_INTERVAL_MS = int(os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "20"))
+TRADE_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_MS", "5"))
+TRADE_TIMER_INTERVAL_MS = int(os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "1"))
 
 
 def _entry_file_path():
@@ -6673,279 +7930,38 @@ def _entry_file_path():
 
 
 def _entry_base_dir():
-    entry_file = _entry_file_path()
-    if entry_file:
-        return os.path.dirname(entry_file)
-    for name in ("CFQUANT_QMT_SCRIPT_DIR", "CFQUANT_SCRIPT_DIR", "CFQUANT_ENTRY_DIR"):
-        path = str(os.environ.get(name) or "").strip()
-        if path and os.path.isdir(path):
-            return os.path.abspath(path)
-    try:
-        cwd = os.path.abspath(os.getcwd())
-        if (
-            os.path.isfile(os.path.join(cwd, "CFQUANT_LITE_SH.py"))
-            or os.path.isfile(os.path.join(cwd, "cfquant_bridge_config.json"))
-            or os.path.isdir(os.path.join(cwd, "cfquant"))
-        ):
-            return cwd
-    except Exception:
-        pass
-    for path in sys.path:
-        path = str(path or "").strip()
-        if path and os.path.isdir(path):
-            base = os.path.abspath(path)
-            if (
-                os.path.isfile(os.path.join(base, "CFQUANT_LITE_SH.py"))
-                or os.path.isfile(os.path.join(base, "cfquant_bridge_config.json"))
-                or os.path.isdir(os.path.join(base, "cfquant"))
-            ):
-                return base
-    try:
-        return os.path.abspath(os.getcwd())
-    except Exception:
-        return ""
-
-
-def _runtime_log_path():
-    try:
-        base_dir = _entry_base_dir()
-        parent_dir = os.path.dirname(base_dir)
-        configured = os.environ.get("CFQUANT_QMT_LOG_DIR") or (os.path.join(os.environ.get("CFQUANT_LOG_DIR"), "qmt_bridge") if os.environ.get("CFQUANT_LOG_DIR") else "")
-        if configured:
-            candidates = [configured]
-        elif os.path.basename(base_dir).lower() == "python":
-            candidates = [
-                os.path.join(parent_dir, "bin.x64", "log"),
-                os.path.join(parent_dir, "log"),
-                os.path.join(base_dir, "log"),
-            ]
-        else:
-            candidates = [
-                os.path.join(base_dir, "log"),
-                os.path.join(parent_dir, "bin.x64", "log"),
-                os.path.join(parent_dir, "log"),
-            ]
-        candidates.extend([
-            os.path.join(parent_dir, "bin.x64", "tx_log"),
-            os.path.join(base_dir, "tx_log"),
-            os.path.join(parent_dir, "tx_log"),
-            base_dir,
-        ])
-        for log_dir in candidates:
-            if not log_dir:
-                continue
-            try:
-                os.makedirs(log_dir, exist_ok=True)
-                return os.path.join(log_dir, "cfquant_lite_bridge.log")
-            except Exception:
-                if os.path.isdir(log_dir):
-                    return os.path.join(log_dir, "cfquant_ctype_bridge.log")
-    except Exception:
-        pass
-    return ""
+    entry = _entry_file_path()
+    if entry:
+        return os.path.dirname(entry)
+    return (os.environ.get("CFQUANT_QMT_SCRIPT_DIR") or os.environ.get("CFQUANT_SCRIPT_DIR")
+            or os.environ.get("CFQUANT_ENTRY_DIR") or os.getcwd())
 
 
 def _write_runtime_log(message):
-    try:
-        path = _runtime_log_path()
-        if not path:
-            return
-        log_dir = os.path.dirname(path)
-        if log_dir and not os.path.isdir(log_dir):
-            os.makedirs(log_dir)
-        with open(path, "a") as f:
-            f.write("%s %s\n" % (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message))
-    except Exception:
-        pass
+    enabled = globals().get("get_log_enabled")
+    if not callable(enabled) or enabled():
+        print(message)
 
 
 def _ensure_path():
-    try:
-        base_dir = _entry_base_dir()
-        parent_dir = os.path.dirname(base_dir)
-        env_paths = [p for p in os.environ.get("CFQUANT_PYTHONPATH", "").split(os.pathsep) if p]
-        if os.path.basename(base_dir).lower() == "python":
-            candidates = env_paths + [os.path.join(parent_dir, "bin.x64"), base_dir, parent_dir]
-        else:
-            candidates = env_paths + [
-                base_dir,
-                os.path.join(base_dir, "bin.x64"),
-                parent_dir,
-                os.path.join(parent_dir, "bin.x64"),
-                os.path.join(parent_dir, "python"),
-            ]
-        ordered = []
-        seen = set()
-        for path in candidates:
-            if not path or not os.path.isdir(path):
-                continue
-            path = os.path.abspath(path)
-            key = os.path.normcase(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(path)
-        if ordered:
-            sys.path[:] = ordered + [
-                path for path in sys.path
-                if os.path.normcase(os.path.abspath(path or os.curdir)) not in seen
-            ]
-    except Exception:
-        pass
-
-
-def _runtime_config_paths():
-    try:
-        base_dir = _entry_base_dir()
-        parent_dir = os.path.dirname(base_dir)
-        candidates = []
-        env_path = os.environ.get("CFQUANT_BRIDGE_CONFIG_FILE")
-        if env_path:
-            candidates.append(env_path)
-        market = str(os.environ.get("CFQUANT_MARKET") or QMT_MARKET or "").strip().upper()
-        market_filenames = []
-        if market in ("SH", "SZ"):
-            market_filenames.append("cfquant_bridge_config_%s.json" % market)
-        if os.path.basename(base_dir).lower() == "python":
-            for filename in market_filenames:
-                candidates.append(os.path.join(parent_dir, "bin.x64", filename))
-                candidates.append(os.path.join(base_dir, filename))
-            candidates.append(os.path.join(parent_dir, "bin.x64", "cfquant_bridge_config.json"))
-            candidates.append(os.path.join(base_dir, "cfquant_bridge_config.json"))
-        else:
-            for filename in market_filenames:
-                candidates.append(os.path.join(base_dir, filename))
-                candidates.append(os.path.join(base_dir, "bin.x64", filename))
-            candidates.append(os.path.join(base_dir, "cfquant_bridge_config.json"))
-            candidates.append(os.path.join(base_dir, "bin.x64", "cfquant_bridge_config.json"))
-        for filename in market_filenames:
-            candidates.append(os.path.join(parent_dir, filename))
-        candidates.append(os.path.join(parent_dir, "cfquant_bridge_config.json"))
-        result = []
-        seen = set()
-        for path in candidates:
-            if not path:
-                continue
-            path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
-            key = os.path.normcase(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(path)
-        return result
-    except Exception:
-        return []
-
-
-def _runtime_path_maybe_file(path):
-    try:
-        return os.path.isfile(path)
-    except Exception:
-        return True
-
-
-def _read_text_file_ctypes(path, max_bytes=1024 * 1024):
-    if os.name != "nt":
-        return None
-    handle = None
-    k32 = None
-    try:
-        _ctypes = ctypes
-        _wintypes = wintypes
-        k32 = _ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateFileW.argtypes = [
-            _wintypes.LPCWSTR,
-            _wintypes.DWORD,
-            _wintypes.DWORD,
-            _wintypes.LPVOID,
-            _wintypes.DWORD,
-            _wintypes.DWORD,
-            _wintypes.HANDLE,
-        ]
-        k32.CreateFileW.restype = _wintypes.HANDLE
-        k32.ReadFile.argtypes = [
-            _wintypes.HANDLE,
-            _wintypes.LPVOID,
-            _wintypes.DWORD,
-            _ctypes.POINTER(_wintypes.DWORD),
-            _wintypes.LPVOID,
-        ]
-        k32.ReadFile.restype = _wintypes.BOOL
-        k32.CloseHandle.argtypes = [_wintypes.HANDLE]
-        k32.CloseHandle.restype = _wintypes.BOOL
-        handle = k32.CreateFileW(
-            path,
-            0x80000000,
-            0x00000001 | 0x00000002 | 0x00000004,
-            None,
-            3,
-            0x00000080,
-            None,
-        )
-        invalid = _ctypes.c_void_p(-1).value
-        if handle in (None, 0, invalid):
-            handle = None
-            return None
-        chunks = []
-        total = 0
-        limit = int(max_bytes)
-        while total < limit:
-            chunk_size = min(65536, limit - total)
-            buf = _ctypes.create_string_buffer(chunk_size)
-            read = _wintypes.DWORD(0)
-            ok = k32.ReadFile(handle, buf, chunk_size, _ctypes.byref(read), None)
-            if not ok:
-                if _ctypes.get_last_error() == 38:
-                    break
-                return None
-            if read.value <= 0:
-                break
-            chunks.append(buf.raw[:read.value])
-            total += read.value
-        raw = b"".join(chunks)
-        for encoding in ("utf-8-sig", "utf-8", "gbk"):
-            try:
-                return raw.decode(encoding)
-            except Exception:
-                pass
-        return raw.decode("utf-8", errors="replace")
-    except Exception:
-        return None
-    finally:
-        if handle not in (None, 0):
-            try:
-                if k32 is not None:
-                    k32.CloseHandle(handle)
-            except Exception:
-                pass
+    base = _entry_base_dir()
+    parent = os.path.dirname(base)
+    candidates = [p for p in os.environ.get("CFQUANT_PYTHONPATH", "").split(os.pathsep) if p]
+    candidates += [base, os.path.join(parent, "bin.x64"), parent]
+    for path in reversed(candidates):
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def _load_runtime_config():
-    for path in _runtime_config_paths():
-        if not _runtime_path_maybe_file(path):
-            continue
-        last_error = None
-        for index, opener in enumerate((
-            lambda: io.open(path, "r", encoding="utf-8"),
-            lambda: open(path, "r"),
-        )):
-            try:
-                with opener() as f:
-                    data = json.loads(f.read())
-                if isinstance(data, dict):
-                    return path, data
-            except Exception as e:
-                last_error = e
-        text = _read_text_file_ctypes(path)
-        if text is not None:
-            try:
-                data = json.loads(text)
-                if isinstance(data, dict):
-                    return path, data
-            except Exception as e:
-                last_error = e
-        if last_error is not None:
-            _write_runtime_log("cfquant lite runtime config read failed path=%s error=%s" % (path, last_error))
+    if EMBEDDED_RUNTIME_CONFIG:
+        return "embedded", dict(EMBEDDED_RUNTIME_CONFIG)
+    text = os.environ.get("CFQUANT_RUNTIME_CONFIG_JSON", "").strip()
+    if text:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("CFQUANT_RUNTIME_CONFIG_JSON must be a JSON object")
+        return "environment", data
     return "", {}
 
 
@@ -6963,6 +7979,8 @@ def _config_bool(value, default=True):
 
 
 def _env_allows_runtime_override(name, default_value=""):
+    if EMBEDDED_RUNTIME_CONFIG:
+        return True
     value = str(os.environ.get(name) or "").strip()
     if not value:
         return True
@@ -6972,15 +7990,17 @@ def _env_allows_runtime_override(name, default_value=""):
 
 
 def _apply_runtime_config():
+    global TRADE_TIMER_INTERVAL_MS
     global BRIDGE_ID, PIPE_NAME, RUNTIME_CONFIG_PATH, RUNTIME_CONFIG, RUNTIME_CHANNELS, QMT_MARKET, DEFAULT_ACCOUNT_ID, DEFAULT_ACCOUNT_TYPE
 
     path, data = _load_runtime_config()
     RUNTIME_CONFIG_PATH = path
     RUNTIME_CONFIG = data
+    TRADE_TIMER_INTERVAL_MS = _qmt_timer_interval(data)
     if not data:
         _write_runtime_log("cfquant lite runtime config not found")
         return
-    if data.get("account_id") and not DEFAULT_ACCOUNT_ID:
+    if data.get("account_id") and (EMBEDDED_RUNTIME_CONFIG or not DEFAULT_ACCOUNT_ID):
         DEFAULT_ACCOUNT_ID = str(data.get("account_id") or "").strip()
     if data.get("account_type"):
         DEFAULT_ACCOUNT_TYPE = str(data.get("account_type") or DEFAULT_ACCOUNT_TYPE or "STOCK").strip().upper()
@@ -7001,8 +8021,6 @@ def _apply_runtime_config():
         RUNTIME_CHANNELS = channels
     if not os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") and data.get("qmt_log_language"):
         os.environ["CFQUANT_QMT_LOG_LANGUAGE"] = str(data.get("qmt_log_language") or "zh")
-    if not os.environ.get("CFQUANT_QMT_LOG_ENABLED") and "qmt_log_enabled" in data:
-        os.environ["CFQUANT_QMT_LOG_ENABLED"] = "1" if _config_bool(data.get("qmt_log_enabled"), True) else "0"
     _write_runtime_log(
         "cfquant lite runtime config loaded path=%s bridge_id=%s pipe=%s"
         % (path, BRIDGE_ID, PIPE_NAME)
@@ -7014,8 +8032,35 @@ def _print_log(message):
         return
     translated = translate_log(message)
     print(translated)
-    _write_runtime_log(translated)
 
+
+# BEGIN GENERATED BINDING SETTINGS
+_QMT_BOUND_LOG_ENABLED = None
+
+
+def get_log_enabled():
+    if _QMT_BOUND_LOG_ENABLED is not None:
+        return _QMT_BOUND_LOG_ENABLED
+    value = RUNTIME_CONFIG.get("qmt_log_enabled", os.environ.get("CFQUANT_QMT_LOG_ENABLED", "1"))
+    return _config_bool(value, True)
+
+
+def set_log_enabled(value):
+    global _QMT_BOUND_LOG_ENABLED
+    _QMT_BOUND_LOG_ENABLED = _config_bool(value, True)
+    return _QMT_BOUND_LOG_ENABLED
+
+
+def _qmt_timer_interval(data):
+    value = data.get("qmt_timer_interval_ms", os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "1"))
+    try:
+        if isinstance(value, bool) or str(value).strip() != str(int(value)):
+            return 1
+        value = int(value)
+        return value if 1 <= value <= 1000 else 1
+    except (TypeError, ValueError, OverflowError):
+        return 1
+# END GENERATED BINDING SETTINGS
 
 _apply_runtime_config()
 _write_runtime_log("cfquant lite entry executing from {} cwd {}".format(_entry_file_path() or "<string>", os.getcwd()))
@@ -7035,202 +8080,208 @@ for _channel_key in ("normal", "trade", "callback"):
         BRIDGE_CHANNELS[_channel_key] = str(_channel_value).strip()
 
 
+# BEGIN GENERATED PIPE RUNTIME
+"""In-memory managed strategy control over the existing Pipe connection (QMT 3.6+)."""
 
-def _lite_marker_text(value):
-    if value is None:
-        return ""
-    try:
-        return str(value).strip()
-    except Exception:
-        return ""
-
-
-def _lite_marker_path(value):
-    value = _lite_marker_text(value)
-    if not value:
-        return ""
-    try:
-        return os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
-    except Exception:
-        return value
+import functools as _cq_functools
+import os as _cq_os
+import sys as _cq_sys
+import threading as _cq_threading
+import time as _cq_time
 
 
-def _lite_marker_safe_name(value, default="runtime"):
-    value = _lite_marker_text(value) or default
-    chars = []
-    for ch in value:
-        if ch.isalnum() or ch in ("-", "_", "."):
-            chars.append(ch)
-        else:
-            chars.append("_")
-    name = "".join(chars).strip("._")
-    return name or default
+class ManagedPipeRuntime(object):
+    def __init__(self, descriptor=None):
+        self.descriptor = dict(descriptor or {})
+        self.active = False
+        self.approved = False
+        self.revoked = False
+        self.namespace = {}
+        self.original_stop = None
+        self.failure = ""
+        self.calls = 0
+        self.bridges_closed = False
+        self.attached_bridges = []
+        self.mutex = _cq_threading.RLock()
 
+    def acquire(self):
+        if not self.descriptor:
+            self.active = True
+            return self
+        # sys survives strategy namespace reloads inside one QMT process.
+        # Across processes the Pipe hub arbitrates ownership of request channels.
+        registry = _cq_sys.__dict__.setdefault("_cfquant_pipe_strategies", {})
+        lock = _cq_sys.__dict__.setdefault("_cfquant_pipe_strategies_lock", _cq_threading.RLock())
+        with lock:
+            key = (self.descriptor["runtime_key"], self.descriptor["role"])
+            incompatible = any(scope[0] == key[0] and (
+                owner.descriptor.get("mode") != self.descriptor["mode"]
+                or owner.descriptor.get("generation") != self.descriptor["generation"])
+                for scope, owner in registry.items())
+            if key in registry or incompatible:
+                raise RuntimeError("Another cfquant strategy still owns this QMT account role.")
+            registry[key] = self
+            self.active = True
+        return self
 
-def _lite_marker_add_dir(paths, path):
-    path = _lite_marker_path(path)
-    if not path:
-        return
-    try:
-        key = os.path.normcase(os.path.abspath(path))
-    except Exception:
-        key = path.lower()
-    for item in paths:
-        try:
-            item_key = os.path.normcase(os.path.abspath(item))
-        except Exception:
-            item_key = item.lower()
-        if item_key == key:
-            return
-    paths.append(path)
+    def status(self):
+        bridges = [self.namespace.get(name) for name in ("_normal_bridge", "_trade_bridge")
+                   if self.namespace.get(name) is not None]
+        ready = bool(bridges) and all(getattr(bridge, "running", False)
+                                     and getattr(bridge, "context", None) is not None for bridge in bridges)
+        state = "error" if self.failure else ("stopped" if not self.active or self.revoked
+                                              else ("running" if ready and self.approved else "loaded"))
+        return dict(self.descriptor, state=state, error=self.failure,
+                    pid=_cq_os.getpid(), updated_at=_cq_time.time())
 
+    def control(self, desired):
+        if desired.get("runtime_key") != self.descriptor.get("runtime_key"):
+            raise ValueError("Managed strategy account scope mismatch")
+        accepted = desired.get("accepted_generations") or []
+        if not isinstance(accepted, (tuple, list)):
+            accepted = []
+        allowed = (desired.get("enabled") is True
+                   and desired.get("mode") == self.descriptor["mode"]
+                   and self.descriptor["generation"] in [desired.get("generation")] + accepted)
+        with self.mutex:
+            self.approved = allowed and self.active and not self.revoked
+            if not allowed and not self.revoked:
+                self.revoked = True
+                # Block requests immediately; let the control response leave before closing Pipe.
+                worker = _cq_threading.Timer(0.1, self.close)
+                worker.daemon = True
+                worker.start()
+        return self.status()
 
-def _lite_runtime_marker_dirs():
-    paths = []
-    config = RUNTIME_CONFIG if isinstance(RUNTIME_CONFIG, dict) else {}
-    for key in ("qmt_runtime_marker_dir", "runtime_marker_dir"):
-        _lite_marker_add_dir(paths, config.get(key))
-    for key in ("runtime_status_dir", "web_runtime_status_dir"):
-        base = _lite_marker_path(config.get(key))
-        if base:
-            _lite_marker_add_dir(paths, os.path.join(base, "qmt_runtime"))
-    for key in ("runtime_dir", "web_runtime_dir"):
-        base = _lite_marker_path(config.get(key))
-        if base:
-            _lite_marker_add_dir(paths, os.path.join(base, "status", "qmt_runtime"))
-    for name in ("CFQUANT_QMT_RUNTIME_MARKER_DIR", "CFQUANT_RUNTIME_MARKER_DIR"):
-        _lite_marker_add_dir(paths, os.environ.get(name))
-    for name in ("CFQUANT_RUNTIME_STATUS_DIR", "CFQUANT_WEB_RUNTIME_STATUS_DIR"):
-        base = _lite_marker_path(os.environ.get(name))
-        if base:
-            _lite_marker_add_dir(paths, os.path.join(base, "qmt_runtime"))
-    for name in ("CFQUANT_RUNTIME_DIR", "CFQUANT_WEB_RUNTIME_DIR"):
-        base = _lite_marker_path(os.environ.get(name))
-        if base:
-            _lite_marker_add_dir(paths, os.path.join(base, "status", "qmt_runtime"))
-    base_dir = _entry_base_dir()
-    if base_dir:
-        parent_dir = os.path.dirname(base_dir)
-        _lite_marker_add_dir(paths, os.path.join(base_dir, "runtime", "status", "qmt_runtime"))
-        if parent_dir and parent_dir != base_dir:
-            _lite_marker_add_dir(paths, os.path.join(parent_dir, "runtime", "status", "qmt_runtime"))
-            if os.path.basename(base_dir).lower() == "python":
-                _lite_marker_add_dir(paths, os.path.join(parent_dir, "bin.x64", "runtime", "status", "qmt_runtime"))
-    return paths
+    def dispatch(self, function):
+        dispatch_request = self.wrap(function, reject=True)
+        @_cq_functools.wraps(function)
+        def guarded(action, params, msg):
+            if action == "cfquant.strategy.control":
+                return self.control(params or {})
+            if action == "cfquant.status":
+                return function(action, params, msg)
+            if not self.approved:
+                raise RuntimeError("Managed strategy is awaiting account mode confirmation from cfquant Web.")
+            return dispatch_request(action, params, msg)
+        return guarded
 
-
-def _write_lite_runtime_marker(reason="startup"):
-    try:
-        config = RUNTIME_CONFIG if isinstance(RUNTIME_CONFIG, dict) else {}
-        dirs = _lite_runtime_marker_dirs()
-        if not dirs:
-            return {"ok": False, "files": [], "errors": ["no marker dir"]}
-        now = time.time()
-        started_at = _runtime_marker_started_at or now
-        entry_file = _entry_file_path() or "<string>"
-        entry_script = os.path.basename(entry_file) if entry_file and not entry_file.startswith("<") else "CFQUANT_LITE.py"
-        account_type = _lite_marker_text(config.get("account_type") or os.environ.get("CFQUANT_ACCOUNT_TYPE") or DEFAULT_ACCOUNT_TYPE or "STOCK").upper()
-        report = {
-            "schema": "cfquant.qmt.runtime",
-            "report_schema": "cfquant.qmt.runtime_marker.v1",
-            "version": CORE_VERSION,
-            "core_version": CORE_VERSION,
-            "entry_version": LITE_ENTRY_VERSION,
-            "runtime_entry_version": LITE_ENTRY_VERSION,
-            "qmt_runtime_entry_version": LITE_ENTRY_VERSION,
-            "entry_script": entry_script,
-            "entry_file": entry_file,
-            "bridge": "CFQUANT_LITE",
-            "bridge_id": BRIDGE_ID,
-            "account_id": _lite_marker_text(DEFAULT_ACCOUNT_ID or config.get("account_id")),
-            "account_type": account_type,
-            "account_key": _lite_marker_text(config.get("account_key")),
-            "mode": _lite_marker_text(config.get("mode") or "lite"),
-            "transport": "lite",
-            "runtime_mode": "lite_extreme_pipe",
-            "channel_key": "normal",
-            "request_channel": BRIDGE_CHANNELS.get("normal"),
-            "callback_event_channel": BRIDGE_CHANNELS.get("callback"),
-            "channels": dict(BRIDGE_CHANNELS),
-            "pipe_name": PIPE_NAME,
-            "market": _lite_marker_text(QMT_MARKET or config.get("market")),
-            "market_role": _lite_marker_text(config.get("market_role")),
-            "market_route_parent_bridge_id": _lite_marker_text(config.get("market_route_parent_bridge_id")),
-            "config_path": RUNTIME_CONFIG_PATH,
-            "module_file": entry_file,
-            "python": sys.executable,
-            "pid": os.getpid(),
-            "cwd": os.getcwd(),
-            "started_at": started_at,
-            "started_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at)),
-            "reported_at": now,
-            "reported_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-            "reason": reason,
-            "source": "qmt_startup_marker",
-        }
-        name = "cfquant_qmt_runtime_%s_normal_%s_%s.json" % (
-            _lite_marker_safe_name(BRIDGE_ID, "default"),
-            _lite_marker_safe_name(os.path.splitext(entry_script)[0], "CFQUANT_LITE"),
-            _lite_marker_safe_name(os.getpid(), "pid"),
-        )
-        files = []
-        errors = []
-        for directory in dirs:
+    def wrap(self, function, reject=False):
+        @_cq_functools.wraps(function)
+        def guarded(*args, **kwargs):
+            with self.mutex:
+                if not self.active or self.revoked:
+                    if reject:
+                        raise RuntimeError("The account's cfquant strategy mode has changed.")
+                    return None
+                self.calls += 1
             try:
-                os.makedirs(directory, exist_ok=True)
-                path = os.path.join(directory, name)
-                temp_path = "%s.%s.tmp" % (path, os.getpid())
-                data = dict(report)
-                data["marker_dir"] = directory
-                data["marker_file"] = path
-                data["marker_written_at"] = time.time()
-                data["marker_written_at_text"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data["marker_written_at"]))
-                with io.open(temp_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-                try:
-                    os.replace(temp_path, path)
-                except AttributeError:
-                    if os.path.exists(path):
-                        os.remove(path)
-                    os.rename(temp_path, path)
-                files.append(path)
-            except Exception as e:
-                errors.append("%s: %s" % (directory, e))
-        if files and reason in ("module_loaded", "context_ready"):
-            _print_log("cfquant lite runtime marker written version=%s reason=%s file=%s" % (CORE_VERSION, reason, files[0]))
-        if errors and not files:
-            _print_log("cfquant lite runtime marker write failed reason=%s error=%s" % (reason, "; ".join(errors)))
-        return {"ok": bool(files), "files": files, "primary_file": files[0] if files else "", "errors": errors, "report": report}
-    except Exception as e:
-        _print_log("cfquant lite runtime marker write failed reason=%s error=%s" % (reason, e))
-        return {"ok": False, "files": [], "errors": [str(e)]}
+                return function(*args, **kwargs)
+            except Exception as error:
+                if function.__name__ == "init":
+                    self.failure = str(error)
+                    self.close()
+                raise
+            finally:
+                with self.mutex:
+                    self.calls -= 1
+                    self.release_if_idle()
+        return guarded
 
-_write_lite_runtime_marker("module_loaded")
+    def bind(self, namespace):
+        if not self.descriptor:
+            return
+        self.namespace = namespace
+        self.original_stop = namespace.get("stop")
+        for name, value in list(namespace.items()):
+            if (name in ("init", "after_init", "handlebar", "cfquant_normal_timer", "cfquant_ctype_trade_timer")
+                    or name.endswith("_callback")) and callable(value):
+                namespace[name] = self.wrap(value)
+        for name in ("_normal_bridge", "_trade_bridge"):
+            bridge = namespace.get(name)
+            if bridge is not None:
+                self.attach_bridge(bridge)
+        namespace["stop"] = self.close
 
-_normal_bridge = start_pipe_normal_bridge(
-    None,
-    pipe_name=PIPE_NAME,
-    request_channel=BRIDGE_CHANNELS["normal"],
-    request_channels=[BRIDGE_CHANNELS["normal"]],
-    callback_event_channel=BRIDGE_CHANNELS["callback"],
-    bridge_id=BRIDGE_ID,
-    account_id=DEFAULT_ACCOUNT_ID,
-    show=True,
-    schedule_timer=True,
-    pump_max_count=NORMAL_PUMP_MAX_COUNT,
-    pump_max_ms=NORMAL_PUMP_MAX_MS,
-    connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
-)
+    def attach_bridge(self, bridge):
+        if bridge not in self.attached_bridges:
+            self.attached_bridges.append(bridge)
+        if not self.descriptor or getattr(bridge, "managed_runtime", None) is self:
+            return
+        bridge.managed_runtime = self
+        bridge._dispatch = self.dispatch(bridge._dispatch)
+        for method in ("start", "poll", "pump"):
+            function = getattr(bridge, method, None)
+            if callable(function):
+                setattr(bridge, method, self.wrap(function))
 
-_trade_bridge = start_pipe_trade_bridge(
-    None,
-    pipe_name=PIPE_NAME,
-    request_channel=BRIDGE_CHANNELS["trade"],
-    bridge_id=BRIDGE_ID,
-    account_id=DEFAULT_ACCOUNT_ID,
-    show=True,
-    connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
-)
+    def release_if_idle(self):
+        if self.bridges_closed and self.calls == 0:
+            registry = _cq_sys.__dict__.get("_cfquant_pipe_strategies", {})
+            key = (self.descriptor.get("runtime_key"), self.descriptor.get("role"))
+            lock = _cq_sys.__dict__.setdefault("_cfquant_pipe_strategies_lock", _cq_threading.RLock())
+            with lock:
+                if registry.get(key) is self:
+                    registry.pop(key, None)
+
+    def close(self, context=None):
+        with self.mutex:
+            if not self.active:
+                return
+            self.active = False
+            self.approved = False
+        try:
+            if self.original_stop is not None:
+                self.original_stop(context)
+            else:
+                bridges = list(self.attached_bridges)
+                for name in ("_normal_bridge", "_trade_bridge"):
+                    bridge = self.namespace.get(name)
+                    if bridge is not None and bridge not in bridges:
+                        bridges.append(bridge)
+                for bridge in bridges:
+                    bridge.close()
+            with self.mutex:
+                self.bridges_closed = True
+                self.release_if_idle()
+        except Exception as error:
+            self.failure = str(error)
+            print("cfquant strategy shutdown failed: %s" % error)
+# END GENERATED PIPE RUNTIME
+
+_managed_runtime = ManagedPipeRuntime(RUNTIME_CONFIG.get("managed_strategy")).acquire()
+_managed_runtime.namespace = globals()
+try:
+    _normal_bridge = start_pipe_normal_bridge(
+        None,
+        pipe_name=PIPE_NAME,
+        request_channel=BRIDGE_CHANNELS["normal"],
+        request_channels=[BRIDGE_CHANNELS["normal"]],
+        callback_event_channel=BRIDGE_CHANNELS["callback"],
+        bridge_id=BRIDGE_ID,
+        account_id=DEFAULT_ACCOUNT_ID,
+        show=True,
+        schedule_timer=False,
+        pump_max_count=NORMAL_PUMP_MAX_COUNT,
+        pump_max_ms=NORMAL_PUMP_MAX_MS,
+        dispatch_on_qmt_thread=True,
+        connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
+    )
+
+    _trade_bridge = start_pipe_trade_bridge(
+        None,
+        pipe_name=PIPE_NAME,
+        request_channel=BRIDGE_CHANNELS["trade"],
+        bridge_id=BRIDGE_ID,
+        account_id=DEFAULT_ACCOUNT_ID,
+        show=True,
+        connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
+    )
+    for _account_bridge in (_normal_bridge, _trade_bridge):
+        _account_bridge.account_type = DEFAULT_ACCOUNT_TYPE
+except BaseException:
+    _managed_runtime.close()
+    raise
 
 _print_log("cfquant lite extreme bridge module loaded")
 _print_log("cfquant lite extreme entry version:%s" % _ENTRY_VERSION)
@@ -7244,7 +8295,6 @@ _print_log("cfquant lite bridge id:%s pipe:%s normal_channel:%s trade_channel:%s
 if QMT_MARKET:
     _print_log("cfquant lite market route market:%s bridge_id:%s" % (QMT_MARKET, BRIDGE_ID))
 _print_log("cfquant lite trade loop in thread:%s sleep_seconds:%s" % (TRADE_LOOP_IN_THREAD, TRADE_SLEEP_SECONDS))
-
 
 
 def _record_lite_runtime_report_success(reason):
@@ -7268,9 +8318,8 @@ def _publish_lite_runtime_report(reason="startup", force=False):
     if not force and now - _runtime_report_last_attempt_at < 1.0:
         return False
     _runtime_report_last_attempt_at = now
-    marker = _write_lite_runtime_marker(reason)
     if not _normal_bridge:
-        return bool(marker.get("ok"))
+        return False
     try:
         tx = getattr(_normal_bridge, "tx", None)
         if tx is None:
@@ -7338,7 +8387,7 @@ def _attach_normal_status_extra():
             "ctype_trade_pump_max_ms": TRADE_PUMP_MAX_MS,
             "ctype_trade_timer_interval_ms": TRADE_TIMER_INTERVAL_MS,
             "ctype_trade_dispatch_thread": "qmt_timer_or_handlebar",
-            "ctype_trade_route_mode": "xttrader_to_normal_worker",
+            "ctype_trade_route_mode": "xttrader_to_normal_qmt_timer",
         })
         return data
 
@@ -7447,8 +8496,24 @@ def _start_trade_loop():
     _run_trade_loop()
 
 
+def _bind_dispatch_context(ContextInfo):
+    if ContextInfo is None:
+        return
+    if _normal_bridge:
+        _normal_bridge.context = ContextInfo
+    if _trade_bridge:
+        _trade_bridge.context = ContextInfo
+
+
 def cfquant_ctype_trade_timer(*args, **kwargs):
+    context = args[0] if args else kwargs.get("ContextInfo") or kwargs.get("context")
+    _bind_dispatch_context(context)
     _drain_trade_requests("timer")
+    if _normal_bridge:
+        try:
+            _normal_bridge.pump()
+        except Exception as e:
+            _print_log("cfquant lite normal bridge pump failed source=trade_timer error:%s" % e)
 
 
 def _schedule_trade_timer(ContextInfo):
@@ -7584,6 +8649,7 @@ def after_init(ContextInfo):
 
 
 def handlebar(ContextInfo):
+    _bind_dispatch_context(ContextInfo)
     if TRADE_LOOP_IN_THREAD:
         _start_trade_loop()
     _drain_trade_requests("handlebar")
@@ -7615,7 +8681,8 @@ def stop(ContextInfo):
 
 def _publish_callback(event_name, obj):
     try:
-        _print_log("cfquant lite raw qmt callback received event=%s %s" % (event_name, _callback_brief(obj)))
+        if get_log_enabled():
+            _print_log("cfquant lite raw qmt callback received event=%s %s" % (event_name, _callback_brief(obj)))
         if _normal_bridge:
             _normal_bridge.publish_callback_event(event_name, obj)
         # The low-latency trade bridge is a separate bridge instance. Forward
@@ -7672,3 +8739,5 @@ def order_stock_async_response_callback(ContextInfo, response):
 
 def cancel_order_stock_async_response_callback(ContextInfo, response):
     _publish_callback("trader:on_cancel_order_stock_async_response", response)
+
+_managed_runtime.bind(globals())

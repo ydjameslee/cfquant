@@ -2,6 +2,7 @@
 import json
 import queue
 import threading
+import time
 import pytest
 
 from cfquant.pipe_client import PipeRpcClient
@@ -43,6 +44,10 @@ class FakePipeConnection(object):
 
 
 def delivered_payload(connection):
+    # Hub deliveries are written by a per-connection background sender.
+    deadline = time.monotonic() + 2.0
+    while not connection.writes and time.monotonic() < deadline:
+        time.sleep(0.005)
     assert len(connection.writes) == 1
     envelope = loads_pipe_message(connection.writes[0])
     assert envelope["type"] == "delivery"

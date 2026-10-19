@@ -6,6 +6,10 @@ import io
 import re
 import tokenize
 from pathlib import Path
+try:
+    from tools.sync_qmt_fileless import updated_source as update_fileless_source
+except ImportError:
+    from sync_qmt_fileless import updated_source as update_fileless_source
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +119,9 @@ def updated_source(source):
         '        if action in CFTRADER_BATCH_CANCEL_ACTIONS:\n',
         '            return execute_qmt_cancel_batch(self, params, msg, action.endswith("_async"))\n',
     ]
-    if lines[dispatch.lineno:dispatch.lineno + len(branch)] != branch:
+    # Timing dispatch can precede the batch branches; do not insert duplicates
+    # merely because this block is no longer the first statement.
+    if ''.join(branch) not in ''.join(lines[dispatch.lineno:dispatch.end_lineno]):
         if lines[dispatch.lineno:dispatch.lineno + 4] == branch[2:]:
             lines[dispatch.lineno:dispatch.lineno] = branch[:2]
         elif (lines[dispatch.lineno:dispatch.lineno + 2]
@@ -134,12 +140,41 @@ def updated_source(source):
     # The core identity/cancel/token methods depend on order_meta and process
     # state absent from Lite; copying those methods alone breaks live requests.
     core = (ROOT / 'cfquant/tx_trade_bridge.py').read_text(encoding='utf-8')
+    if 'self.order_callback_cache = OrderCallbackCache()' not in source:
+        source = source.replace(
+            '        self.order_request_metadata_lock = threading.RLock()\n',
+            '        self.order_request_metadata_lock = threading.RLock()\n'
+            '        self.order_callback_cache = OrderCallbackCache()\n', 1)
+    if 'self._remember_order_callback_fields(formatted)' not in source:
+        source = source.replace(
+            '                        self._enrich_order_request_fields(formatted)\n',
+            '                        self._enrich_order_request_fields(formatted)\n'
+            '                        if detail_type.lower() == "order":\n'
+            '                            self._remember_order_callback_fields(formatted)\n', 1)
     for name in ('_passorder_optype', '_account_type_name', '_stock_order_type', '_get_trading_dates'):
         source = _replace_class_method(source, 'TxTradeBridge', name,
                                        _class_method(core, 'TxTradeBridge', name))
     source = source.replace('validate_connect_order(params, account_type)',
                             'normalize_connect_order(params, account_type)')
     normal = (ROOT / 'cfquant/normal_bridge.py').read_text(encoding='utf-8')
+    callback_method = _class_method(source, 'NormalQmtBridge', 'publish_callback_event')
+    if 'data.setdefault("account_id", account_id)' not in callback_method:
+        callback_method = callback_method.replace(
+            '        account_type = self._callback_account_type(obj, data)\n',
+            '        account_type = self._callback_account_type(obj, data)\n'
+            '        if account_id:\n'
+            '            data.setdefault("account_id", account_id)\n', 1)
+    if 'restore_strategy_name(data)' not in callback_method:
+        callback_method = callback_method.replace(
+            '        payload = {\n',
+            '        restore_strategy_name(data)\n'
+            '        payload = {\n', 1)
+    source = _replace_class_method(source, 'NormalQmtBridge', 'publish_callback_event', callback_method)
+    if 'self._remember_order_callback_fields(data)' not in source:
+        source = source.replace(
+            '            self._handle_async_order_callback(data)\n',
+            '            self._handle_async_order_callback(data)\n'
+            '            self._remember_order_callback_fields(data)\n', 1)
     source = _replace_class_method(source, 'NormalQmtBridge', '_callback_account_type',
                                    _class_method(normal, 'NormalQmtBridge', '_callback_account_type').replace(
                                        'order_meta.normalize_account_type', '_lite_normalize_account_type'))
@@ -163,7 +198,7 @@ def main():
     for path in sorted((ROOT / 'qmt_scripts').rglob('CFQUANT_LITE*.py')):
         raw = path.read_bytes()
         source = raw.decode('gbk')
-        updated = updated_source(source)
+        updated = update_fileless_source(updated_source(source), lite=True)
         if source.replace('\r\n', '\n') == updated:
             continue
         outdated.append(str(path.relative_to(ROOT)))

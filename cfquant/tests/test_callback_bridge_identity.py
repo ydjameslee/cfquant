@@ -1,5 +1,6 @@
 """Callback event identity is bridge-owned, even on shared client channels."""
 import json
+import time
 
 import pytest
 
@@ -27,7 +28,11 @@ class RecordingReceiver(object):
         self.frames.append(raw)
 
 
-def delivered_event(receiver):
+def delivered_event(receiver, count=1):
+    # Hub deliveries are written by a per-connection background sender.
+    deadline = time.monotonic() + 2.0
+    while len(receiver.frames) < count and time.monotonic() < deadline:
+        time.sleep(0.005)
     return loads_message(loads_pipe_message(receiver.frames[-1])["payload"])
 
 
@@ -76,14 +81,14 @@ def test_registered_pipe_bridge_routes_shared_web_callback_to_its_subscriber(mon
             for account_key in web.account_subscription_keys("ACCOUNT", "STOCK", bridge_id, ""):
                 route._account_subscribers.setdefault(account_key, set()).add(client_id)
 
-    for qmt_conn in (qmt_a, qmt_b):
+    for count, qmt_conn in enumerate((qmt_a, qmt_b), 1):
         hub._handle_qmt_publish(qmt_conn, {
             "channel": "web-shared",
             "payload": web.pack_event("trader:on_stock_order", {
                 "account_id": "ACCOUNT", "account_type": "STOCK", "order_id": 17,
             }, client_id="web-shared"),
         })
-        route._on_client_event(delivered_event(receiver))
+        route._on_client_event(delivered_event(receiver, count))
 
     assert [channel for _, _, channel in route.tx.pushes] == ["browser-a", "browser-b"]
 

@@ -152,7 +152,7 @@ def test_same_account_id_stock_connect_types_keep_isolated_bindings(tmp_path):
     rows = [
         config.save_account_config(
             "SAME_ACCOUNT", account_type=account_type, qmt_dir=str(tmp_path), enabled=True,
-            qmt_strategy={"enabled": True},
+            qmt_strategy={"enabled": True}, qmt_auto_login={"enabled": False},
         )
         for account_type in ("STOCK", "HUGANGTONG", "SHENGANGTONG")
     ]

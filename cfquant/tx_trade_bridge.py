@@ -15,6 +15,7 @@ from .order_identity import (
     prepare_order_remark,
     restore_order_remark,
 )
+from .order_identity import OrderCallbackCache, order_remark_matches_reference
 from .batch_orders import (
     CFTRADER_BATCH_CANCEL_ACTIONS,
     CFTRADER_BATCH_ORDER_ACTIONS,
@@ -43,12 +44,12 @@ from .logging_i18n import get_log_enabled, get_log_language, set_log_enabled, se
 from .runtime_report import build_qmt_runtime_report, module_source_state, source_sha256, write_qmt_runtime_marker
 from .xttype import (
     CreditAssure, CreditSloCode, CreditSubjects, StkCompacts, XtCreditDetail, XtPositionStatistics,
-    XtAccountInfo, XtAccountStatus, XtSmtAppointmentResponse,
+    XtAccountInfo, XtAccountStatus,
     filter_cancelable_orders, normalize_order_price_type, _is_zero_time_value, _with_qmt_compact_aliases,
 )
 
 
-_LOADED_SOURCE_SHA256 = source_sha256(__file__)
+_LOADED_SOURCE_SHA256 = "" if os.environ.get("CFQUANT_QMT_NO_FILE_IO") == "1" else source_sha256(__file__)
 
 
 # A single all-in-one QMT entry can create both a normal bridge and a trade
@@ -252,6 +253,7 @@ class TxTradeBridge(object):
         self.pending_sync_orders_lock = threading.RLock()
         self.order_request_metadata = {}
         self.order_request_metadata_lock = threading.RLock()
+        self.order_callback_cache = OrderCallbackCache()
         self.order_error_contexts = {}
         self.order_error_contexts_lock = threading.RLock()
         self.order_meta_enabled = bool(order_meta_enabled)
@@ -325,15 +327,16 @@ class TxTradeBridge(object):
         msg = loads_message(raw)
         if not msg or msg.get("type") != "request":
             return
+        msg["_received_monotonic"] = time.perf_counter()
         request_id = msg.get("id")
         action = msg.get("action")
         client_id = msg.get("client_id") or msg.get("reply_channel")
         try:
             result = self._dispatch(action, msg.get("params") or {}, msg)
-            response = pack_response(request_id, ok=True, result=result)
+            response = pack_response(request_id, ok=True, result=result, meta=msg.get("_response_meta"))
             self._log("tx trade response_ready action=%s id=%s" % (action, request_id))
         except Exception as e:
-            response = pack_response(request_id, ok=False, error=e)
+            response = pack_response(request_id, ok=False, error=e, meta=msg.get("_response_meta"))
             self._log("tx trade request_error action=%s id=%s error=%s" % (action, request_id, e))
         if client_id:
             self.tx.push("response", response, client_id)
@@ -343,6 +346,8 @@ class TxTradeBridge(object):
             )
 
     def _dispatch(self, action, params, msg):
+        if action in ("xtdata.get_market_data", "xtdata.get_market_data_ex", "xtdata.get_full_tick"):
+            return self._dispatch_timed_market_data(action, params, msg)
         if action == "xttrader.get_hkt_exchange_rate":
             return query_connect_exchange_rate(self, params)
         if action in CFTRADER_BATCH_ORDER_ACTIONS:
@@ -365,7 +370,7 @@ class TxTradeBridge(object):
         if action == "cfquant.set_log_enabled":
             return self._set_log_enabled(params)
         if action == "cfquant.get_log_enabled":
-            return {"enabled": get_log_enabled()}
+            return {"enabled": self._get_log_enabled()}
         if action == "cfquant.cleanup_qmt_logs":
             return self._cleanup_qmt_userdata_logs(params)
         if action == "cfquant.query_info":
@@ -396,12 +401,6 @@ class TxTradeBridge(object):
             return self._cancel_order_stock_sysid(params)
         if action == "xttrader.cancel_order_stock_sysid_async":
             return self._cancel_order_stock_sysid_async(params, msg)
-        if action == "xtdata.get_market_data":
-            return self._get_market_data(params)
-        if action == "xtdata.get_market_data_ex":
-            return self._get_market_data_ex(params)
-        if action == "xtdata.get_full_tick":
-            return self.context.get_full_tick(params.get("code_list", []))
         if action == "xtdata.get_local_data":
             return self._get_local_data(params)
         if action == "xtdata.download_history_data":
@@ -441,7 +440,7 @@ class TxTradeBridge(object):
             "runtime": runtime,
             "account_subscribers": self._account_subscriber_status(),
             "log_language": get_log_language(),
-            "log_enabled": get_log_enabled(),
+            "log_enabled": self._get_log_enabled(),
             "context_ready": self.context is not None,
             "tx_ready": self.tx is not None,
             "ts": time.time(),
@@ -491,10 +490,13 @@ class TxTradeBridge(object):
             entry_file=entry_file,
             module_file=__file__,
             started_at=self.started_at,
-            extra=module_source_state(__file__, _LOADED_SOURCE_SHA256, self.started_at),
+            extra=self._source_state(),
         )
 
     def _publish_runtime_report(self, reason):
+        if not getattr(self, "file_io_enabled", True):
+            # NormalQmtBridge publishes the report through its Pipe callback channel.
+            return
         try:
             channel_key = "normal" if "normal" in str(self.request_channel or "").lower() else "trade"
             if not self.started_at:
@@ -541,18 +543,27 @@ class TxTradeBridge(object):
         self._log("QMT日志语言已切换为:%s" % ("中文" if lang == "zh" else "English"))
         return {"language": lang}
 
+    def _get_log_enabled(self):
+        getter = self.globals_dict.get("get_log_enabled")
+        if callable(getter):
+            return bool(getter())
+        return get_log_enabled()
+
     def _set_log_enabled(self, params):
         params = params or {}
         if "enabled" in params:
             value = params.get("enabled")
         else:
             value = params.get("show")
-        enabled = set_log_enabled(value)
+        setter = self.globals_dict.get("set_log_enabled") or set_log_enabled
+        enabled = setter(value)
         self.show = True
-        self._log("QMT log output enabled=%s" % ("1" if enabled else "0"), force=True)
+        self._log("QMT log output enabled=%s" % ("1" if enabled else "0"))
         return {"enabled": enabled}
 
     def _cleanup_qmt_userdata_logs(self, params):
+        if not getattr(self, "file_io_enabled", True):
+            raise NotImplementedError("QMT file IO is disabled; clean logs from the external Web process.")
         params = params or {}
         retention_days = self._retention_days(params.get("retention_days"), default=5)
         dry_run = str(params.get("dry_run") or "").strip().lower() in ("1", "true", "yes", "on")
@@ -699,6 +710,8 @@ class TxTradeBridge(object):
                     if detail_type.lower() in ("order", "deal"):
                         self._enrich_order_request_fields(formatted)
                         self._enrich_query_order_meta_fields(formatted, account_id, account_type)
+                        if detail_type.lower() == "order":
+                            self._remember_order_callback_fields(formatted)
                 result.append(formatted)
             except Exception as e:
                 self._log(
@@ -1845,6 +1858,20 @@ class TxTradeBridge(object):
         # been overwritten by another request with the same labels; use it
         # only when QMT itself supplied the matching dated internal reference.
         raw_ref = self._normalize_order_id(order.get("m_nRef"))
+        if metadata is None and raw_ref is not None and all(key[:5]):
+            # Some DEAL reports echo only the public remark.  Accept one
+            # same-scope submission whose recorded QMT ref is this exact ref.
+            with self.order_request_metadata_lock:
+                matches = [
+                    (candidate_key, candidate)
+                    for candidate_key, candidate in self.order_request_metadata.items()
+                    if candidate_key[:5] == key[:5]
+                    and order_remark_matches_reference(candidate_key[5], key[5])
+                    and isinstance(candidate, dict)
+                    and self._normalize_order_id(candidate.get("order_id")) == raw_ref
+                ]
+            if len(matches) == 1:
+                matched_key, metadata = matches[0]
         if (
             not bridge_matches
             or not account_id
@@ -1855,7 +1882,7 @@ class TxTradeBridge(object):
             or raw_ref is None
             or raw_ref != self._normalize_order_id(metadata.get("order_id"))
         ):
-            return restore_order_remark(order)
+            return self.order_callback_cache.enrich(order, self._account_type_name(order.get("account_type")))
         if isinstance(metadata, dict):
             strategy_name = str(metadata.get("strategy_name") or "")
             order_remark = str(
@@ -1880,7 +1907,11 @@ class TxTradeBridge(object):
                     order[name] = order_remark
         if order_id is not None and self._normalize_order_id(order.get("order_id")) is None:
             order["order_id"] = order_id
+        self.order_callback_cache.enrich(order, self._account_type_name(order.get("account_type")))
         return restore_order_remark(order)
+
+    def _remember_order_callback_fields(self, order):
+        self.order_callback_cache.remember(order, self._account_type_name(order.get("account_type")))
 
     def _enrich_query_order_meta_fields(self, data, account_id="", account_type=""):
         if not isinstance(data, dict):
@@ -2399,6 +2430,27 @@ class TxTradeBridge(object):
         rows = self._call_trade_detail_data(func, account_id, "credit", "account")
         return self._format_credit_rows(rows, params, XtCreditDetail, "get_trade_detail_data")
 
+    def _smt_response_data(self, raw):
+        # Validate before SDK coercion: bool("false") and str([]) must never
+        # turn a malformed acknowledgement into a final business response.
+        data = self._plain_object(raw)
+        data = dict(data) if isinstance(data, dict) else {}
+        aliases = {
+            "success": ("m_bSuccess",),
+            "msg": ("m_strMsg", "m_strError", "error"),
+            "apply_id": ("m_strApplyID", "m_strApplyId", "applyId"),
+            "account_id": (), "m_strAccountID": (),
+            "account_type": (), "m_nAccountType": (),
+            "m_strAccountType": (), "m_nBrokerType": (),
+        }
+        for target, sources in aliases.items():
+            for name in (target,) + sources:
+                value = self._get_value(raw, name)
+                if value is not None:
+                    data[target] = value
+                    break
+        return data
+
     def _smt_request(self, params, msg, method):
         account_id = self._credit_account_id(params)
         seq = params.get("seq")
@@ -2419,10 +2471,9 @@ class TxTradeBridge(object):
         raw = func(account_id, *args)
         if raw is False or (isinstance(raw, int) and not isinstance(raw, bool) and raw == -1):
             return {"seq": -1, "accepted": False}
-        response = XtSmtAppointmentResponse.from_any(raw)
-        if not isinstance(response, XtSmtAppointmentResponse):
+        data = self._smt_response_data(raw)
+        if not data:
             raise RuntimeError("%s returned no final business response; outcome unknown, reconcile before retrying" % method)
-        data = self._plain_value(vars(response))
         for name in ("account_id", "m_strAccountID"):
             if data.get(name) not in (None, "", account_id):
                 raise ValueError("%s returned a different account" % method)
@@ -2687,7 +2738,7 @@ class TxTradeBridge(object):
             )
         if method in XTDATA_COMPAT_CANDIDATES:
             return self._generic_xtdata_call(method, params, msg)
-        source = module_source_state(__file__, _LOADED_SOURCE_SHA256, self.started_at)
+        source = self._source_state()
         hint = "; bridge source changed on disk, restart the QMT process to load the updated module" if source["restart_required"] else ""
         raise NotImplementedError("xtdata.%s is not implemented by cfquant QMT bridge%s" % (method, hint))
 
@@ -2779,25 +2830,66 @@ class TxTradeBridge(object):
         ])
         return self._call_variants(func, variants)
 
-    def _get_market_data(self, params):
-        if params.get("period") in L2_PERIODS:
-            result = self._get_market_data_ex(params)
-            return market_data_legacy_shape(
-                result,
-                params.get("period", "1d"),
-                params.get("field_list", []),
-                params.get("stock_list", []),
+    def _dispatch_timed_market_data(self, action, params, msg):
+        started = time.perf_counter()
+        received = msg.get("_received_monotonic")
+        timing = {
+            "available": True,
+            "queue_ms": round(max(0.0, started - received) * 1000, 3) if received is not None else None,
+            "native_ms": 0.0, "convert_ms": 0.0,
+            "native_calls": [], "fallback_used": False,
+        }
+        msg["_response_meta"] = {"timing": {"qmt": timing}}
+        try:
+            if action == "xtdata.get_full_tick":
+                return self._timed_market_call(timing, "get_full_tick", self.context.get_full_tick,
+                                               params.get("code_list", []))
+            if action == "xtdata.get_market_data_ex":
+                return self._get_market_data_ex(params, timing=timing)
+            return self._get_market_data(params, timing=timing)
+        finally:
+            timing["execute_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            self._log(
+                "market_timing action=%s id=%s queue_ms=%s native_ms=%.3f convert_ms=%.3f execute_ms=%.3f fallback=%s"
+                % (action, msg.get("id"), timing["queue_ms"], timing["native_ms"],
+                   timing["convert_ms"], timing["execute_ms"], timing["fallback_used"])
             )
+
+    def _timed_market_call(self, timing, name, func, *args):
+        if timing is None:
+            return func(*args)
+        started = time.perf_counter()
+        succeeded = False
+        try:
+            result = func(*args)
+            succeeded = True
+            return result
+        finally:
+            elapsed = (time.perf_counter() - started) * 1000
+            timing["native_ms"] = round(timing["native_ms"] + elapsed, 3)
+            timing["native_calls"].append({"method": name, "elapsed_ms": round(elapsed, 3), "ok": succeeded})
+
+    def _legacy_market_result(self, result, params, timing):
+        started = time.perf_counter()
+        try:
+            return market_data_legacy_shape(result, params.get("period", "1d"),
+                                            params.get("field_list", []), params.get("stock_list", []))
+        finally:
+            if timing is not None:
+                timing["convert_ms"] = round(timing["convert_ms"] + (time.perf_counter() - started) * 1000, 3)
+
+    def _get_market_data(self, params, timing=None):
+        if params.get("period") in L2_PERIODS:
+            result = self._get_market_data_ex(params, timing=timing)
+            return self._legacy_market_result(result, params, timing)
         func = self._get_callable("get_market_data")
         if not func:
-            result = self._get_market_data_ex(params)
-            return market_data_legacy_shape(
-                result,
-                params.get("period", "1d"),
-                params.get("field_list", []),
-                params.get("stock_list", []),
-            )
-        result = func(
+            if timing is not None:
+                timing["fallback_used"] = True
+            result = self._get_market_data_ex(params, timing=timing)
+            return self._legacy_market_result(result, params, timing)
+        result = self._timed_market_call(
+            timing, "get_market_data", func,
             params.get("field_list", []),
             params.get("stock_list", []),
             params.get("start_time", ""),
@@ -2808,16 +2900,18 @@ class TxTradeBridge(object):
             params.get("count", -1),
         )
         if market_data_result_needs_fallback(result):
-            result = self._get_market_data_ex(params)
-            return market_data_legacy_shape(result, params.get("period", "1d"),
-                                             params.get("field_list", []), params.get("stock_list", []))
+            if timing is not None:
+                timing["fallback_used"] = True
+            result = self._get_market_data_ex(params, timing=timing)
+            return self._legacy_market_result(result, params, timing)
         return result
 
-    def _get_market_data_ex(self, params):
+    def _get_market_data_ex(self, params, timing=None):
         func = self._get_callable("get_market_data_ex")
         if not func:
             raise NotImplementedError("get_market_data_ex not found")
-        return func(
+        return self._timed_market_call(
+            timing, "get_market_data_ex", func,
             params.get("field_list", []),
             params.get("stock_list", []),
             params.get("period", "1d"),
@@ -4403,6 +4497,8 @@ class TxTradeBridge(object):
             )
 
     def _default_log_file(self):
+        if not getattr(self, "file_io_enabled", True):
+            return ""
         base_dir = os.getcwd()
         log_dir = (
             os.environ.get("CFQUANT_QMT_LOG_DIR")
@@ -4417,17 +4513,23 @@ class TxTradeBridge(object):
         return os.path.join(log_dir, "cfquant_qmt_bridge.log")
 
     def _log(self, msg, force=False):
-        if not force and not get_log_enabled():
+        if not force and not self._get_log_enabled():
             return
         msg = translate_log(msg)
         line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-        try:
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+        if getattr(self, "file_io_enabled", True):
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
         if self.show:
             print(msg)
+
+    def _source_state(self):
+        if not getattr(self, "file_io_enabled", True):
+            return {"restart_required": False, "source_inspection_enabled": False}
+        return module_source_state(__file__, _LOADED_SOURCE_SHA256, self.started_at)
 
 
 def start_tx_trade_bridge(

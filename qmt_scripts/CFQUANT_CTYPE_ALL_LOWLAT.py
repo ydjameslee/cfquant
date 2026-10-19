@@ -3,9 +3,10 @@
 
 import os
 import sys
+sys.dont_write_bytecode = True
+os.environ["CFQUANT_QMT_NO_FILE_IO"] = "1"
 import importlib
 import datetime as dt
-import io
 import json
 import queue
 import threading
@@ -32,17 +33,18 @@ USER_BRIDGE_ID = "default"
 BRIDGE_ID = os.environ.get("CFQUANT_BRIDGE_ID", USER_BRIDGE_ID)
 PIPE_NAME = os.environ.get("CFQUANT_PIPE_NAME", r"\\.\pipe\cfquant_pipe_hub")
 RUNTIME_CONFIG_PATH = ""
+EMBEDDED_RUNTIME_CONFIG = {}
 RUNTIME_CONFIG = {}
 RUNTIME_CHANNELS = {}
 QMT_MARKET = os.environ.get("CFQUANT_MARKET", "").strip().upper()
 PIPE_CONNECT_TIMEOUT_MS = int(os.environ.get("CFQUANT_PIPE_CONNECT_TIMEOUT_MS", "3000"))
 TRADE_LOOP_IN_THREAD = os.environ.get("CFQUANT_CTYPE_TRADE_THREAD", "1").strip().lower() in ("1", "true", "yes", "on")
 NORMAL_PUMP_MAX_COUNT = int(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_COUNT", "100"))
-NORMAL_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_MS", "0"))
+NORMAL_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_MS", "5"))
 TRADE_SLEEP_SECONDS = float(os.environ.get("CFQUANT_CTYPE_TRADE_SLEEP_SECONDS", "0.001"))
 TRADE_PUMP_MAX_COUNT = int(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_COUNT", "100"))
-TRADE_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_MS", "0"))
-TRADE_TIMER_INTERVAL_MS = int(os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "20"))
+TRADE_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_MS", "5"))
+TRADE_TIMER_INTERVAL_MS = int(os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "1"))
 
 
 def _entry_file_path():
@@ -57,90 +59,17 @@ def _entry_file_path():
 
 
 def _entry_base_dir():
-    entry_file = _entry_file_path()
-    if entry_file:
-        return os.path.dirname(entry_file)
-    for name in ("CFQUANT_QMT_SCRIPT_DIR", "CFQUANT_SCRIPT_DIR", "CFQUANT_ENTRY_DIR"):
-        path = str(os.environ.get(name) or "").strip()
-        if path and os.path.isdir(path):
-            return os.path.abspath(path)
-    try:
-        cwd = os.path.abspath(os.getcwd())
-        if (
-            os.path.isfile(os.path.join(cwd, "CFQUANT_CTYPE_ALL_LOWLAT.py"))
-            or os.path.isfile(os.path.join(cwd, "cfquant_bridge_config.json"))
-            or os.path.isdir(os.path.join(cwd, "cfquant"))
-        ):
-            return cwd
-    except Exception:
-        pass
-    for path in sys.path:
-        path = str(path or "").strip()
-        if path and os.path.isdir(path):
-            base = os.path.abspath(path)
-            if (
-                os.path.isfile(os.path.join(base, "CFQUANT_CTYPE_ALL_LOWLAT.py"))
-                or os.path.isfile(os.path.join(base, "cfquant_bridge_config.json"))
-                or os.path.isdir(os.path.join(base, "cfquant"))
-            ):
-                return base
-    try:
-        return os.path.abspath(os.getcwd())
-    except Exception:
-        return ""
-
-
-def _runtime_log_path():
-    try:
-        base_dir = _entry_base_dir()
-        parent_dir = os.path.dirname(base_dir)
-        configured = os.environ.get("CFQUANT_QMT_LOG_DIR") or (os.path.join(os.environ.get("CFQUANT_LOG_DIR"), "qmt_bridge") if os.environ.get("CFQUANT_LOG_DIR") else "")
-        if configured:
-            candidates = [configured]
-        elif os.path.basename(base_dir).lower() == "python":
-            candidates = [
-                os.path.join(parent_dir, "bin.x64", "log"),
-                os.path.join(parent_dir, "log"),
-                os.path.join(base_dir, "log"),
-            ]
-        else:
-            candidates = [
-                os.path.join(base_dir, "log"),
-                os.path.join(parent_dir, "bin.x64", "log"),
-                os.path.join(parent_dir, "log"),
-            ]
-        candidates.extend([
-            os.path.join(parent_dir, "bin.x64", "tx_log"),
-            os.path.join(base_dir, "tx_log"),
-            os.path.join(parent_dir, "tx_log"),
-            base_dir,
-        ])
-        for log_dir in candidates:
-            if not log_dir:
-                continue
-            try:
-                os.makedirs(log_dir, exist_ok=True)
-                return os.path.join(log_dir, "cfquant_ctype_bridge.log")
-            except Exception:
-                if os.path.isdir(log_dir):
-                    return os.path.join(log_dir, "cfquant_ctype_bridge.log")
-    except Exception:
-        pass
-    return ""
+    entry = _entry_file_path()
+    if entry:
+        return os.path.dirname(entry)
+    return (os.environ.get("CFQUANT_QMT_SCRIPT_DIR") or os.environ.get("CFQUANT_SCRIPT_DIR")
+            or os.environ.get("CFQUANT_ENTRY_DIR") or os.getcwd())
 
 
 def _write_runtime_log(message):
-    try:
-        path = _runtime_log_path()
-        if not path:
-            return
-        log_dir = os.path.dirname(path)
-        if log_dir and not os.path.isdir(log_dir):
-            os.makedirs(log_dir)
-        with open(path, "a") as f:
-            f.write("%s %s\n" % (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message))
-    except Exception:
-        pass
+    enabled = globals().get("get_log_enabled")
+    if not callable(enabled) or enabled():
+        print(message)
 
 
 def _install_logging_compat():
@@ -220,99 +149,24 @@ def _install_logging_compat():
 
 
 def _ensure_path():
-    try:
-        base_dir = _entry_base_dir()
-        parent_dir = os.path.dirname(base_dir)
-        env_paths = [p for p in os.environ.get("CFQUANT_PYTHONPATH", "").split(os.pathsep) if p]
-        if os.path.basename(base_dir).lower() == "python":
-            candidates = env_paths + [os.path.join(parent_dir, "bin.x64"), base_dir, parent_dir]
-        else:
-            candidates = env_paths + [
-                base_dir,
-                os.path.join(base_dir, "bin.x64"),
-                parent_dir,
-                os.path.join(parent_dir, "bin.x64"),
-                os.path.join(parent_dir, "python"),
-            ]
-        ordered = []
-        seen = set()
-        for path in candidates:
-            if not path or not os.path.isdir(path):
-                continue
-            path = os.path.abspath(path)
-            key = os.path.normcase(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(path)
-        if ordered:
-            sys.path[:] = ordered + [
-                path for path in sys.path
-                if os.path.normcase(os.path.abspath(path or os.curdir)) not in seen
-            ]
-    except Exception:
-        pass
-
-
-def _runtime_config_paths():
-    try:
-        base_dir = _entry_base_dir()
-        parent_dir = os.path.dirname(base_dir)
-        candidates = []
-        env_path = os.environ.get("CFQUANT_BRIDGE_CONFIG_FILE")
-        if env_path:
-            candidates.append(env_path)
-        market = str(os.environ.get("CFQUANT_MARKET") or QMT_MARKET or "").strip().upper()
-        market_filenames = []
-        if market in ("SH", "SZ"):
-            market_filenames.append("cfquant_bridge_config_%s.json" % market)
-        if os.path.basename(base_dir).lower() == "python":
-            for filename in market_filenames:
-                candidates.append(os.path.join(parent_dir, "bin.x64", filename))
-                candidates.append(os.path.join(base_dir, filename))
-            candidates.append(os.path.join(parent_dir, "bin.x64", "cfquant_bridge_config.json"))
-            candidates.append(os.path.join(base_dir, "cfquant_bridge_config.json"))
-        else:
-            for filename in market_filenames:
-                candidates.append(os.path.join(base_dir, filename))
-                candidates.append(os.path.join(base_dir, "bin.x64", filename))
-            candidates.append(os.path.join(base_dir, "cfquant_bridge_config.json"))
-            candidates.append(os.path.join(base_dir, "bin.x64", "cfquant_bridge_config.json"))
-        for filename in market_filenames:
-            candidates.append(os.path.join(parent_dir, filename))
-        candidates.append(os.path.join(parent_dir, "cfquant_bridge_config.json"))
-        result = []
-        seen = set()
-        for path in candidates:
-            if not path:
-                continue
-            path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
-            key = os.path.normcase(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(path)
-        return result
-    except Exception:
-        return []
+    base = _entry_base_dir()
+    parent = os.path.dirname(base)
+    candidates = [p for p in os.environ.get("CFQUANT_PYTHONPATH", "").split(os.pathsep) if p]
+    candidates += [base, os.path.join(parent, "bin.x64"), parent]
+    for path in reversed(candidates):
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def _load_runtime_config():
-    for path in _runtime_config_paths():
-        if not os.path.isfile(path):
-            continue
-        for index, opener in enumerate((
-            lambda: io.open(path, "r", encoding="utf-8"),
-            lambda: open(path, "r"),
-        )):
-            try:
-                with opener() as f:
-                    data = json.loads(f.read())
-                if isinstance(data, dict):
-                    return path, data
-            except Exception as e:
-                if index == 1:
-                    _write_runtime_log("cfquant ctypes runtime config read failed path=%s error=%s" % (path, e))
+    if EMBEDDED_RUNTIME_CONFIG:
+        return "embedded", dict(EMBEDDED_RUNTIME_CONFIG)
+    text = os.environ.get("CFQUANT_RUNTIME_CONFIG_JSON", "").strip()
+    if text:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("CFQUANT_RUNTIME_CONFIG_JSON must be a JSON object")
+        return "environment", data
     return "", {}
 
 
@@ -330,6 +184,8 @@ def _config_bool(value, default=True):
 
 
 def _env_allows_runtime_override(name, default_value=""):
+    if EMBEDDED_RUNTIME_CONFIG:
+        return True
     value = str(os.environ.get(name) or "").strip()
     if not value:
         return True
@@ -339,15 +195,17 @@ def _env_allows_runtime_override(name, default_value=""):
 
 
 def _apply_runtime_config():
+    global TRADE_TIMER_INTERVAL_MS
     global BRIDGE_ID, PIPE_NAME, RUNTIME_CONFIG_PATH, RUNTIME_CONFIG, RUNTIME_CHANNELS, QMT_MARKET, DEFAULT_ACCOUNT_ID, DEFAULT_ACCOUNT_TYPE
 
     path, data = _load_runtime_config()
     RUNTIME_CONFIG_PATH = path
     RUNTIME_CONFIG = data
+    TRADE_TIMER_INTERVAL_MS = _qmt_timer_interval(data)
     if not data:
         _write_runtime_log("cfquant ctypes runtime config not found")
         return
-    if data.get("account_id") and not DEFAULT_ACCOUNT_ID:
+    if data.get("account_id") and (EMBEDDED_RUNTIME_CONFIG or not DEFAULT_ACCOUNT_ID):
         DEFAULT_ACCOUNT_ID = str(data.get("account_id") or "").strip()
     if data.get("account_type"):
         DEFAULT_ACCOUNT_TYPE = str(data.get("account_type") or DEFAULT_ACCOUNT_TYPE or "STOCK").strip().upper()
@@ -367,8 +225,6 @@ def _apply_runtime_config():
         RUNTIME_CHANNELS = channels
     if not os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") and data.get("qmt_log_language"):
         os.environ["CFQUANT_QMT_LOG_LANGUAGE"] = str(data.get("qmt_log_language") or "zh")
-    if not os.environ.get("CFQUANT_QMT_LOG_ENABLED") and "qmt_log_enabled" in data:
-        os.environ["CFQUANT_QMT_LOG_ENABLED"] = "1" if _config_bool(data.get("qmt_log_enabled"), True) else "0"
     _write_runtime_log(
         "cfquant ctypes runtime config loaded path=%s bridge_id=%s pipe=%s"
         % (path, BRIDGE_ID, PIPE_NAME)
@@ -376,11 +232,38 @@ def _apply_runtime_config():
 
 
 _ensure_path()
+# BEGIN GENERATED BINDING SETTINGS
+_QMT_BOUND_LOG_ENABLED = None
+
+
+def get_log_enabled():
+    if _QMT_BOUND_LOG_ENABLED is not None:
+        return _QMT_BOUND_LOG_ENABLED
+    value = RUNTIME_CONFIG.get("qmt_log_enabled", os.environ.get("CFQUANT_QMT_LOG_ENABLED", "1"))
+    return _config_bool(value, True)
+
+
+def set_log_enabled(value):
+    global _QMT_BOUND_LOG_ENABLED
+    _QMT_BOUND_LOG_ENABLED = _config_bool(value, True)
+    return _QMT_BOUND_LOG_ENABLED
+
+
+def _qmt_timer_interval(data):
+    value = data.get("qmt_timer_interval_ms", os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "1"))
+    try:
+        if isinstance(value, bool) or str(value).strip() != str(int(value)):
+            return 1
+        value = int(value)
+        return value if 1 <= value <= 1000 else 1
+    except (TypeError, ValueError, OverflowError):
+        return 1
+# END GENERATED BINDING SETTINGS
+
 _apply_runtime_config()
 _write_runtime_log("cfquant ctypes entry executing file=%s sys_path_head=%s" % (_entry_file_path() or "<string>", sys.path[:5]))
 
 _logging_i18n = _install_logging_compat()
-get_log_enabled = _logging_i18n.get_log_enabled
 translate_log = _logging_i18n.translate_log
 
 try:
@@ -401,7 +284,6 @@ def _print_log(message):
         return
     translated = translate_log(message)
     print(translated)
-    _write_runtime_log(translated)
 
 
 def _load_bridge_starters():
@@ -442,35 +324,47 @@ for _channel_key in ("normal", "trade", "callback"):
     if _channel_value:
         BRIDGE_CHANNELS[_channel_key] = str(_channel_value).strip()
 
-_normal_bridge = start_pipe_normal_bridge(
-    None,
-    pipe_name=PIPE_NAME,
-    request_channel=BRIDGE_CHANNELS["normal"],
-    request_channels=[BRIDGE_CHANNELS["normal"]],
-    callback_event_channel=BRIDGE_CHANNELS["callback"],
-    bridge_id=BRIDGE_ID,
-    account_id=DEFAULT_ACCOUNT_ID,
-    show=True,
-    schedule_timer=False,
-    pump_max_count=NORMAL_PUMP_MAX_COUNT,
-    pump_max_ms=NORMAL_PUMP_MAX_MS,
-    dispatch_on_qmt_thread=True,
-    connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
-)
-if DEFAULT_ACCOUNT_TYPE and _normal_bridge:
-    _normal_bridge.account_type = DEFAULT_ACCOUNT_TYPE
+# BEGIN GENERATED PIPE RUNTIME
+from cfquant.qmt_pipe_runtime import ManagedPipeRuntime
+# END GENERATED PIPE RUNTIME
 
-_trade_bridge = start_pipe_trade_bridge(
-    None,
-    pipe_name=PIPE_NAME,
-    request_channel=BRIDGE_CHANNELS["trade"],
-    bridge_id=BRIDGE_ID,
-    account_id=DEFAULT_ACCOUNT_ID,
-    show=True,
-    connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
-)
-if DEFAULT_ACCOUNT_TYPE and _trade_bridge:
-    _trade_bridge.account_type = DEFAULT_ACCOUNT_TYPE
+_managed_runtime = ManagedPipeRuntime(RUNTIME_CONFIG.get("managed_strategy")).acquire()
+_managed_runtime.namespace = globals()
+try:
+    _normal_bridge = start_pipe_normal_bridge(
+        None,
+        pipe_name=PIPE_NAME,
+        request_channel=BRIDGE_CHANNELS["normal"],
+        request_channels=[BRIDGE_CHANNELS["normal"]],
+        callback_event_channel=BRIDGE_CHANNELS["callback"],
+        bridge_id=BRIDGE_ID,
+        account_id=DEFAULT_ACCOUNT_ID,
+        show=True,
+        schedule_timer=False,
+        pump_max_count=NORMAL_PUMP_MAX_COUNT,
+        pump_max_ms=NORMAL_PUMP_MAX_MS,
+        dispatch_on_qmt_thread=True,
+        connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
+    )
+    if DEFAULT_ACCOUNT_TYPE and _normal_bridge:
+        _normal_bridge.account_type = DEFAULT_ACCOUNT_TYPE
+
+    _trade_bridge = start_pipe_trade_bridge(
+        None,
+        pipe_name=PIPE_NAME,
+        request_channel=BRIDGE_CHANNELS["trade"],
+        bridge_id=BRIDGE_ID,
+        account_id=DEFAULT_ACCOUNT_ID,
+        show=True,
+        connect_timeout_ms=PIPE_CONNECT_TIMEOUT_MS,
+    )
+    if DEFAULT_ACCOUNT_TYPE and _trade_bridge:
+        _trade_bridge.account_type = DEFAULT_ACCOUNT_TYPE
+    for _account_bridge in (_normal_bridge, _trade_bridge):
+        _account_bridge.account_type = DEFAULT_ACCOUNT_TYPE
+except BaseException:
+    _managed_runtime.close()
+    raise
 
 _print_log("cfquant ctypes all-in-one lowlat bridge module loaded")
 _print_log("cfquant ctypes all-in-one lowlat entry version:%s" % _ENTRY_VERSION)
@@ -808,7 +702,8 @@ def stop(ContextInfo):
 
 def _publish_callback(event_name, obj):
     try:
-        _print_log("cfquant ctypes raw qmt callback received event=%s %s" % (event_name, _callback_brief(obj)))
+        if get_log_enabled():
+            _print_log("cfquant ctypes raw qmt callback received event=%s %s" % (event_name, _callback_brief(obj)))
         if _normal_bridge:
             _normal_bridge.publish_callback_event(event_name, obj)
         # Orders are dispatched through the low-latency trade bridge while
@@ -865,3 +760,5 @@ def order_stock_async_response_callback(ContextInfo, response):
 
 def cancel_order_stock_async_response_callback(ContextInfo, response):
     _publish_callback("trader:on_cancel_order_stock_async_response", response)
+
+_managed_runtime.bind(globals())
