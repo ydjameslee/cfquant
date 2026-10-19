@@ -1140,6 +1140,25 @@ body.binding-dialog-open {
   transform: translateY(0);
 }
 
+.qmt-password-input {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+
+.qmt-password-input input {
+  flex: 1;
+  width: 0;
+  min-width: 0;
+}
+
+.qmt-password-input button {
+  flex: none;
+  white-space: nowrap;
+  padding-inline: 10px;
+}
+
 .qmt-login-prerequisite {
   display: grid;
   gap: 10px;
@@ -4102,6 +4121,7 @@ th.num .sort-header {
 
 .binding-dialog {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   width: min(1100px, 100%);
   max-height: calc(100vh - 36px);
   overflow: auto;
@@ -4339,6 +4359,7 @@ th.num .sort-header {
 }
 
 .binding-dialog-form {
+  min-width: 0;
   padding: 16px 18px 18px;
 }
 
@@ -4349,6 +4370,32 @@ th.num .sort-header {
 .binding-dialog-wide-row {
   grid-column: 1 / -1;
   align-self: start;
+}
+
+.binding-runtime-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.binding-runtime-settings.hidden {
+  display: none;
+}
+
+.binding-runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.binding-runtime-settings p {
+  margin: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .binding-dialog-bleed {
@@ -4598,6 +4645,19 @@ th.num .sort-header {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.api-endpoint .api-endpoint-label {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  white-space: normal;
+}
+
+.api-endpoint-label code {
+  font-size: 11px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .api-workbench {
@@ -5871,6 +5931,7 @@ input[type="file"] {
 
 .api-form-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: end;
   gap: 8px;
 }
@@ -5945,10 +6006,54 @@ input[type="file"] {
 
 .quote-live-panel {
   margin-bottom: 14px;
+  min-width: 0;
+}
+
+.quote-live-panel > [data-quote-latency] {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+.quote-live-panel > [data-quote-latency] p {
+  margin: 8px 0;
+}
+
+.quote-live-panel [data-quote-latency].hidden {
+  display: none;
 }
 
 .quote-live-panel.hidden {
   display: none;
+}
+
+.quote-latency-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 12px;
+  margin: 12px 0;
+}
+
+.quote-latency-controls label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.quote-latency-controls input,
+.quote-latency-controls select {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.quote-latency-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex-basis: 100%;
 }
 
 .download-progress-panel {
@@ -6080,10 +6185,21 @@ input[type="file"] {
 
 .quote-live-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 8px;
+}
+
+.quote-live-head > div {
+  min-width: 0;
+  max-width: 100%;
+}
+
+#quoteLiveStatus {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .quote-live-head h3 {
@@ -9592,8 +9708,9 @@ tr.order-row-updated td {
     grid-template-columns: 1fr;
   }
 
-  .binding-dialog-form {
-    grid-template-columns: 1fr;
+  .binding-dialog-form,
+  .binding-runtime-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .market-routing-head,

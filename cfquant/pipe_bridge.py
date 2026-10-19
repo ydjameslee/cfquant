@@ -9,6 +9,8 @@ from .tx_trade_bridge import TxTradeBridge
 
 
 class PipeNormalQmtBridge(NormalQmtBridge):
+    file_io_enabled = False
+
     def __init__(
         self,
         context,
@@ -22,7 +24,7 @@ class PipeNormalQmtBridge(NormalQmtBridge):
         globals_dict=None,
         schedule_timer=True,
         pump_max_count=20,
-        pump_max_ms=0,
+        pump_max_ms=5,
         dispatch_on_qmt_thread=False,
         connect_timeout_ms=3000,
     ):
@@ -48,6 +50,9 @@ class PipeNormalQmtBridge(NormalQmtBridge):
         self.connect_timeout_ms = int(connect_timeout_ms)
 
     def start(self):
+        runtime = self.globals_dict.get("_managed_runtime")
+        if runtime is not None:
+            runtime.attach_bridge(self)
         if self.running:
             return self
         self.running = True
@@ -61,7 +66,9 @@ class PipeNormalQmtBridge(NormalQmtBridge):
             endpoint_name="normal",
             show=self.show,
             connect_timeout_ms=self.connect_timeout_ms,
-        ).start()
+        )
+        self.tx._log = self._log
+        self.tx.start()
         self.tx.start_txg(self.request_channel)
         self.recv_thread = threading.Thread(target=self._recv_loop)
         self.recv_thread.daemon = True
@@ -104,6 +111,8 @@ class PipeNormalQmtBridge(NormalQmtBridge):
 
 
 class PipeTradeBridge(TxTradeBridge):
+    file_io_enabled = False
+
     def __init__(
         self,
         context,
@@ -131,6 +140,9 @@ class PipeTradeBridge(TxTradeBridge):
         self.connect_timeout_ms = int(connect_timeout_ms)
 
     def start(self):
+        runtime = self.globals_dict.get("_managed_runtime")
+        if runtime is not None:
+            runtime.attach_bridge(self)
         if self.running:
             return self
         self.running = True
@@ -143,7 +155,9 @@ class PipeTradeBridge(TxTradeBridge):
             endpoint_name="trade",
             show=self.show,
             connect_timeout_ms=self.connect_timeout_ms,
-        ).start()
+        )
+        self.tx._log = self._log
+        self.tx.start()
         self.tx.start_txg(self.request_channel)
         self._log(
             "pipe trade bridge started pipe=%s request_channel=%s"
@@ -198,7 +212,7 @@ def start_pipe_normal_bridge(
     show=True,
     schedule_timer=True,
     pump_max_count=20,
-    pump_max_ms=0,
+    pump_max_ms=5,
     dispatch_on_qmt_thread=False,
     connect_timeout_ms=3000,
 ):

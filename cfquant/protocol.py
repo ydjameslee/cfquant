@@ -80,7 +80,7 @@ def loads_message(raw):
         raw = raw.decode("utf-8", errors="replace")
     if not isinstance(raw, str):
         return None
-    if "|" in raw:
+    if not raw.startswith(MESSAGE_PREFIX) and "|" in raw:
         _, raw = raw.split("|", 1)
     if not raw.startswith(MESSAGE_PREFIX):
         return None
@@ -107,15 +107,36 @@ def pack_request(action, params=None, reply_channel=None, client_id=None, reques
     return dumps_message(payload)
 
 
-def pack_response(request_id, ok=True, result=None, error=None, meta=None):
-    return dumps_message({
+def encode_response_result(result):
+    """Freeze one response body for reuse; include all serialization work."""
+    started = time.perf_counter()
+    encoded = encode_value(result)
+    converted = time.perf_counter()
+    normalized = normalize_json_value(encoded, "result")
+    normalized_at = time.perf_counter()
+    body = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    finished = time.perf_counter()
+    return body, {"encode_value_ms": round((converted - started) * 1000, 3),
+                  "normalize_ms": round((normalized_at - converted) * 1000, 3),
+                  "json_encode_ms": round((finished - normalized_at) * 1000, 3),
+                  "encode_ms": round((finished - started) * 1000, 3)}
+
+
+def pack_response(request_id, ok=True, result=None, error=None, meta=None, encoded_result=None):
+    body, encoding_timing = encode_response_result(result) if encoded_result is None else encoded_result
+    meta = dict(meta or {})
+    timing = meta.get("timing")
+    if isinstance(timing, dict) and isinstance(timing.get("qmt"), dict):
+        timing = dict(timing, qmt=dict(timing["qmt"], **encoding_timing))
+        meta["timing"] = timing
+    header = dumps_message({
         "type": "response",
         "id": request_id,
         "ok": bool(ok),
-        "result": encode_value(result),
         "error": encode_error(error),
-        "meta": meta or {},
+        "meta": meta,
     })
+    return header[:-1] + ',"result":' + body + '}'
 
 
 def pack_event(event, data=None, client_id=None, subscription_id=None, meta=None):
@@ -127,6 +148,66 @@ def pack_event(event, data=None, client_id=None, subscription_id=None, meta=None
         "data": encode_value(data),
         "meta": meta or {},
     })
+
+
+def is_readonly_request(action):
+    # Only known query families. Downloads, subscriptions and all writes retain
+    # their existing execution semantics, including on an ambiguous timeout.
+    return (str(action).startswith(("xtdata.get_", "xttrader.query_"))
+            or action in ("cfquant.ping", "cfquant.status", "cfquant.query_info"))
+
+
+def request_expired(msg, now=None):
+    if not is_readonly_request(msg.get("action")):
+        return False
+    received = msg.get("_received_monotonic")
+    timeout = msg.get("timeout")
+    if received is None or timeout is None:
+        return False
+    return (time.perf_counter() if now is None else now) - received >= max(0.0, float(timeout))
+
+
+def _quote_json_default(value):
+    """Box only uncommon quote scalars; ordinary dict/list traversal stays in JSON's C encoder."""
+    if type(value).__module__.startswith("pandas.") and type(value).__name__ in ("NAType", "NaTType"):
+        return None
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError("unsupported quote JSON type: %s" % type(value).__name__)
+
+
+def pack_whole_quote_event(event, data, client_id=None, subscription_id=None):
+    """Serialize a whole-quote batch without recursive Python preprocessing.
+
+    Only the event metadata carries the encoding marker; callback data keeps
+    its stock-code dictionary shape. Unsupported values require the caller's
+    compatibility fallback, just as for diagnostic snapshots.
+    """
+    quotes_json = json.dumps(data, default=_quote_json_default,
+                             ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    header = dumps_message({"type": "event", "event": event, "client_id": client_id,
+                           "subscription_id": subscription_id, "meta": {"quote_json_plain": True}})
+    return header[:-1] + ',"data":' + quotes_json + '}'
+
+
+def pack_quote_latency_event(event, data, client_id=None, subscription_id=None):
+    """Encode the complete diagnostic snapshot once, without recursive Python preprocessing.
+
+    Nonfinite or unusual payloads raise and use the bridge's existing compatibility
+    encoder. The wire format remains ordinary strict JSON, consumable by old receivers.
+    """
+    started = time.perf_counter()
+    quotes_json = json.dumps(data["quotes"], default=_quote_json_default,
+                             ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    metadata = {key: value for key, value in data.items() if key != "quotes"}
+    metadata["qmt_encode_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+    metadata["qmt_encoding"] = "direct_json"
+    header = dumps_message({"type": "event", "event": event, "client_id": client_id,
+                           "subscription_id": subscription_id, "meta": {"quote_json_plain": True}})
+    details = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return header[:-1] + ',"data":' + details[:-1] + ',"quotes":' + quotes_json + '}}'
 
 
 def encode_error(error):
@@ -220,17 +301,52 @@ def _clean_cell(value):
     return encode_value(value)
 
 
+def dataframe_numeric_rows(value):
+    """Bulk rows for plain numeric frames; None keeps pandas' other semantics."""
+    columns = getattr(value, "columns", None)
+    dtypes = getattr(value, "dtypes", None)
+    if columns is None or not len(columns) or dtypes is None or not getattr(columns, "is_unique", False):
+        return None
+    # Nullable, object and date-like columns need pandas' scalar boxing rules.
+    # Restrict this fast path so callers keep their existing null/date behavior.
+    for dtype in dtypes:
+        if (type(dtype).__module__.split(".", 1)[0] != "numpy"
+                or dtype.kind not in ("b", "i", "u", "f") or dtype.itemsize > 8):
+            return None
+    # Combining mixed numeric blocks before this cast can round large IDs.
+    return value.astype(object, copy=False).values.tolist()
+
+
 def _encode_dataframe(value):
     try:
-        raw_rows = list(value.itertuples(index=False, name=None))
+        # itertuples builds a Series per column, which is expensive for QMT's
+        # stock-by-date history frames. Cast BEFORE combining the blocks: using
+        # values directly can round int64/uint64 IDs in mixed float/int frames.
+        # astype also works with QMT's pandas 0.22 (which has no to_numpy).
+        raw_rows = value.astype(object, copy=False).values.tolist() if len(value.columns) else []
     except Exception:
         try:
-            raw_rows = value.values.tolist()
+            raw_rows = list(value.itertuples(index=False, name=None))
         except Exception:
-            raw_rows = []
+            try:
+                raw_rows = value.values.tolist()
+            except Exception:
+                raw_rows = []
     rows = []
     for row in raw_rows:
         rows.append([_clean_cell(v) for v in row])
+    # Thousands of date columns usually share one dtype. Formatting its name
+    # repeatedly can cost more than extracting the actual values.
+    dtype_flags = {}
+    object_columns = []
+    for name, dtype in getattr(value, "dtypes", {}).items():
+        is_object = dtype_flags.get(dtype)
+        if is_object is None:
+            dtype_name = str(dtype)
+            is_object = dtype_name == "object" or dtype_name.startswith(("Int", "UInt"))
+            dtype_flags[dtype] = is_object
+        if is_object:
+            object_columns.append(_encode_label(name))
     index_name = getattr(getattr(value, "index", None), "name", None)
     return {
         "__cf_type__": "dataframe",
@@ -238,8 +354,7 @@ def _encode_dataframe(value):
         "index": [_encode_label(i) for i in getattr(value, "index", [])],
         "data": rows,
         "index_name": _encode_label(index_name) if index_name is not None else None,
-        "object_columns": [_encode_label(name) for name, dtype in getattr(value, "dtypes", {}).items()
-                           if str(dtype) == "object" or str(dtype).startswith(("Int", "UInt"))],
+        "object_columns": object_columns,
     }
 
 
@@ -328,6 +443,13 @@ def decode_value(value):
                     parts[2] = tuple(parts[2])
                 dtype_descr.append(tuple(parts))
             dtype = np.dtype(dtype_descr)
+            # JSON turns each structured record tuple into a list. NumPy
+            # treats that list as another array dimension unless restored.
+            def record_tuples(items, dimensions):
+                if dimensions == 0:
+                    return tuple(items)
+                return [record_tuples(item, dimensions - 1) for item in items]
+            data = record_tuples(data, len(value.get("shape", [len(data)])))
         elif value.get("dtype"):
             try:
                 dtype = np.dtype(value.get("dtype"))

@@ -5,6 +5,7 @@ sys.dont_write_bytecode = True
 import argparse
 import base64
 from contextlib import contextmanager
+from contextvars import ContextVar
 import email.parser
 import email.policy
 import fnmatch
@@ -14,7 +15,10 @@ import json
 import math
 import mimetypes
 import os
+from pathlib import Path
+from cfquant.diagnostics import latency_report, SCHEMA as QUOTE_LATENCY_SCHEMA
 from cfquant.stock_connect import connect_account_type, normalize_connect_code, validate_connect_order, validate_connect_market
+from cfquant.qmt_binding_settings import normalize_qmt_runtime_settings, qmt_runtime_identity
 import posixpath
 import queue
 import re
@@ -110,12 +114,18 @@ from cfquant.batch_orders import (
 from cfquant import _editable_install
 from cfquant import xtconstant as cf_xtconstant
 from cfquant.qmt_strategy_deploy import (QmtStrategyManager, account_qmt_roots,
-    normalize_strategy_settings, qmt_root, entry_script_for_mode, read_entry_source)
+    normalize_strategy_settings, qmt_root, entry_script_for_mode, read_entry_source,
+    configured_pipe_source, PipeStrategyController)
 from cfquant.channels import configured_bridges, normalize_bridge_id
 from cfquant.config import get_config as get_cfquant_config
 from cfquant.logging_i18n import normalize_log_enabled, normalize_log_language
+from cfquant.level2 import L2_PERIODS
+from cfquant.protocol import dataframe_numeric_rows
 from cfquant.pipe_transport import DEFAULT_PIPE_NAME, normalize_pipe_name
-from cfquant.protocol import decode_value, loads_message, new_id, pack_event, pack_response
+from cfquant.protocol import decode_value, loads_message, new_id, pack_event, pack_response, pack_whole_quote_event
+from cfquant.protocol import is_readonly_request
+from cfquant.flow_control import KeyedExecutor, OrderedSender
+from cfquant.quote_history import QuoteHistory
 from cfquant.runtime_report import read_qmt_runtime_markers as read_qmt_runtime_marker_files
 from cfquant.runtime_report import module_source_state
 from cfquant.version import WEB_VERSION, __version__ as CORE_VERSION
@@ -573,7 +583,7 @@ MANAGEMENT_STARTED_AT = time.time()
 MANAGEMENT_READY = False
 MANAGEMENT_API_PATHS = frozenset({
     "/api/management/status", "/api/management/restart", "/api/management/stop",
-    "/api/setup/initialize", "/api/account-config", "/api/account-config/delete",
+    "/api/setup/initialize", "/api/account-config", "/api/account-config/delete", "/api/account-config/qmt-password",
     "/api/bindings/status", "/api/project-updates/status", "/api/project-updates/official",
     "/api/project-updates/github", "/api/project-updates/rollback", "/api/project-updates/ensure-latest",
     "/api/version", "/api/config",
@@ -670,11 +680,16 @@ ACCOUNT_ACTIONS = {
 NORMAL_QMT_ACTIONS = {
     "xtdata.subscribe_quote",
     "xtdata.subscribe_whole_quote",
+    "xtdata.subscribe_whole_quote_latency",
     "xtdata.unsubscribe_quote",
     "xtdata.download_history_data",
     "xtdata.download_history_data2",
     "xtdata.download_financial_data",
     "xtdata.download_financial_data2",
+    "xtdata.get_local_data",
+    "xtdata.get_financial_data",
+    "xtdata.get_financial_data_ori",
+    "xtdata.get_financial_data_raw",
     "xtdata.subscribe_formula",
     "xtdata.unsubscribe_formula",
     "xtdata.subscribe_l2thousand",
@@ -912,6 +927,12 @@ TEST_SOURCE_META = {
         "自动化测试",
         "验证教程阅读器页面结构、导航和内容读取行为。",
         'python -X utf8 -m pytest "cfquant/tests/test_tutorial_reader.py" -q',
+    ),
+    "34_全推内部延迟测试.py": (
+        "全推内部延迟测试",
+        "行情测试",
+        "独立订阅全推，打印行情时间到程序、QMT 发送到程序的延迟及数据样本。",
+        'python -X utf8 "cfquant/tests/34_全推内部延迟测试.py"',
     ),
     "1_行情接收测试.py": (
         "全市场行情接收测试",
@@ -1724,6 +1745,9 @@ def normalize_qmt_auto_login_restart_times(value):
 def normalize_qmt_auto_login_settings(value=None, existing=None):
     existing = existing if isinstance(existing, dict) else {}
     default_enabled = parse_config_bool(existing.get("enabled"), True)
+    default_times = existing.get("restart_times", ["09:00"])
+    if not default_enabled and not default_times:
+        default_times = ["09:00"]
     if value is None:
         value = existing
     if isinstance(value, dict):
@@ -1737,20 +1761,43 @@ def normalize_qmt_auto_login_settings(value=None, existing=None):
         elif "restartTime" in value:
             restart_source = value.get("restartTime")
         else:
-            restart_source = existing.get("restart_times") or []
+            restart_source = default_times if enabled else existing.get("restart_times", [])
     else:
         enabled = parse_config_bool(value, default_enabled)
-        restart_source = existing.get("restart_times") or []
-    return {
+        restart_source = default_times if enabled else existing.get("restart_times", [])
+    result = {
         "enabled": bool(enabled),
         "restart_times": normalize_qmt_auto_login_restart_times(restart_source),
     }
+    source = value if isinstance(value, dict) else {}
+    if "login_account" in source or "login_account" in existing:
+        result["login_account"] = str(source.get("login_account", existing.get("login_account", "")) or "").strip()
+        result["password_saved"] = parse_config_bool(source.get("password_saved", existing.get("password_saved")), False)
+    return result
 
 
 def account_config_is_enabled(config):
     if not isinstance(config, dict):
         return True
     return parse_config_bool(config.get("enabled"), True)
+
+
+def validate_qmt_auto_login_credentials(config_path, qmt_dir, settings, password=None):
+    """Validate before stopping QMT or changing configuration; never trust a saved flag."""
+    from cfquant.qmt_credentials import QmtCredentialStore
+    enabled = settings.get("enabled", False)
+    login_account = settings.get("login_account", "")
+    if enabled or password:
+        if not qmt_dir:
+            raise ValueError("开启 QMT 自动重启时必须填写 QMT 目录")
+        if not login_account:
+            raise ValueError("开启 QMT 自动重启时必须填写 QMT 登录账号")
+    if password is not None and (not isinstance(password, str) or len(password) > 1024):
+        raise ValueError("QMT 登录密码必须是长度不超过 1024 的字符串")
+    saved = QmtCredentialStore(config_path).has(qmt_dir, login_account) if login_account else False
+    if enabled and not password and not saved:
+        raise ValueError("开启 QMT 自动重启时必须填写 QMT 登录密码；更换账号或目录后请重新填写密码")
+    return saved
 
 
 def normalize_market_code(value):
@@ -2687,6 +2734,19 @@ class WebRuntimeConfig(object):
             self._save_locked()
         return self.python_environment_info()
 
+    def validate_account_auto_login(self, body):
+        """Use the same binding lookup as save before any process/config mutations."""
+        account_id = str(body.get("account_id") or DEFAULT_ACCOUNT_ID).strip()
+        account_type = normalize_account_type(body.get("account_type") or "STOCK")
+        qmt_dir = normalize_optional_path(body.get("qmt_dir") or body.get("python_dir"))
+        request = body.get("qmt_auto_login")
+        with self._lock:
+            bridge_id = self._account_bridge_id_locked(account_id, account_type, body.get("bridge_id"), qmt_dir)
+            existing = self._data.get("account_configs", {}).get(account_key_for(account_id, account_type, bridge_id)) or {}
+            settings = normalize_qmt_auto_login_settings(request, existing=existing.get("qmt_auto_login"))
+            password = request.get("password") if isinstance(request, dict) else None
+            validate_qmt_auto_login_credentials(self.path, qmt_dir, settings, password)
+
     def save_account_config(
         self,
         account_id,
@@ -2702,6 +2762,7 @@ class WebRuntimeConfig(object):
         market_bridges=None,
         qmt_strategy=None,
         qmt_auto_login=None,
+        qmt_runtime=None,
     ):
         account_id = str(account_id or "").strip()
         if not account_id:
@@ -2717,6 +2778,9 @@ class WebRuntimeConfig(object):
             bridge_id = self._account_bridge_id_locked(account_id, account_type, bridge_id, qmt_dir)
             account_key = account_key_for(account_id, account_type, bridge_id)
             existing = configs.get(account_key)
+            runtime_settings = normalize_qmt_runtime_settings(
+                qmt_runtime, existing=(existing or {}).get("qmt_runtime"), strict=True,
+            )
             # Older clients may omit mode when editing an existing binding.
             # Preserve its strategy selection instead of silently choosing ctypes.
             mode = normalize_transport_mode(mode or (existing or {}).get("mode") or "ctypes")
@@ -2780,6 +2844,14 @@ class WebRuntimeConfig(object):
                     occupied.update(route.get("bridge_id") for route in (other.get("market_bridges") or {}).values())
                     if requested_channels.intersection(occupied):
                         raise ValueError("自动导入的市场入口需要独立 bridge_id，请清空市场 bridge_id 后重试")
+            supplied_password = qmt_auto_login.get("password") if isinstance(qmt_auto_login, dict) else None
+            password_saved = validate_qmt_auto_login_credentials(self.path, qmt_dir, auto_login_settings, supplied_password)
+            if supplied_password:
+                from cfquant.qmt_credentials import QmtCredentialStore
+                QmtCredentialStore(self.path).save(qmt_dir, auto_login_settings["login_account"], supplied_password)
+                password_saved = True
+            if "login_account" in auto_login_settings:
+                auto_login_settings["password_saved"] = password_saved
             if bridge_id not in self.bridges():
                 self._data.setdefault("bridges", {})[bridge_id] = self._bridge_row(
                     bridge_id,
@@ -2830,6 +2902,7 @@ class WebRuntimeConfig(object):
                 "market_bridges": market_routes if market_routing_enabled else {},
                 "qmt_strategy": strategy_settings,
                 "qmt_auto_login": auto_login_settings,
+                "qmt_runtime": runtime_settings,
                 "updated_at": now,
             }
             if enabled:
@@ -3661,6 +3734,7 @@ class WebRuntimeConfig(object):
                 "mode": normalize_transport_mode(item.get("mode") or "ctypes"),
                 "qmt_strategy": normalize_strategy_settings(item.get("qmt_strategy")),
                 "qmt_auto_login": normalize_qmt_auto_login_settings(item.get("qmt_auto_login")),
+                "qmt_runtime": normalize_qmt_runtime_settings(item.get("qmt_runtime")),
                 "data_provider": bool(item.get("data_provider")),
                 "enabled": item.get("enabled", True) is not False,
                 "market_routing_enabled": parse_config_bool(item.get("market_routing_enabled"), False),
@@ -4116,6 +4190,10 @@ def xtdata_action_requires_normal_bridge(action, params=None):
     params = params if isinstance(params, dict) else {}
     if params.get("callback_event") or params.get("callback_positions"):
         return True
+    # Advanced mode has separate QMT data directories. Historical reads must
+    # use the same instance that receives downloads, even if trade returns {}.
+    if action in ("xtdata.get_market_data", "xtdata.get_market_data_ex"):
+        return params.get("period") not in L2_PERIODS
     method = action.split(".", 1)[1]
     return action in NORMAL_QMT_ACTIONS or method.startswith(XTDATA_NORMAL_METHOD_PREFIXES)
 
@@ -4217,6 +4295,10 @@ def is_pipe_client_closed_error(error):
     return any(marker in text for marker in closed_markers)
 
 
+MARKET_TIMING_ACTIONS = frozenset(("xtdata.get_full_tick", "xtdata.get_market_data", "xtdata.get_market_data_ex"))
+_market_timing_attempts = ContextVar("market_timing_attempts", default=None)
+
+
 class GlobalTxClient(object):
     def __init__(self):
         self._lock = threading.RLock()
@@ -4250,24 +4332,31 @@ class GlobalTxClient(object):
         last_error = None
         for attempt in range(2):
             client = self._get_client(mode)
+            request_options = {}
+            timing_attempts = _market_timing_attempts.get()
+            if timing_attempts is not None and action in MARKET_TIMING_ACTIONS:
+                response_meta = {"bridge_id": normalize_bridge_id(bridge_id), "channel": channel_key, "mode": mode}
+                timing_attempts.append(response_meta)
+                request_options["response_meta"] = response_meta
             try:
                 result = client.request(
                     action,
                     params or {},
                     timeout=timeout,
                     request_channel=channels[channel_key],
+                    **request_options,
                 )
                 self._cooldown_until.pop(cooldown_key, None)
                 self._last_error.pop(cooldown_key, None)
                 return result
             except CfquantError as e:
                 last_error = e
-                if action in CFTRADER_BATCH_ACTIONS and is_pipe_client_closed_error(e):
+                if is_pipe_client_closed_error(e):
                     self._drop_client(mode, client)
-                    raise
-                if attempt == 0 and action not in CFTRADER_BATCH_ACTIONS and is_pipe_client_closed_error(e):
-                    self._drop_client(mode, client)
-                    continue
+                    if attempt == 0 and is_readonly_request(action) and not action.endswith("_async"):
+                        continue
+                    # A disconnected sender may already have delivered a write.
+                    # Never retry an order, cancel, subscription or download here.
                 raise
             except CfquantTimeout as e:
                 if mark_offline_on_timeout:
@@ -5222,6 +5311,7 @@ def binding_status_snapshot():
         except Exception as error:
             rows.append(dict(entry, error=str(error)))
         rows[-1]["qmt_strategy_deploy"] = QMT_STRATEGIES.status(entry["account_key"])
+        rows[-1]["qmt_auto_login"] = _qmt_auto_login_saved_session(entry)
     now = time.time()
     return {
         "bindings": rows,
@@ -5636,6 +5726,7 @@ class LttxWebRouteServer(object):
         self._trader_event_dedupe = {}
         self._trader_event_dedupe_ttl = float(os.environ.get("CFQUANT_WEB_LTTX_TRADER_EVENT_DEDUPE_SECONDS", "2.0") or 2.0)
         self._last_registry_put = 0.0
+        self._executor = None
 
     def start(self):
         with self._lock:
@@ -5651,6 +5742,11 @@ class LttxWebRouteServer(object):
 
     def close(self):
         self.running = False
+        with self._lock:
+            tx, self.tx = self.tx, None
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.close()
         CLIENTS.remove_callback("quote", self._on_quote_event)
         CLIENTS.remove_callback("__event__", self._on_client_event)
         with self._lock:
@@ -5663,8 +5759,6 @@ class LttxWebRouteServer(object):
                 self._release_external_quote(row, timeout=2.0)
             except Exception as error:
                 safe_print("cfquant quote cleanup failed: %s" % error)
-        tx = self.tx
-        self.tx = None
         if tx is not None:
             try:
                 tx.close()
@@ -5707,7 +5801,7 @@ class LttxWebRouteServer(object):
                         continue
                     if raw is None:
                         break
-                    self._handle_raw(raw)
+                    self._enqueue_raw(raw, tx)
             except Exception as e:
                 if self.running:
                     safe_print("cfquant LTtx 统一路由异常: %s，1秒后重试" % e)
@@ -5721,8 +5815,57 @@ class LttxWebRouteServer(object):
                     except Exception:
                         pass
 
-    def _handle_raw(self, raw):
+    def _enqueue_raw(self, raw, tx):
         msg = loads_message(raw)
+        if not msg or msg.get("type") != "request":
+            return
+        entered = time.perf_counter()
+        client_id = msg.get("client_id") or msg.get("reply_channel")
+        keys = [("client", client_id)]
+        action = str(msg.get("action") or "")
+        if action.startswith("xttrader.") or action in CFTRADER_BATCH_ACTIONS:
+            params = msg.get("params") or {}
+            # All clients addressing the same account retain arrival ordering.
+            keys.append(("account", _external_account_id(params) or configured_default_account_id(),
+                         _external_account_type(params)))
+
+        def reject(error):
+            if client_id and self.tx is tx:
+                tx.push("response", pack_response(msg.get("id"), ok=False, error=error), client_id)
+
+        def run():
+            if self.tx is not tx:
+                return
+            waited = time.perf_counter() - entered
+            current = dict(msg, _web_queue_ms=round(waited * 1000, 3))
+            if is_readonly_request(action):
+                remaining = float(msg.get("timeout") or 12.0) - waited
+                if remaining <= 0:
+                    reject(TimeoutError("read-only request expired in Web route queue"))
+                    return
+                current["timeout"] = remaining
+                params = dict(current.get("params") or {})
+                if "timeout" in params:
+                    params["timeout"] = min(float(params["timeout"]), remaining)
+                current["params"] = params
+            self._handle_raw(current, response_tx=tx)
+
+        with self._lock:
+            if self.tx is not tx:
+                return
+            if self._executor is None:
+                self._executor = KeyedExecutor(
+                    workers=int(os.environ.get("CFQUANT_WEB_ROUTE_WORKERS", "8")),
+                    max_pending=int(os.environ.get("CFQUANT_WEB_ROUTE_MAX_PENDING", "1024")))
+            executor = self._executor
+        try:
+            executor.submit(keys, run, reject)
+        except Exception as error:
+            reject(error)
+
+    def _handle_raw(self, raw, response_tx=None):
+        response_tx = response_tx if response_tx is not None else self.tx
+        msg = raw if isinstance(raw, dict) else loads_message(raw)
         if not msg or msg.get("type") != "request":
             return
         request_id = msg.get("id")
@@ -5731,7 +5874,7 @@ class LttxWebRouteServer(object):
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         callback_event = params.get("callback_event")
         quote_subscribe = action in (
-            "xtdata.subscribe_quote", "xtdata.subscribe_whole_quote",
+            "xtdata.subscribe_quote", "xtdata.subscribe_whole_quote", "xtdata.subscribe_whole_quote_latency",
             "xtdata.subscribe_l2thousand", "xtdata.subscribe_l2thousand_queue",
         )
         # QMT may emit a first snapshot before returning its subscription ID.
@@ -5740,7 +5883,8 @@ class LttxWebRouteServer(object):
             with self._lock:
                 self._quote_sequence += 1
                 quote_route = {"subscribe_id": self._quote_sequence, "client_id": client_id,
-                               "callback_event": callback_event or "quote:%s" % self._quote_sequence}
+                               "callback_event": callback_event or "quote:%s" % self._quote_sequence,
+                               "transport": response_tx}
                 callback_event = "quote:%s" % new_id("web_subscription")
                 self._quote_event_routes[callback_event] = quote_route
             msg = dict(msg, params=dict(params, callback_event=callback_event))
@@ -5762,18 +5906,26 @@ class LttxWebRouteServer(object):
                 result = dict(result) if isinstance(result, dict) else {}
                 result.update(subscribe_id=quote_route["subscribe_id"], callback_event=quote_route["callback_event"])
                 with self._lock:
-                    self._quote_routes[(str(quote_route["subscribe_id"]), client_id)] = quote_route
+                    abandoned = response_tx is not self.tx
+                    if not abandoned:
+                        self._quote_routes[(str(quote_route["subscribe_id"]), client_id)] = quote_route
+                if abandoned:
+                    self._release_external_quote(quote_route, timeout=2.0)
+                    raise RuntimeError("Web route connection closed during quote subscription")
+            meta = dict(meta, web_queue_ms=msg.get("_web_queue_ms", 0))
             response = pack_response(request_id, ok=True, result=result, meta=meta)
-            self._remember_external_subscription(action, msg, result)
+            if response_tx is self.tx:
+                self._remember_external_subscription(action, msg, result)
         except Exception as e:
             if quote_subscribe and callback_event:
                 with self._lock:
                     self._quote_event_routes.pop(callback_event, None)
             response = pack_response(request_id, ok=False, error=e, meta={"route": "web_lttx"})
             safe_print("cfquant LTtx 统一路由请求失败 action=%s id=%s error=%s" % (action, request_id, e))
-        if client_id and self.tx is not None:
+        response_tx = response_tx if response_tx is not None else self.tx
+        if client_id and response_tx is not None and response_tx is self.tx:
             try:
-                self.tx.push("response", response, client_id)
+                response_tx.push("response", response, client_id)
             except Exception as e:
                 safe_print("cfquant LTtx 统一路由回包失败 client=%s error=%s" % (client_id, e))
 
@@ -5852,8 +6004,11 @@ class LttxWebRouteServer(object):
         event = msg.get("event") or "quote:%s" % subscribe_id
         with self._lock:
             route = self._quote_event_routes.get(event)
-        if route:
-            self._push_event(route["client_id"], route["callback_event"], msg.get("data"), route["subscribe_id"])
+        if route and ("native_id" in route or route.get("transport", self.tx) is self.tx):
+            meta = msg.get("meta")
+            plain_quote = isinstance(meta, dict) and meta.get("quote_json_plain") is True
+            self._push_event(route["client_id"], route["callback_event"], msg.get("data"), route["subscribe_id"],
+                             plain_quote=plain_quote)
 
     def _on_client_event(self, msg):
         if not isinstance(msg, dict):
@@ -5916,12 +6071,20 @@ class LttxWebRouteServer(object):
         raw = json.dumps(to_jsonable(key_payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
-    def _push_event(self, client_id, event, data=None, subscription_id=None):
+    def _push_event(self, client_id, event, data=None, subscription_id=None, plain_quote=False):
         tx = self.tx
         if tx is None or not client_id:
             return
         try:
-            payload = pack_event(event, data=data, client_id=client_id, subscription_id=subscription_id)
+            if plain_quote:
+                try:
+                    # Preserve the plain-JSON marker across the optional Web
+                    # route, without repeating the generic object conversion.
+                    payload = pack_whole_quote_event(event, data, client_id, subscription_id)
+                except (TypeError, ValueError):
+                    payload = pack_event(event, data=data, client_id=client_id, subscription_id=subscription_id)
+            else:
+                payload = pack_event(event, data=data, client_id=client_id, subscription_id=subscription_id)
             tx.push("event", payload, client_id)
         except Exception as e:
             safe_print("cfquant LTtx 统一路由事件转发失败 client=%s event=%s error=%s" % (client_id, event, e))
@@ -6322,6 +6485,8 @@ class WebSocketCallbackClient(object):
         self.job_id = str(job_id or "").strip()
         self._lock = threading.RLock()
         self.alive = True
+        self._sender = OrderedSender(self._write_frame, self._send_failed,
+                                    max_bytes=int(os.environ.get("CFQUANT_WS_SEND_MAX_BYTES", 128 * 1024 * 1024)))
 
     def matches(self, event):
         if self.bridge_id:
@@ -6352,13 +6517,28 @@ class WebSocketCallbackClient(object):
         return True
 
     def send_json(self, payload):
-        raw = json.dumps(to_jsonable(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        frame = self._frame(raw)
+        self.send_frame(self._frame(web_json_bytes(payload)))
+
+    def send_frame(self, frame):
+        if not self.alive:
+            raise RuntimeError("websocket is closed")
+        self._sender.submit(frame)
+
+    def _write_frame(self, frame):
         with self._lock:
             self.sock.sendall(frame)
 
+    def _send_failed(self, error):
+        safe_print("websocket send failed: %s" % error)
+        self.close()
+
     def close(self):
         self.alive = False
+        self._sender.close()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         try:
             self.sock.close()
         except Exception:
@@ -6394,16 +6574,16 @@ class WebSocketCallbackManager(object):
 
     def broadcast(self, event):
         dead = []
+        frame = None
         with self._lock:
             clients = list(self._clients)
         for client in clients:
             if not client.alive or not client.matches(event):
                 continue
             try:
-                client.send_json({
-                    "type": "callback",
-                    "event": event,
-                })
+                if frame is None:
+                    frame = client._frame(web_json_bytes({"type": "callback", "event": event}))
+                client.send_frame(frame)
             except Exception:
                 dead.append(client)
         for client in dead:
@@ -6450,17 +6630,21 @@ class WebSocketQuoteManager(object):
                 safe_print("websocket quotes empty callback failed: %s" % e)
 
     def broadcast(self, event):
+        return self.broadcast_encoded(event)
+
+    def broadcast_encoded(self, event, encoded=None):
         dead = []
+        frame = None
         with self._lock:
             clients = list(self._clients)
         for client in clients:
             if not client.alive or not client.matches(event):
                 continue
             try:
-                client.send_json({
-                    "type": "quote",
-                    "event": event,
-                })
+                if frame is None:
+                    raw = encoded if encoded is not None else web_json_bytes({"type": "quote", "event": event})
+                    frame = client._frame(raw)
+                client.send_frame(frame)
             except Exception:
                 dead.append(client)
         for client in dead:
@@ -6475,12 +6659,16 @@ WS_QUOTES = WebSocketQuoteManager()
 
 
 class QuoteSubscriptionStore(object):
-    def __init__(self, max_events=1000):
+    def __init__(self, max_events=1000, diagnostic=False, manager=None):
+        self.diagnostic = diagnostic
+        self.manager = manager or WS_QUOTES
+        self._pending_diagnostics = {}
         self.max_events = int(max_events)
         self._lock = threading.RLock()
         self._subscribe_lock = threading.Lock()
         self._subscriptions = {}
-        self._events = []
+        self._events = QuoteHistory(self.max_events, int(os.environ.get("CFQUANT_WEB_QUOTE_HISTORY_BYTES", 64 * 1024 * 1024)))
+        self._history_error = ""
         self._seq = 0
         self._callback_registered = False
         self._whole_subscribe_id = None
@@ -6496,9 +6684,18 @@ class QuoteSubscriptionStore(object):
 
     def close(self):
         with self._lock:
+            self._cancel_idle_release_locked()
+            self._events.clear()
+            self._pending_diagnostics.clear()
+            diagnostic_ids = list(self._subscriptions) if self.diagnostic else []
             if self._callback_registered:
                 CLIENTS.remove_callback("quote", self._on_quote)
                 self._callback_registered = False
+        for subscribe_id in diagnostic_ids:
+            try:
+                self.unsubscribe({"subscribe_id": subscribe_id, "timeout": 2.0})
+            except Exception as error:
+                safe_print("quote diagnostic cleanup failed id=%s error=%s" % (subscribe_id, error))
 
     def subscribe_whole(self, body):
         with self._subscribe_lock:
@@ -6521,7 +6718,7 @@ class QuoteSubscriptionStore(object):
                     and (not body.get("bridge_id") or normalize_bridge_id(body["bridge_id"]) == row.get("bridge_id"))
                     and (not requested_channel or requested_channel == row.get("channel"))
                 )
-                if not same_request or WS_QUOTES.count() <= 0:
+                if not same_request or self.manager.count() <= 0:
                     replace_id = existing_id
                     existing_id = None
                 else:
@@ -6539,7 +6736,7 @@ class QuoteSubscriptionStore(object):
                         "account_id": row.get("account_id") or "",
                         "account_type": row.get("account_type") or "",
                         "account_key": row.get("account_key") or "",
-                        "kind": "whole_quote",
+                        "kind": "whole_quote_latency" if self.diagnostic else "whole_quote",
                         "markets": row.get("markets", markets),
                         "already_subscribed": True,
                         "event_count": row.get("event_count", 0),
@@ -6549,14 +6746,25 @@ class QuoteSubscriptionStore(object):
                 self._clear_events_locked(None)
         if replace_id is not None:
             self.unsubscribe({"subscribe_id": replace_id, "timeout": timeout})
-        route = data_provider_request(
-            "xtdata.subscribe_whole_quote",
-            {"code_list": markets},
-            requested_channel=requested_channel,
-            default_channel="normal",
-            timeout=timeout,
-            bridge_id=body.get("bridge_id"),
-        )
+        callback_event = "quote:%s" % new_id("latency") if self.diagnostic else None
+        params = {"code_list": markets}
+        if callback_event:
+            params["callback_event"] = callback_event
+            with self._lock:
+                self._pending_diagnostics[callback_event] = None
+        try:
+            route = data_provider_request(
+                "xtdata.subscribe_whole_quote_latency" if self.diagnostic else "xtdata.subscribe_whole_quote",
+                params,
+                requested_channel=requested_channel,
+                default_channel="normal",
+                timeout=timeout,
+                bridge_id=body.get("bridge_id"),
+            )
+        except BaseException:
+            with self._lock:
+                self._pending_diagnostics.pop(callback_event, None)
+            raise
         result = route["result"]
         bridge_id = route["bridge_id"]
         channel = route["channel"]
@@ -6564,13 +6772,14 @@ class QuoteSubscriptionStore(object):
         with self._lock:
             self._subscriptions[subscribe_id] = {
                 "subscribe_id": subscribe_id,
+                "callback_event": callback_event,
                 "bridge_id": bridge_id,
                 "channel": channel,
                 "mode": route["mode"],
                 "account_id": route.get("data_provider") or "",
                 "account_type": route.get("data_provider_account_type") or "",
                 "account_key": route.get("data_provider_account_key") or "",
-                "kind": "whole_quote",
+                "kind": "whole_quote_latency" if self.diagnostic else "whole_quote",
                 "markets": markets,
                 "created_at": time.time(),
                 "event_count": 0,
@@ -6581,6 +6790,9 @@ class QuoteSubscriptionStore(object):
             self._whole_subscribed_at = time.time()
             self._clear_events_locked(subscribe_id)
             self._schedule_idle_release_locked()
+            pending = self._pending_diagnostics.pop(callback_event, None)
+        if pending is not None:
+            self._on_quote(*pending)
         return {
             "subscribe_id": subscribe_id,
             "bridge_id": bridge_id,
@@ -6588,7 +6800,7 @@ class QuoteSubscriptionStore(object):
             "account_id": route.get("data_provider") or "",
             "account_type": route.get("data_provider_account_type") or "",
             "account_key": route.get("data_provider_account_key") or "",
-            "kind": "whole_quote",
+            "kind": "whole_quote_latency" if self.diagnostic else "whole_quote",
             "markets": markets,
             "already_subscribed": False,
             "publish_existing": bool(result.get("publish_existing")) if isinstance(result, dict) else False,
@@ -6635,7 +6847,7 @@ class QuoteSubscriptionStore(object):
             subscribe_id = self._whole_subscribe_id
             if not subscribe_id or subscribe_id not in self._subscriptions:
                 return {"released": False, "reason": "no whole quote subscription"}
-            if WS_QUOTES.count() > 0:
+            if self.manager.count() > 0:
                 return {"released": False, "reason": "websocket clients still connected"}
             age = time.time() - (self._whole_subscribed_at or self._subscriptions[subscribe_id].get("created_at", 0))
             if grace_seconds and age < grace_seconds:
@@ -6695,14 +6907,9 @@ class QuoteSubscriptionStore(object):
             self._cancel_idle_release_locked()
 
     def _clear_events_locked(self, subscribe_id=None):
-        if subscribe_id:
-            subscribe_id = str(subscribe_id)
-            self._events = [
-                row for row in self._events
-                if str(row.get("subscribe_id") or "") != subscribe_id
-            ]
-        else:
-            self._events = []
+        self._history_error = ""
+        self._events.clear(str(subscribe_id) if subscribe_id else None)
+        if not subscribe_id:
             self._seq = 0
 
     def _schedule_idle_release_locked(self):
@@ -6730,10 +6937,9 @@ class QuoteSubscriptionStore(object):
     def latest(self, since=0, limit=200, subscribe_id=None):
         subscribe_id = str(subscribe_id or "").strip()
         with self._lock:
-            rows = [row for row in self._events if row.get("seq", 0) > since]
-            if subscribe_id:
-                rows = [row for row in rows if str(row.get("subscribe_id") or "") == subscribe_id]
-            return rows[-int(limit):]
+            if self._history_error:
+                raise OSError("quote history unavailable: %s" % self._history_error)
+            return self._events.latest(since, limit, subscribe_id)
 
     def status(self):
         with self._lock:
@@ -6741,27 +6947,62 @@ class QuoteSubscriptionStore(object):
                 "subscriptions": list(self._subscriptions.values()),
                 "whole_subscribe_id": self._whole_subscribe_id,
                 "event_count": len(self._events),
-                "websocket_clients": WS_QUOTES.count(),
+                "history": self._events.status(),
+                "history_error": self._history_error,
+                "websocket_clients": self.manager.count(),
             }
 
-    def _on_quote(self, data):
+    def _on_quote(self, data, received_at_ms=None):
+        received_at_ms = time.time() * 1000.0 if received_at_ms is None else received_at_ms
+        payload = data.get("data") if isinstance(data, dict) else None
+        diagnostic = isinstance(payload, dict) and payload.get("schema") == QUOTE_LATENCY_SCHEMA
+        if diagnostic != self.diagnostic:
+            return
         event = self._normalize_event(data)
         with self._lock:
+            if self.diagnostic and event.get("event") in self._pending_diagnostics:
+                # QMT may publish synchronously while subscribe is still running.
+                # Keep one latest frame and its original callback-entry timestamp.
+                self._pending_diagnostics[event["event"]] = (data, received_at_ms)
+                return
             subscribe_id = str(event.get("subscribe_id") or "")
             if subscribe_id and subscribe_id not in self._subscriptions:
                 return
             if not subscribe_id and not self._subscriptions:
                 return
+            if self.diagnostic:
+                row = self._subscriptions.get(subscribe_id) or {}
+                if event.get("event") != row.get("callback_event"):
+                    return
+                report = latency_report(payload, received_at_ms)
+                event["latency"] = report
+                # Preserve the complete batch. Only the browser's DOM is paged;
+                # all symbols and their original fields remain available for export.
+                event["data"] = payload["quotes"]
+                event["code_count"] = report["code_count"]
             self._seq += 1
             event["seq"] = self._seq
-            event["received_at"] = time.time()
+            event["received_at"] = received_at_ms / 1000.0
             if subscribe_id and subscribe_id in self._subscriptions:
                 self._subscriptions[subscribe_id]["event_count"] = self._subscriptions[subscribe_id].get("event_count", 0) + 1
                 self._subscriptions[subscribe_id]["last_event_at"] = event["received_at"]
-            self._events.append(event)
-            if len(self._events) > self.max_events:
-                self._events = self._events[-self.max_events:]
-        WS_QUOTES.broadcast(event)
+            envelope = {"type": "quote", "event": event}
+            if isinstance(event.get("meta"), dict) and event["meta"].get("quote_json_plain") is True:
+                # The wire decoder already produced JSON-compatible quote data.
+                # Avoid another walk over every symbol; unusual additions still
+                # take web_json_bytes' compatibility fallback.
+                envelope = JsonReadyResponse(envelope)
+            encoded = web_json_bytes(envelope)
+            if not self._history_error:
+                try:
+                    self._events.append(event, encoded)
+                except Exception as error:
+                    self._history_error = str(error)
+                    safe_print("quote history failed; live delivery continues: %s" % error)
+        if hasattr(self.manager, "broadcast_encoded"):
+            self.manager.broadcast_encoded(event, encoded)
+        else:
+            self.manager.broadcast(event)
         self.release_idle_whole_subscription(reason="no websocket clients during quote", grace_seconds=8)
 
     def _normalize_event(self, data):
@@ -6792,6 +7033,10 @@ class QuoteSubscriptionStore(object):
 
 
 QUOTES = QuoteSubscriptionStore()
+WS_LATENCY_QUOTES = WebSocketQuoteManager()
+LATENCY_QUOTES = QuoteSubscriptionStore(max_events=2, diagnostic=True, manager=WS_LATENCY_QUOTES)
+WS_LATENCY_QUOTES.on_empty = lambda: LATENCY_QUOTES.release_idle_whole_subscription(
+    reason="no diagnostic websocket clients", grace_seconds=0)
 
 
 def _release_quote_subscription_on_empty():
@@ -7323,12 +7568,33 @@ WEB_CONFIG = WebRuntimeConfig(WEB_CONFIG_FILE)
 UPDATER = None
 
 
+class JsonReadyResponse(dict):
+    """Internal marker: the payload has already passed Web JSON conversion."""
+
+
+def web_json_bytes(payload):
+    if isinstance(payload, JsonReadyResponse):
+        try:
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError):
+            pass  # A caller may have added an unconverted value after ok().
+    return json.dumps(to_jsonable(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def ok(data=None):
-    return {"ok": True, "data": to_jsonable(data)}
+    started = time.perf_counter()
+    converted = to_jsonable(data)
+    if isinstance(converted, dict) and isinstance(converted.get("timing"), dict):
+        converted["timing"].setdefault("web", {})["result_convert_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    return JsonReadyResponse(ok=True, data=converted)
 
 
 def fail(error, status=400):
-    return {"ok": False, "error": str(error), "status": status}
+    result = {"ok": False, "error": str(error), "status": status}
+    timing = getattr(error, "market_timing", None)
+    if timing is not None:
+        result["timing"] = timing
+    return result
 
 
 def is_project_update_trade_write_path(path):
@@ -7360,6 +7626,17 @@ def to_jsonable(value, depth=0):
 
     type_name = value.__class__.__name__
     if type_name == "DataFrame" and hasattr(value, "to_dict"):
+        if depth <= 38 and getattr(value.index, "is_unique", False):
+            rows = dataframe_numeric_rows(value)
+            if rows is not None:
+                columns = [jsonable_key(column) for column in value.columns] if rows else []
+                return {
+                    jsonable_key(index): {
+                        column: to_jsonable(cell, depth + 3)
+                        for column, cell in zip(columns, row)
+                    }
+                    for index, row in zip(value.index, rows)
+                }
         return to_jsonable(value.to_dict(orient="index"), depth + 1)
     if type_name == "Series" and hasattr(value, "to_dict"):
         return to_jsonable(value.to_dict(), depth + 1)
@@ -7874,10 +8151,21 @@ class CfquantUpdater(object):
                 source_path = os.path.abspath(os.path.join(source_root, "qmt_scripts", *entry_script.split("/")))
                 if not os.path.isfile(source_path):
                     raise RuntimeError("QMT entry script not found in update source: %s" % entry_script)
-                read_entry_source(source_path)
+                entry_source = read_entry_source(source_path)
+                entry_bytes = Path(source_path).read_bytes()
+                if os.path.basename(entry_script).startswith(("CFQUANT_LITE", "CFQUANT_CTYPE_ALL_LOWLAT")):
+                    market = os.path.splitext(os.path.basename(entry_script))[0].rsplit("_", 1)[-1]
+                    config_name = "cfquant_bridge_config_%s.json" % market if market in ("SH", "SZ") else QMT_BRIDGE_CONFIG_FILENAME
+                    config_path = Path(target["python_dir"]) / config_name
+                    if config_path.is_file():
+                        identity = json.loads(config_path.read_text(encoding="utf-8"))
+                        if not isinstance(identity, dict):
+                            raise ValueError("QMT account configuration must be a JSON object")
+                        identity.pop("managed_strategy", None)
+                        entry_bytes = configured_pipe_source(entry_source, identity).replace("\r\n", "\n").replace("\n", "\r\n").encode("gbk")
                 entry_file = os.path.abspath(os.path.join(script_dir, os.path.basename(entry_script)))
                 result["entry_file"] = entry_file
-                if file_content_equal(source_path, entry_file):
+                if os.path.isfile(entry_file) and Path(entry_file).read_bytes() == entry_bytes:
                     result.update(
                         skipped=True,
                         message="QMT entry script is already the current version",
@@ -7900,7 +8188,7 @@ class CfquantUpdater(object):
                     script_dir,
                     ".cfquant_entry_%s_%s.tmp" % (uuid.uuid4().hex, os.path.basename(entry_script)),
                 )
-                shutil.copy2(source_path, temp_file)
+                Path(temp_file).write_bytes(entry_bytes)
                 os.replace(temp_file, entry_file)
                 result.update({
                     "updated": True,
@@ -9931,6 +10219,7 @@ PROJECT_UPDATER = CfquantProjectUpdater()
 QMT_STRATEGIES = QmtStrategyManager(
     os.path.join(RUNTIME_CONFIG_DIR, "qmt_strategy_jobs.json"),
     os.path.join(_SOURCE_ROOT, "qmt_scripts"),
+    runtime_request=PipeStrategyController(),
 )
 
 
@@ -10056,7 +10345,7 @@ def _write_qmt_bridge_identity_for_dir(row, qmt_dir_override=None, qmt_role="nor
             "qmt_runtime_marker_dir": QMT_RUNTIME_MARKER_DIR,
             "qmt_runtime_version_file": QMT_RUNTIME_VERSION_FILE,
             "qmt_log_language": WEB_CONFIG.qmt_log_language() if WEB_CONFIG is not None else "zh",
-            "qmt_log_enabled": WEB_CONFIG.qmt_log_enabled() if WEB_CONFIG is not None else True,
+            **qmt_runtime_identity(row, WEB_CONFIG.qmt_log_enabled() if WEB_CONFIG is not None else True),
             "updated_at": time.time(),
             "updated_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
             "source": "cfquant_web_account_binding",
@@ -10200,7 +10489,7 @@ def write_qmt_market_bridge_identities(row):
                 "market_route_parent_bridge_id": parent_bridge_id,
                 "market_routing_enabled": True,
                 "qmt_log_language": WEB_CONFIG.qmt_log_language() if WEB_CONFIG is not None else "zh",
-                "qmt_log_enabled": WEB_CONFIG.qmt_log_enabled() if WEB_CONFIG is not None else True,
+                **qmt_runtime_identity(row, WEB_CONFIG.qmt_log_enabled() if WEB_CONFIG is not None else True),
                 "updated_at": time.time(),
                 "updated_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                 "source": "cfquant_web_account_market_binding",
@@ -10590,7 +10879,7 @@ def _qmt_auto_login_write_capture_script(paths):
     return path
 
 
-def _qmt_auto_login_processes(bin_dir):
+def _qmt_auto_login_processes(bin_dir, strict=False):
     paths = _qmt_auto_login_paths(bin_dir)
     exe_key = os.path.normcase(os.path.abspath(paths["exe_path"]))
     rows = []
@@ -10607,14 +10896,16 @@ def _qmt_auto_login_processes(bin_dir):
                     "name": process.info.get("name") or "XtItClient.exe",
                     "executable_path": exe,
                 })
-            except (
-                getattr(psutil, "NoSuchProcess", Exception),
-                getattr(psutil, "AccessDenied", Exception),
-                getattr(psutil, "ZombieProcess", Exception),
-            ):
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
             except Exception:
+                if strict:
+                    raise RuntimeError("无法确认对应 QMT 的进程状态，请检查进程访问权限；已停止启动") from None
                 continue
+    elif strict:
+        raise RuntimeError("缺少 psutil，无法确认旧 QMT 是否退出；已停止启动")
+    if strict:
+        return rows
     if rows:
         return rows
     script = r"""
@@ -10895,24 +11186,13 @@ def _qmt_auto_login_start_xtitclient(paths, use_link=False):
 
 
 def _qmt_auto_login_stop_xtitclient(row, paths, session=None):
-    session = session if isinstance(session, dict) else {}
-    pids = []
-    for key in ("launch_pid", "restart_pid", "pid"):
-        try:
-            pid = int(session.get(key) or 0)
-        except Exception:
-            pid = 0
-        if pid > 0 and pid not in pids and _qmt_auto_login_pid_matches(pid, paths["bin_dir"]):
-            pids.append(pid)
-    for process in _qmt_auto_login_processes(paths["bin_dir"]):
-        try:
-            pid = int(process.get("pid") or 0)
-        except Exception:
-            pid = 0
-        if pid > 0 and pid not in pids:
-            pids.append(pid)
+    # Enumerate live executable paths instead of trusting PIDs from old sessions.
+    pids = [int(process["pid"]) for process in _qmt_auto_login_processes(paths["bin_dir"], strict=True)]
     results = []
     for pid in pids:
+        # A process may have exited between enumeration and termination.
+        if not any(int(process["pid"]) == pid for process in _qmt_auto_login_processes(paths["bin_dir"], strict=True)):
+            continue
         completed = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"] if os.name == "nt" else ["kill", "-TERM", str(pid)],
             stdout=subprocess.PIPE,
@@ -10929,9 +11209,12 @@ def _qmt_auto_login_stop_xtitclient(row, paths, session=None):
             "stdout": (completed.stdout or "").strip(),
             "stderr": (completed.stderr or "").strip(),
         })
-    if pids:
-        time.sleep(1.0)
-    return {"requested_pids": pids, "results": results}
+    deadline = time.monotonic() + 8.0
+    while _qmt_auto_login_processes(paths["bin_dir"], strict=True):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("旧 QMT 进程未完全退出，已停止重启，请检查进程权限")
+        time.sleep(0.2)
+    return {"requested_pids": pids, "results": results, "exit_confirmed": True}
 
 
 def _qmt_auto_login_copy_current_link(paths):
@@ -11096,7 +11379,80 @@ def qmt_auto_login_complete_for_account(row):
     return result
 
 
-QMT_AUTO_LOGIN_REMINDER = "国金 QMT：请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。非国金 QMT：请在登录界面勾选自动登录和记住密码，然后等待自动登录完成。所有 QMT 都要先完成 Python 库下载。"
+QMT_AUTO_LOGIN_REMINDER = "项目先结束对应目录的旧 QMT 进程，确认退出后重新启动；清空登录框中的旧账号和密码，填入绑定中保存的账号和密码再登录。计划重启仅在 A 股交易日执行，默认北京时间 09:00。请先完成 QMT 内的 Python 库下载。"
+QMT_COMPONENT_JOBS = {}
+
+
+def _qmt_component_job_key(directory):
+    from cfquant.qmt_credentials import directory_key
+    return directory_key(directory)
+
+
+def _qmt_component_login_preflight(paths, settings):
+    from cfquant.qmt_component_login import verify_environment
+    from cfquant.qmt_credentials import QmtCredentialStore
+    validate_qmt_auto_login_credentials(WEB_CONFIG.path, paths["bin_dir"], dict(settings, enabled=True))
+    if not QmtCredentialStore(WEB_CONFIG.path).password(paths["bin_dir"], settings.get("login_account", "")):
+        raise ValueError("请在绑定中重新保存 QMT 登录密码后启用自动重启")
+    verify_environment(paths["bin_dir"])
+
+
+def _qmt_component_login_worker(row, paths, pid, config_path):
+    from cfquant.qmt_component_login import login_running_qmt
+    from cfquant.qmt_credentials import QmtCredentialStore
+    settings = normalize_qmt_auto_login_settings(row.get("qmt_auto_login"))
+    account = settings.get("login_account", "")
+    try:
+        result = login_running_qmt(
+            paths["bin_dir"], account,
+            lambda: QmtCredentialStore(config_path).password(paths["bin_dir"], account),
+            expected_pid=pid,
+        )
+        outcome = result["outcome"]
+        descriptions = {
+            "logged_in": "QMT 已自动登录，等待已配置的策略连接",
+            "already_logged_in": "QMT 已登录，等待已配置的策略连接",
+            "password_required": "请在绑定设置中填写 QMT 登录账号和密码",
+            "credential_error": "QMT 密码被拒绝，请修改绑定中保存的密码",
+            "network_error": "QMT 服务器连接失败，下个交易日仍会按计划重新启动登录",
+            "challenge": "QMT 需要验证码或其他人工验证",
+            "timeout": "QMT 登录超时，下个交易日仍会按计划重新启动登录",
+            "startup_timeout": "QMT 登录界面未就绪，请检查客户端启动状态",
+            "login_not_ready": "QMT 正在登录或登录按钮尚未就绪",
+        }
+        message = descriptions.get(outcome, "QMT 自动登录未完成")
+        updates = {"state": "logged_in" if result.get("login_succeeded") else "login_failed",
+                   "login_state": outcome, "login_succeeded": bool(result.get("login_succeeded")),
+                   "login_attempts": result.get("attempts", []), "message": message,
+                   "error": "" if result.get("login_succeeded") else message}
+    except Exception:
+        # Native exceptions and credential providers must never echo supplied data.
+        updates = {"state": "login_failed", "login_state": "component_error", "login_succeeded": False,
+                   "error": "QMT 组件登录失败，请检查客户端版本、登录账号及自动登录依赖",
+                   "message": "QMT 组件登录失败，请检查客户端版本、登录账号及自动登录依赖"}
+    # Do not let a stale worker overwrite a later process's state.
+    with QMT_AUTO_LOGIN_LOCK:
+        key = _qmt_component_job_key(paths["bin_dir"])
+        if QMT_COMPONENT_JOBS.get(key) is not threading.current_thread():
+            return
+        session = _qmt_auto_login_saved_session(row)
+        if session.get("pid") == pid:
+            _qmt_auto_login_update_session(row, updates)
+        QMT_COMPONENT_JOBS.pop(key, None)
+
+
+def _qmt_queue_component_login(row, paths, pid):
+    key = _qmt_component_job_key(paths["bin_dir"])
+    job = QMT_COMPONENT_JOBS.get(key)
+    if job and job.is_alive():
+        return False
+    worker = threading.Thread(target=_qmt_component_login_worker,
+                              args=(dict(row), dict(paths), pid, WEB_CONFIG.path),
+                              name="qmt-component-login-%s" % pid, daemon=True)
+    worker.qmt_pid = pid
+    QMT_COMPONENT_JOBS[key] = worker
+    worker.start()
+    return True
 
 
 def _qmt_auto_login_first_pid(processes, launch=None):
@@ -11172,14 +11528,28 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
     try:
         with QMT_AUTO_LOGIN_LOCK:
             paths = _qmt_auto_login_paths(qmt_dir)
+            _qmt_component_login_preflight(paths, settings)
+            key = _qmt_component_job_key(paths["bin_dir"])
+            running = _qmt_auto_login_processes(paths["bin_dir"], strict=True)
+            job = QMT_COMPONENT_JOBS.get(key)
+            if (not restart and job and job.is_alive()
+                    and any(process["pid"] == getattr(job, "qmt_pid", None) for process in running)):
+                result.update(configured=True, login_state="logging_in", message="该 QMT 正在启动登录，请等待本次操作完成")
+                return result
+            # Every new login task uses a fresh process, including a failed
+            # terminal left behind when the web service was stopped.
+            restart = bool(restart or running)
+            QMT_COMPONENT_JOBS.pop(key, None)
             stop = None
             if restart:
                 stop = _qmt_auto_login_stop_xtitclient(row, paths, session=_qmt_auto_login_saved_session(row))
-            running = _qmt_auto_login_processes(paths["bin_dir"])
+            running = _qmt_auto_login_processes(paths["bin_dir"], strict=True)
+            if restart and running:
+                raise RuntimeError("旧 QMT 进程未完全退出，已停止重启，避免重复启动")
             launch = None
             if not running:
                 launch = _qmt_auto_login_start_xtitclient(paths, use_link=False)
-                running = _qmt_auto_login_processes(paths["bin_dir"])
+                running = _qmt_auto_login_processes(paths["bin_dir"], strict=True)
             pid = _qmt_auto_login_first_pid(running, launch)
             started = bool(launch)
             result.update({
@@ -11197,7 +11567,7 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
             })
             if restart:
                 result["message"] = (
-                    "已按计划重启 QMT，PID: %s" % pid
+                    "已结束旧进程并重新启动 QMT，PID: %s" % pid
                     if pid else "已执行计划重启，但暂未获取到 QMT 进程 PID"
                 )
             elif started:
@@ -11212,7 +11582,9 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
                 )
             _qmt_auto_login_update_session(row, {
                 "enabled": True,
-                "state": "restarted" if restart else "running",
+                "state": "logging_in",
+                "login_state": "logging_in",
+                "login_succeeded": False,
                 "qmt_dir": qmt_dir,
                 "bin_dir": paths["bin_dir"],
                 "exe_path": paths["exe_path"],
@@ -11225,6 +11597,10 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
                 "message": result["message"],
                 "error": "",
             })
+            login_row = dict(row, qmt_auto_login=settings)
+            if pid:
+                result["login_state"] = "logging_in"
+                _qmt_queue_component_login(login_row, paths, pid)
     except Exception as error:
         result.update({
             "configured": False,
@@ -11254,7 +11630,6 @@ class QmtAutoLoginRestartScheduler:
         self.interval = float(interval or 20.0)
         self._stop = threading.Event()
         self._thread = None
-        self._fired = {}
         self._lock = threading.Lock()
 
     def start(self):
@@ -11282,9 +11657,15 @@ class QmtAutoLoginRestartScheduler:
             return []
         if WEB_CONFIG is None:
             return []
-        now = now or time.localtime()
+        if now is None:
+            import datetime
+            now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).timetuple()
         current_day = time.strftime("%Y-%m-%d", now)
-        current_time = time.strftime("%H:%M", now)
+        import datetime
+        from cfquant.trading_calendar import is_trading_day
+        day = datetime.date(now.tm_year, now.tm_mon, now.tm_mday)
+        if not is_trading_day(day):
+            return []
         configs = WEB_CONFIG.account_configs()
         results = []
         with self._lock:
@@ -11292,16 +11673,29 @@ class QmtAutoLoginRestartScheduler:
                 if not isinstance(row, dict) or not account_config_is_enabled(row):
                     continue
                 settings = normalize_qmt_auto_login_settings(row.get("qmt_auto_login"))
-                if not settings["enabled"] or current_time not in settings["restart_times"]:
+                if not settings["enabled"] or not row.get("qmt_dir"):
                     continue
-                account_key = _qmt_auto_login_session_key(row)
-                fired_key = "%s|%s|%s" % (account_key, current_day, current_time)
-                if self._fired.get(fired_key):
-                    continue
-                self._fired[fired_key] = time.time()
-                results.append(qmt_auto_login_restart_for_account(row, settings, reason="scheduled:%s" % current_time))
-            cutoff = time.time() - 86400 * 3
-            self._fired = {key: value for key, value in self._fired.items() if value >= cutoff}
+                # Catch up a delayed poll or web restart for ten minutes, never midday.
+                minute = now.tm_hour * 60 + now.tm_min
+                slots = [slot for slot in settings["restart_times"]
+                         if 0 <= minute - (int(slot[:2]) * 60 + int(slot[3:])) <= 10]
+                for slot in slots:
+                    directory = _qmt_component_job_key(row["qmt_dir"])
+                    fired_key = "%s|%s|%s" % (directory, current_day, slot)
+                    with QMT_AUTO_LOGIN_LOCK:
+                        state = _qmt_auto_login_read_state_locked()
+                        fired = state.setdefault("scheduled_runs", {})
+                        if fired_key in fired:
+                            continue
+                        fired[fired_key] = time.time()
+                        cutoff = time.time() - 86400 * 7
+                        state["scheduled_runs"] = {key: value for key, value in fired.items() if value >= cutoff}
+                        _qmt_auto_login_write_state_locked(state)
+                    try:
+                        result = qmt_auto_login_restart_for_account(row, settings, reason="scheduled:%s" % slot)
+                    except Exception:
+                        result = {"error": "计划重启失败，下个交易日将重新执行", "account_key": _qmt_auto_login_session_key(row)}
+                    results.append(result)
         return results
 
 
@@ -11321,7 +11715,7 @@ def start_configured_qmt_on_web_startup():
         if policy is False or (policy is None and not settings["enabled"]):
             continue
         qmt_dir = normalize_optional_path(row.get("qmt_dir") or row.get("python_dir"))
-        key = os.path.normcase(os.path.abspath(qmt_dir)) if qmt_dir else ""
+        key = _qmt_component_job_key(qmt_dir) if qmt_dir else ""
         if key and key in seen_dirs:
             continue
         if key:
@@ -11855,6 +12249,9 @@ def lttx_status():
     running = bool(processes) or port_open
     managed_pids = [row["pid"] for row in processes if is_lttx_managed_process(row)]
     now = time.time()
+    executor = LTTX_WEB_ROUTE._executor
+    with CLIENTS._lock:
+        rpc_clients = list(CLIENTS._clients.items())
     return {
         "host": LTTX_HOST,
         "port": LTTX_PORT,
@@ -11867,6 +12264,8 @@ def lttx_status():
         "entry": os.path.abspath(LTTX_ENTRY),
         "purpose": "cfquant Python 库自动发现与 Web 统一路由入口",
         "stop_policy": "Web 重启和定时重启保留 LTtx；完整退出 cfquant 时停止 LTtx",
+        "request_queue": executor.status() if executor is not None else {"queued_requests": 0, "active_keys": 0},
+        "callback_queues": {mode: client.callback_status() for mode, client in rpc_clients if hasattr(client, "callback_status")},
         "checked_at": now,
         "checked_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
     }
@@ -13957,6 +14356,7 @@ def ensure_account_runtime(mode):
 @serialized_account_configuration
 def save_account_runtime_config(body):
     body = body or {}
+    WEB_CONFIG.validate_account_auto_login(body)
     # Check every configured QMT instance before writing config files or injecting strategies.
     qmt_process_preflight(body=body)
     account_id = str(body.get("account_id") or "").strip()
@@ -13989,6 +14389,7 @@ def save_account_runtime_config(body):
         market_bridges=market_bridges,
         qmt_strategy=body.get("qmt_strategy") if "qmt_strategy" in body else None,
         qmt_auto_login=qmt_auto_login_request,
+        qmt_runtime=body.get("qmt_runtime") if "qmt_runtime" in body else None,
     )
     row_enabled = account_config_is_enabled(row)
     qmt_core_deploy = auto_deploy_qmt_core_for_account(
@@ -14051,6 +14452,22 @@ def account_config_for_request(body):
 def complete_qmt_auto_login(body):
     row = account_config_for_request(body)
     return qmt_auto_login_restart_for_account(row, row.get("qmt_auto_login"), reason="manual")
+
+
+def reveal_account_qmt_password(body):
+    """Explicit authenticated reveal for a saved binding, separate from public config."""
+    from cfquant.qmt_credentials import QmtCredentialStore, directory_key
+    row = account_config_for_request(body)
+    settings = normalize_qmt_auto_login_settings(row.get("qmt_auto_login"))
+    account = settings.get("login_account", "")
+    directory = row.get("qmt_dir", "")
+    if (not directory or not account or account != str(body.get("login_account") or "").strip()
+            or not body.get("qmt_dir") or directory_key(directory) != directory_key(body["qmt_dir"])):
+        raise ValueError("登录账号或 QMT 目录已改变，请先保存对应密码")
+    password = QmtCredentialStore(WEB_CONFIG.path).password(directory, account)
+    if not password:
+        raise ValueError("该绑定尚未保存 QMT 登录密码，请重新填写并保存")
+    return {"password": password}
 
 
 @serialized_account_configuration
@@ -14129,6 +14546,7 @@ def delete_account_runtime_config(body):
 @serialized_account_configuration
 def initialize_web_setup(body):
     body = body or {}
+    WEB_CONFIG.validate_account_auto_login(body)
     qmt_process_preflight(body=body)
     python_environment = body.get("python_environment")
     if isinstance(python_environment, dict):
@@ -14781,6 +15199,13 @@ def save_qmt_log_language(body):
     targets = [normalize_bridge_id(bridge_id)] if bridge_id else list(current_bridges().keys())
     results = []
     for target_bridge_id in targets:
+        target_enabled = info["enabled"]
+        for row in WEB_CONFIG.account_configs().values():
+            routes = (row.get("market_bridges") or {}).values()
+            row_bridges = {row.get("bridge_id")} | {route.get("bridge_id") for route in routes}
+            if account_config_is_enabled(row) and target_bridge_id in row_bridges:
+                target_enabled = qmt_runtime_identity(row, info["enabled"])["qmt_log_enabled"]
+                break
         for channel in ("normal", "trade"):
             try:
                 language_result = CLIENTS.request(
@@ -14795,7 +15220,7 @@ def save_qmt_log_language(body):
                     target_bridge_id,
                     channel,
                     "cfquant.set_log_enabled",
-                    {"enabled": info["enabled"]},
+                    {"enabled": target_enabled},
                     timeout=3.0,
                     ignore_cooldown=True,
                 )
@@ -15431,6 +15856,40 @@ def channel_online(bridge_id, channel):
         return None
 
 
+def with_market_timing(func):
+    @wraps(func)
+    def measured(body, action, *args, **kwargs):
+        if action not in MARKET_TIMING_ACTIONS:
+            return func(body, action, *args, **kwargs)
+        attempts = []
+        token = _market_timing_attempts.set(attempts)
+        started = time.perf_counter()
+
+        def snapshot():
+            last = attempts[-1] if attempts else {}
+            return {
+                "request_id": last.get("request_id"),
+                "qmt": last.get("qmt") or {"available": False, "reason": "no_rpc_timing"},
+                "rpc": last.get("rpc") or {},
+                "attempts": attempts,
+                "web": {"route_ms": round((time.perf_counter() - started) * 1000, 3)},
+            }
+
+        try:
+            result = func(body, action, *args, **kwargs)
+            result["timing"] = snapshot()
+            if result.get("mode") == "local":
+                result["timing"]["qmt"] = {"available": False, "reason": "local_data_source"}
+            return result
+        except Exception as error:
+            error.market_timing = snapshot()
+            raise
+        finally:
+            _market_timing_attempts.reset(token)
+    return measured
+
+
+@with_market_timing
 def data_channel_request(body, action, params, default_channel="normal", force_channel=None):
     body = body or {}
     account_id = str(body.get("account_id") or "").strip()
@@ -16009,7 +16468,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/ws/callbacks":
             self._handle_ws_callbacks(parsed)
-        elif parsed.path == "/ws/quotes":
+        elif parsed.path in ("/ws/quotes", "/ws/diagnostics/quotes"):
             self._handle_ws_quotes(parsed)
         elif parsed.path.startswith("/media/"):
             self._serve_runtime_media(parsed.path)
@@ -16191,6 +16650,10 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(result))
                 if reload_requested:
                     schedule_web_reload(self.server, result["reload"])
+            elif parsed.path == "/api/diagnostics/quotes/subscribe":
+                self._write_json(ok(LATENCY_QUOTES.subscribe_whole(body)))
+            elif parsed.path == "/api/diagnostics/quotes/unsubscribe":
+                self._write_json(ok(LATENCY_QUOTES.unsubscribe(body)))
             elif parsed.path == "/api/quotes/whole/subscribe":
                 self._write_json(ok(subscribe_whole_quote(body)))
             elif parsed.path == "/api/quotes/subscribe":
@@ -16252,6 +16715,9 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif parsed.path == "/api/account-config":
                 self._write_json(ok(save_account_runtime_config(body)))
+            elif parsed.path == "/api/account-config/qmt-password":
+                self._write_json(ok(reveal_account_qmt_password(body)),
+                                 extra_headers=[("Cache-Control", "no-store"), ("Pragma", "no-cache")])
             elif parsed.path == "/api/qmt/processes/stop":
                 self._write_json(ok(stop_qmt_processes_for_request(body)))
             elif parsed.path == "/api/qmt/processes/start":
@@ -16674,6 +17140,13 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 )
                 version_info["system_info"] = project_system_info(version_info)
                 self._write_json(ok(version_info))
+            elif parsed.path == "/api/diagnostics/quotes/status":
+                self._write_json(ok(LATENCY_QUOTES.status()))
+            elif parsed.path == "/api/diagnostics/quotes/latest":
+                self._write_json(ok({"events": LATENCY_QUOTES.latest(
+                    since=int((query.get("since") or ["0"])[0]),
+                    limit=max(1, min(120, int((query.get("limit") or ["20"])[0]))),
+                    subscribe_id=(query.get("subscribe_id") or [""])[0])}))
             elif parsed.path == "/api/quotes/status":
                 self._write_json(ok(quote_status()))
             elif parsed.path == "/api/quotes/latest":
@@ -16876,7 +17349,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 if opcode == 0x8:
                     break
                 if opcode == 0x9:
-                    self._send_ws_control(0xA, payload)
+                    self._send_ws_control(0xA, payload, client=client)
         except Exception as e:
             safe_print("websocket callbacks closed: %s" % e)
         finally:
@@ -16884,6 +17357,9 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _handle_ws_quotes(self, parsed):
+        diagnostic = parsed.path == "/ws/diagnostics/quotes"
+        manager = WS_LATENCY_QUOTES if diagnostic else WS_QUOTES
+        store = LATENCY_QUOTES if diagnostic else QUOTES
         if not self._authorized(parsed):
             self.send_response(401)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -16908,19 +17384,22 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         subscribe_id = (query.get("subscribe_id") or [""])[0]
         client = WebSocketQuoteClient(self.request, subscribe_id=subscribe_id)
-        WS_QUOTES.add(client)
+        manager.add(client)
         safe_print(
             "websocket quotes connected subscribe_id=%s clients=%s"
-            % (subscribe_id or "*", WS_QUOTES.count())
+            % (subscribe_id or "*", manager.count())
         )
         try:
             client.send_json({
                 "type": "hello",
                 "channel": "quotes",
                 "subscribe_id": subscribe_id,
-                "clients": WS_QUOTES.count(),
-                "status": QUOTES.status(),
+                "clients": manager.count(),
+                "status": store.status(),
             })
+            if diagnostic:
+                for event in store.latest(limit=1, subscribe_id=subscribe_id):
+                    client.send_json({"type": "quote", "event": event})
             self.request.settimeout(30)
             while client.alive:
                 frame = self._read_ws_frame()
@@ -16930,11 +17409,11 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 if opcode == 0x8:
                     break
                 if opcode == 0x9:
-                    self._send_ws_control(0xA, payload)
+                    self._send_ws_control(0xA, payload, client=client)
         except Exception as e:
             safe_print("websocket quotes closed: %s" % e)
         finally:
-            WS_QUOTES.remove(client)
+            manager.remove(client)
             self.close_connection = True
 
     def _read_ws_frame(self):
@@ -16986,13 +17465,17 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def _send_ws_control(self, opcode, payload=b""):
+    def _send_ws_control(self, opcode, payload=b"", client=None):
         payload = payload or b""
         length = len(payload)
         if length > 125:
             payload = payload[:125]
             length = 125
-        self.request.sendall(bytes([0x80 | opcode, length]) + payload)
+        frame = bytes([0x80 | opcode, length]) + payload
+        if client is not None:
+            client.send_frame(frame)
+        else:
+            self.request.sendall(frame)
 
     def _serve_static(self, path):
         try:
@@ -17049,11 +17532,14 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             safe_print("client disconnected while writing media response: %s" % e)
 
     def _write_json(self, payload, status=200, extra_headers=None):
-        raw = json.dumps(to_jsonable(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        started = time.perf_counter()
+        raw = web_json_bytes(payload)
+        encoded_ms = (time.perf_counter() - started) * 1000
         try:
             self.send_response(status)
             self._send_cors_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Server-Timing", "web_json;dur=%.3f" % encoded_ms)
             for key, value in extra_headers or []:
                 self.send_header(str(key), str(value))
             self.send_header("Content-Length", str(len(raw)))
@@ -17268,6 +17754,7 @@ def main(argv=None):
         ACCOUNT_CACHE.close()
         CALLBACKS.close()
         QUOTES.close()
+        LATENCY_QUOTES.close()
         LTTX_WEB_ROUTE.close()
         CLIENTS.close()
         server.server_close()
