@@ -4513,6 +4513,38 @@ def stock_connect_host_account_key(account_id, account_type, bridge_id=None, acc
     return account_key
 
 
+STOCK_CONNECT_ORDER_ID_CANCELS = {
+    "xttrader.cancel_order_stock": "xttrader.cancel_order_stock_sysid",
+    "xttrader.cancel_order_stock_async": "xttrader.cancel_order_stock_sysid_async",
+}
+STOCK_CONNECT_MARKETS = {"HUGANGTONG": "HGT", "SHENGANGTONG": "SGT"}
+
+
+def stock_connect_order_sysid(account_id, bridge_id, requested_channel, params, default_channel="normal",
+                              timeout=8.0, account_type=None, account_key=None):
+    """Return the counter sysid of a Stock Connect order looked up by order_id, or ''."""
+    order_id = str(params.get("order_id") or "").strip()
+    if not order_id:
+        return ""
+    account = params.get("account") if isinstance(params.get("account"), dict) else {
+        "account_id": account_id, "account_type": account_type,
+    }
+    route = account_request(
+        account_id, bridge_id, requested_channel, "xttrader.query_stock_orders",
+        {"account": account, "cancelable_only": False},
+        default_channel=default_channel, timeout=timeout,
+        account_type=account_type, account_key=account_key,
+    )
+    rows = route.get("result") or []
+    matches = {
+        str(row.get("order_sysid") or "").strip()
+        for row in rows
+        if isinstance(row, dict) and str(row.get("order_id") or "").strip() == order_id
+    }
+    matches.discard("")
+    return matches.pop() if len(matches) == 1 else ""
+
+
 def account_request(
     account_id,
     bridge_id,
@@ -4532,6 +4564,31 @@ def account_request(
     request_account = request_params.get("account") if isinstance(request_params.get("account"), dict) else {}
     account_type = normalize_account_type(account_type or request_account.get("account_type") or request_params.get("account_type") or "STOCK")
     account_key = stock_connect_host_account_key(account_id, account_type, bridge_id, account_key)
+    sysid_action = STOCK_CONNECT_ORDER_ID_CANCELS.get(action)
+    if (
+        sysid_action
+        and account_type in STOCK_CONNECT_ACCOUNT_TYPES
+        and str(request_params.get("order_id_kind") or "").strip().lower() != "sysid"
+    ):
+        # QMT cannot find a Stock Connect order by its order_id (m_nRef), yet
+        # cancel() still reports success; cancel by the counter sysid instead.
+        sysid = stock_connect_order_sysid(
+            account_id, bridge_id, requested_channel, request_params,
+            default_channel=default_channel, timeout=timeout,
+            account_type=account_type, account_key=account_key,
+        )
+        if sysid:
+            route = account_request(
+                account_id, bridge_id, requested_channel, sysid_action,
+                dict(request_params, market=STOCK_CONNECT_MARKETS[account_type], sysid=sysid, order_id_kind="sysid"),
+                default_channel=default_channel, timeout=timeout,
+                mark_offline_on_timeout=mark_offline_on_timeout, ignore_cooldown=ignore_cooldown,
+                account_type=account_type, account_key=account_key, route_market=route_market,
+            )
+            result = route.get("result")
+            if isinstance(result, dict):
+                result = dict(result, order_id=request_params.get("order_id"), order_sysid=sysid)
+            return dict(route, result=result, cancel_by_sysid=sysid)
     bridge_id = resolve_bridge_id(account_id=account_id, bridge_id=bridge_id, account_type=account_type, account_key=account_key)
     base_bridge_id = bridge_id
     base_config = WEB_CONFIG.account_config(
