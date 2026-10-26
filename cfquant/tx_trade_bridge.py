@@ -3813,6 +3813,19 @@ class TxTradeBridge(object):
             params.get("end_date", params.get("end_time", "")),
         )
 
+    def _hosted_connect_account(self, account_id, account_type):
+        """True when a Stock Connect type of this bridge's own account rides on it.
+
+        passorder picks the HGT/SGT channel from the security code, so the
+        bridge keeps its own account and QMT context instead of switching.
+        """
+        own_type = str(self.account_type or "").strip().upper()
+        return (
+            str(account_type or "").strip().upper() in ("HUGANGTONG", "SHENGANGTONG")
+            and str(account_id or "").strip() == str(self.account_id or "").strip()
+            and own_type not in ("", "HUGANGTONG", "SHENGANGTONG")
+        )
+
     def _subscribe_account(self, params, msg=None):
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
@@ -3820,8 +3833,10 @@ class TxTradeBridge(object):
             raise ValueError("account_id is required")
         account_id = str(account_id).strip()
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        self.account_id = account_id
-        self.account_type = account_type
+        hosted = self._hosted_connect_account(account_id, account_type)
+        if not hosted:
+            self.account_id = account_id
+            self.account_type = account_type
         subscriber_key = (account_type.upper(), account_id)
         client_id = ""
         if msg:
@@ -3831,7 +3846,8 @@ class TxTradeBridge(object):
                 self.account_subscribers.setdefault(subscriber_key, set()).add(client_id)
                 self.client_accounts.setdefault(client_id, set()).add(subscriber_key)
             account_routing.subscribe(self.bridge_id, account_id, client_id, account_type=account_type)
-        self._set_context_account(account_id, account_type)
+        if not hosted:
+            self._set_context_account(account_id, account_type)
         self._enable_auto_trade_callback()
         self._log("account subscribed account=%s client_id=%s" % (account_id, client_id or "-"))
         return 0
@@ -3869,7 +3885,7 @@ class TxTradeBridge(object):
                         if not subscribers:
                             self.account_subscribers.pop(item, None)
         account_routing.unsubscribe(self.bridge_id, account_id=account_id, client_id=client_id, account_type=account_type if account_id else None)
-        if account_id and account_id == self.account_id:
+        if account_id and account_id == self.account_id and not self._hosted_connect_account(account_id, account_type):
             self.account_id = ""
             self.account_type = ""
         self._log("account unsubscribed account=%s client_id=%s" % (account_id or "-", client_id or "-"))

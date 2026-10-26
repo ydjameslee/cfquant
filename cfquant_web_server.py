@@ -4482,6 +4482,37 @@ class GlobalTxClient(object):
             client.remove_callback(event, callback)
 
 
+def stock_connect_host_account_key(account_id, account_type, bridge_id=None, account_key=None):
+    """Route a Stock Connect request through the same account's STOCK binding.
+
+    One managed strategy serves every account type of a fund account inside a
+    QMT (passorder picks the channel from the .HGT/.SGT code), so a
+    HUGANGTONG/SHENGANGTONG request without an enabled binding of its own uses
+    the enabled STOCK binding of the same account id. The account type is kept.
+    """
+    if account_key or WEB_CONFIG is None:
+        return account_key
+    account_type = normalize_account_type(account_type)
+    account_id = str(account_id or "").strip()
+    if account_type not in STOCK_CONNECT_ACCOUNT_TYPES or not account_id:
+        return account_key
+    own = WEB_CONFIG.account_config(account_id=account_id, account_type=account_type)
+    if own and account_config_is_enabled(own):
+        return account_key
+    hosts = [
+        (str(row.get("account_key") or key).strip(), normalize_bridge_id(row.get("bridge_id") or DEFAULT_BRIDGE_ID))
+        for key, row in enabled_account_configs().items()
+        if str(row.get("account_id") or "").strip() == account_id
+        and normalize_account_type(row.get("account_type") or "STOCK") == "STOCK"
+    ]
+    requested = normalize_bridge_id(bridge_id) if str(bridge_id or "").strip() else ""
+    if requested and any(bridge == requested for _key, bridge in hosts):
+        hosts = [row for row in hosts if row[1] == requested]
+    if len(hosts) == 1:
+        return hosts[0][0]
+    return account_key
+
+
 def account_request(
     account_id,
     bridge_id,
@@ -4500,6 +4531,7 @@ def account_request(
     request_params = params if isinstance(params, dict) else {}
     request_account = request_params.get("account") if isinstance(request_params.get("account"), dict) else {}
     account_type = normalize_account_type(account_type or request_account.get("account_type") or request_params.get("account_type") or "STOCK")
+    account_key = stock_connect_host_account_key(account_id, account_type, bridge_id, account_key)
     bridge_id = resolve_bridge_id(account_id=account_id, bridge_id=bridge_id, account_type=account_type, account_key=account_key)
     base_bridge_id = bridge_id
     base_config = WEB_CONFIG.account_config(
@@ -5115,6 +5147,7 @@ def data_provider_request(
 def account_route_status(account_id, bridge_id=None, account_type=None, account_key=None):
     account_id = str(account_id or "").strip() or configured_default_account_id()
     account_type = normalize_account_type(account_type or configured_default_account_type())
+    account_key = stock_connect_host_account_key(account_id, account_type, bridge_id, account_key)
     bridge_id = resolve_bridge_id(account_id=account_id, bridge_id=bridge_id, account_type=account_type, account_key=account_key)
     config = WEB_CONFIG.account_config(account_id=account_id, account_type=account_type, bridge_id=bridge_id, account_key=account_key) if WEB_CONFIG else {}
     account_key = account_key or (config or {}).get("account_key") or account_key_for(account_id, account_type, bridge_id)
@@ -13398,6 +13431,7 @@ class AccountDataCache(object):
     def get_market_routed(self, bridge_id, channel, account_id, sections, force=False, subscribe=True, account_type="STOCK", account_key=None, timeout=ACCOUNT_QUERY_TIMEOUT_SECONDS):
         base_bridge_id = normalize_bridge_id(bridge_id)
         account_type = normalize_account_type(account_type)
+        account_key = stock_connect_host_account_key(account_id, account_type, bridge_id, account_key)
         base_config, entries = account_market_route_entries(
             account_id=account_id,
             account_type=account_type,

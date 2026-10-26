@@ -24,7 +24,7 @@ def lite(request):
     cls.bases = []
     methods = {'_dispatch', '_subscribe_account', '_unsubscribe_account',
                '_client_ids_for_account', '_send_trader_event_to_account',
-               '_account_subscriber_status', '_account_type_name'}
+               '_account_subscriber_status', '_account_type_name', '_hosted_connect_account'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in methods]
     namespace = dict(threading=threading, time=time)
     shared = source.split('# BEGIN GENERATED CFTRADER BATCH\n', 1)[1].split('# END GENERATED CFTRADER BATCH', 1)[0]
@@ -116,6 +116,32 @@ def test_unsubscribe_client_clears_all_its_accounts_only_in_one_bridge(lite):
     first._unsubscribe_account({}, {'client_id': 'client'})
     assert lite.bridge('first')._account_subscriber_status() == {}
     assert lite.bridge('second')._account_subscriber_status() == {'STOCK:TEST_ONLY': 1, 'CREDIT:TEST_ONLY': 1}
+
+
+def test_stock_connect_subscription_keeps_the_bridge_own_account(lite):
+    bridge = lite.bridge()
+    contexts = []
+    bridge._set_context_account = lambda *args: contexts.append(args)
+    bridge._subscribe_account({'account_id': 'SAME_ACCOUNT', 'account_type': 'STOCK'}, {'client_id': 'stock'})
+    for kind in ('HUGANGTONG', 'SHENGANGTONG'):
+        bridge._subscribe_account({'account_id': 'SAME_ACCOUNT', 'account_type': kind}, {'client_id': kind})
+    # passorder routes .HGT/.SGT codes itself; the QMT context stays on the bridge's own account.
+    assert (bridge.account_id, bridge.account_type.upper()) == ('SAME_ACCOUNT', 'STOCK')
+    assert [(account, kind.upper()) for account, kind in contexts] == [('SAME_ACCOUNT', 'STOCK')]
+    receiver = lite.bridge()
+    assert receiver._client_ids_for_account('SAME_ACCOUNT', 'HUGANGTONG') == ['HUGANGTONG']
+    assert receiver._client_ids_for_account('SAME_ACCOUNT', 'SHENGANGTONG') == ['SHENGANGTONG']
+    bridge._unsubscribe_account({'account_id': 'SAME_ACCOUNT', 'account_type': 'HUGANGTONG'}, {'client_id': 'HUGANGTONG'})
+    assert (bridge.account_id, bridge.account_type.upper()) == ('SAME_ACCOUNT', 'STOCK')
+    assert receiver._client_ids_for_account('SAME_ACCOUNT', 'STOCK') == ['stock']
+    assert receiver._client_ids_for_account('SAME_ACCOUNT', 'HUGANGTONG') == []
+
+
+def test_bridge_bound_to_a_connect_account_still_switches_to_another_account(lite):
+    bridge = lite.bridge()
+    bridge._subscribe_account({'account_id': 'CONNECT_ONLY', 'account_type': 'HUGANGTONG'}, {'client_id': 'a'})
+    bridge._subscribe_account({'account_id': 'OTHER_ACCOUNT', 'account_type': 'SHENGANGTONG'}, {'client_id': 'b'})
+    assert (bridge.account_id, bridge.account_type.upper()) == ('OTHER_ACCOUNT', 'SHENGANGTONG')
 
 
 @pytest.mark.parametrize('numeric, name', [(2, 'STOCK'), (3, 'CREDIT'), (7, 'HUGANGTONG'), (11, 'SHENGANGTONG')])
