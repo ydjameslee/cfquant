@@ -24,7 +24,8 @@ def lite(request):
     cls.bases = []
     methods = {'_dispatch', '_subscribe_account', '_unsubscribe_account',
                '_client_ids_for_account', '_send_trader_event_to_account',
-               '_account_subscriber_status', '_account_type_name', '_hosted_connect_account'}
+               '_account_subscriber_status', '_account_type_name', '_hosted_connect_account',
+               '_register_hosted_connect_callbacks'}
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in methods]
     namespace = dict(threading=threading, time=time)
     shared = source.split('# BEGIN GENERATED CFTRADER BATCH\n', 1)[1].split('# END GENERATED CFTRADER BATCH', 1)[0]
@@ -127,6 +128,7 @@ def test_stock_connect_subscription_keeps_the_bridge_own_account(lite):
         bridge._subscribe_account({'account_id': 'SAME_ACCOUNT', 'account_type': kind}, {'client_id': kind})
     # passorder routes .HGT/.SGT codes itself; the QMT context stays on the bridge's own account.
     assert (bridge.account_id, bridge.account_type.upper()) == ('SAME_ACCOUNT', 'STOCK')
+    # Without a QMT context there is nothing to register.
     assert [(account, kind.upper()) for account, kind in contexts] == [('SAME_ACCOUNT', 'STOCK')]
     receiver = lite.bridge()
     assert receiver._client_ids_for_account('SAME_ACCOUNT', 'HUGANGTONG') == ['HUGANGTONG']
@@ -175,3 +177,20 @@ def test_lite_callback_publishes_canonical_account_type(path, raw, expected):
     bridge._get_value = lambda obj, key: obj.get(key) if isinstance(obj, dict) else None
     assert bridge._callback_account_type(None, {'m_nBrokerType': raw}) == expected
     assert bridge._callback_account_type(None, {'m_strAccountKey': str(raw) + '____TEST_ONLY'}) == expected
+
+
+def test_stock_connect_subscription_registers_its_callbacks_then_restores_the_bridge_account(lite):
+    """2026-11-02 Galaxy: QMT pushed no order callback for a hosted Shanghai Connect order."""
+    bridge = lite.bridge()
+    bridge.context = SimpleNamespace(set_auto_trade_callback=lambda on: True)
+    contexts = []
+    bridge._set_context_account = lambda *args: contexts.append(args)
+    bridge._subscribe_account({'account_id': 'SAME_ACCOUNT', 'account_type': 'STOCK'}, {'client_id': 'stock'})
+    for kind in ('HUGANGTONG', 'SHENGANGTONG'):
+        bridge._subscribe_account({'account_id': 'SAME_ACCOUNT', 'account_type': kind}, {'client_id': kind})
+    assert [(account, kind.upper()) for account, kind in contexts] == [
+        ('SAME_ACCOUNT', 'STOCK'),
+        ('SAME_ACCOUNT', 'HUGANGTONG'), ('SAME_ACCOUNT', 'STOCK'),
+        ('SAME_ACCOUNT', 'SHENGANGTONG'), ('SAME_ACCOUNT', 'STOCK'),
+    ]
+    assert (bridge.account_id, bridge.account_type.upper()) == ('SAME_ACCOUNT', 'STOCK')

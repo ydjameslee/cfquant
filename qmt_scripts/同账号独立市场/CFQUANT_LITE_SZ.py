@@ -5382,6 +5382,23 @@ class TxTradeBridge(object):
             and own_type not in ("", "HUGANGTONG", "SHENGANGTONG")
         )
 
+    def _register_hosted_connect_callbacks(self, account_id, account_type):
+        """Also register a hosted Stock Connect type with QMT for its callbacks.
+
+        A hosted HGT/SGT type keeps the bridge's own STOCK context, and QMT then
+        never calls order_callback for its orders (2026-11-02, Galaxy: no
+        on_stock_order for a Shanghai Connect order or its cancel, A-share
+        orders were pushed).  QMT only reports accounts set on the context, so
+        register this type too, then set the bridge's own account again so it
+        stays the last one set: if set_account adds accounts, both report; if
+        it replaces, the bridge is back exactly as before.
+        """
+        if getattr(self, "context", None) is None:
+            return
+        self._set_context_account(account_id, account_type)
+        self._set_context_account(self.account_id, self.account_type)
+        self._log("hosted connect callbacks registered account=%s type=%s" % (account_id, account_type))
+
     def _subscribe_account(self, params, msg=None):
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
@@ -5404,6 +5421,8 @@ class TxTradeBridge(object):
             account_route_subscribe(self.bridge_id, account_id, client_id, account_type=account_type)
         if not hosted:
             self._set_context_account(account_id, account_type)
+        else:
+            self._register_hosted_connect_callbacks(account_id, account_type)
         self._enable_auto_trade_callback()
         self._log("account subscribed account=%s client_id=%s" % (account_id, client_id or "-"))
         return 0
